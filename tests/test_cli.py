@@ -10,8 +10,12 @@ temporal, sin tocar la configuración real del repositorio ni invocar
 subprocesos: se llama directamente a orchestrator.app.main().
 """
 
+import contextlib
+import io
+import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +30,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator import app  # noqa: E402
+from orchestrator.adapters.claude_code import EXPECTED_HANDSHAKE_RESULT  # noqa: E402
 from orchestrator.store import Store  # noqa: E402
 
 
@@ -167,6 +172,24 @@ class CliFixtureTestCase(unittest.TestCase):
         data = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
         data["project_id"] = new_project_id
         _write_yaml(rules_path, data)
+
+    def enable_developer(self, **overrides) -> None:
+        """CLAUDE-EXECUTION-001: habilita developer con un handshake válido
+        (o el override indicado) reescribiendo AGENTS.yaml de la fixture."""
+        data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
+        developer = {
+            "role": "developer",
+            "enabled": True,
+            "executable": "claude",
+            "output_format": "json",
+            "max_turns": 1,
+            "timeout_seconds": 60,
+            "permission_mode": "plan",
+            "restricted": True,
+        }
+        developer.update(overrides)
+        data["agents"]["developer"] = developer
+        _write_yaml(self.config_dir / "AGENTS.yaml", data)
 
 
 class InitAndRegisterTests(CliFixtureTestCase):
@@ -373,6 +396,74 @@ class ProjectIdMismatchBlocksTransitionTests(CliFixtureTestCase):
             after_history = store.get_history("T-1")
         self.assertEqual(before_task, after_task)
         self.assertEqual(before_history, after_history)
+
+
+class DeveloperProbeDisabledTests(CliFixtureTestCase):
+    """Escenario obligatorio 16 (CLAUDE-EXECUTION-001): developer
+    deshabilitado (default de la fixture) -> developer-probe rechazado."""
+
+    def test_developer_probe_rejected_when_developer_disabled(self) -> None:
+        with mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run"
+        ) as mock_run:
+            rc = self.run_cli("developer-probe")
+        self.assertNotEqual(rc, 0)
+        mock_run.assert_not_called()
+
+
+class DeveloperProbeEnabledTests(CliFixtureTestCase):
+    """Verifica el wiring end-to-end de `developer-probe`: config core ->
+    AGENTS.yaml -> ClaudeCodeAdapter, con subprocess mockeado (sin invocar
+    Claude Code real)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.enable_developer()
+
+    def test_developer_probe_success_prints_summary(self) -> None:
+        # CORRECTION-001: representa el JSON de éxito EXACTO exigido por el
+        # handshake determinista (type/subtype/is_error/result).
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": EXPECTED_HANDSHAKE_RESULT,
+                "session_id": "sess-1",
+                "num_turns": 1,
+                "duration_ms": 500,
+            }
+        )
+        completed = subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=payload, stderr=""
+        )
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = self.run_cli("developer-probe")
+
+        self.assertEqual(rc, 0)
+        mock_run.assert_called_once()
+        _, call_kwargs = mock_run.call_args
+        self.assertIs(call_kwargs["shell"], False)
+        self.assertIn(EXPECTED_HANDSHAKE_RESULT, stdout.getvalue())
+
+    def test_developer_probe_fails_closed_on_is_error_true(self) -> None:
+        payload = '{"is_error": true, "result": "something went wrong"}'
+        completed = subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=payload, stderr=""
+        )
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            rc = self.run_cli("developer-probe")
+        self.assertNotEqual(rc, 0)
 
 
 if __name__ == "__main__":

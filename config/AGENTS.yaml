@@ -1,7 +1,12 @@
-# AGENTS.yaml — roster declarativo de agentes (BOOTSTRAP)
+# AGENTS.yaml — roster declarativo de agentes (BOOTSTRAP + CLAUDE-EXECUTION-001)
 #
 # Fuente de verdad: 01_MASTER_SPEC.md §2, §7, §13.
-# En BOOTSTRAP ningún agente se conecta todavía: enabled debe ser false.
+# El Director permanece deshabilitado (enabled: false): D1/D2 (§0) reservan
+# su conexión programática vía OpenAI API a un incremento posterior.
+# El Developer se habilita en CLAUDE-EXECUTION-001 EXCLUSIVAMENTE para un
+# handshake seguro y no interactivo con Claude Code CLI (--permission-mode
+# plan + --restricted, sin edición, sin Bash):
+# ver src/orchestrator/adapters/claude_code.py.
 # No incluir API keys, secretos ni credenciales en este archivo.
 
 version: 1
@@ -17,4 +22,18 @@ agents:
     role: "developer"
     provider: "claude_code_cli"
     port: "DeveloperPort"
-    enabled: false
+    enabled: true
+    # Nombre de ejecutable a resolver vía shutil.which(); nunca una ruta
+    # hardcodeada específica del usuario.
+    executable: "claude"
+    output_format: "json"
+    # CLAUDE-EXECUTION-001: handshake mínimo, un solo turno.
+    max_turns: 1
+    timeout_seconds: 60
+    # Único modo autorizado en este incremento: sin edición, sin Bash.
+    permission_mode: "plan"
+    # Defensa en profundidad (CORRECTION-001): permission_mode plan no es la
+    # única barrera; restricted quita las herramientas que ejecutan
+    # comandos/código (Bash, PowerShell, REPL, etc.). No es un default
+    # silencioso: config_loader exige explícitamente restricted: true.
+    restricted: true

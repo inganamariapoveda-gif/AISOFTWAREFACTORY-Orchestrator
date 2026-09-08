@@ -12,7 +12,12 @@ import json
 import sys
 from pathlib import Path
 
-from .config_loader import ConfigError, load_core_config, load_project_rules
+from .adapters.claude_code import (
+    HANDSHAKE_PROMPT,
+    DeveloperExecutionError,
+    run_handshake,
+)
+from .config_loader import ConfigError, OrchestratorConfig, load_core_config, load_project_rules
 from .state_machine import StateMachineError
 from .store import InvalidIdError, Store, StoreError, validate_id
 
@@ -40,9 +45,9 @@ def _resolve_project_rules_path(project_id: str) -> Path:
     return PROJECTS_DIR / project_id / "PROJECT_RULES.yaml"
 
 
-def _require_core_config() -> None:
+def _require_core_config() -> OrchestratorConfig:
     """Falla cerrado: ninguna operación de la CLI procede sin config core válida."""
-    load_core_config(CONFIG_DIR)
+    return load_core_config(CONFIG_DIR)
 
 
 def _require_project_rules(project_id: str) -> dict:
@@ -125,6 +130,38 @@ def cmd_transition(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_developer_probe(args: argparse.Namespace) -> int:
+    """CLAUDE-EXECUTION-001: handshake seguro y no interactivo con Claude
+    Code CLI. No autoriza edición ni Bash; no recibe Task Packet; no ejecuta
+    tareas de desarrollo reales (§17 roadmap: eso es un incremento futuro).
+    cwd y authorized_root quedan fijos en REPO_ROOT: en este incremento la
+    ejecución se limita exclusivamente a este repositorio."""
+    config = _require_core_config()
+    developer_config = config.agents.get("agents", {}).get("developer", {})
+    if developer_config.get("enabled") is not True:
+        print("error: developer is not enabled in AGENTS.yaml", file=sys.stderr)
+        return 1
+
+    result = run_handshake(
+        developer_config=developer_config,
+        prompt=HANDSHAKE_PROMPT,
+        cwd=REPO_ROOT,
+        authorized_root=REPO_ROOT,
+    )
+
+    summary = {
+        "success": result.success,
+        "is_error": result.is_error,
+        "exit_code": result.exit_code,
+        "session_id": result.session_id,
+        "num_turns": result.num_turns,
+        "duration_ms": result.duration_ms,
+        "result_text": result.result_text,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     _require_core_config()
     db_path = _ensure_within_repo(Path(args.db_path))
@@ -178,6 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id")
     p.set_defaults(func=cmd_history)
 
+    p = sub.add_parser(
+        "developer-probe",
+        help="Handshake seguro y no interactivo con Claude Code CLI (sin edición, sin Bash)",
+    )
+    p.set_defaults(func=cmd_developer_probe)
+
     return parser
 
 
@@ -186,7 +229,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (ConfigError, StateMachineError, InvalidIdError, StoreError, CliError) as exc:
+    except (
+        ConfigError,
+        StateMachineError,
+        InvalidIdError,
+        StoreError,
+        CliError,
+        DeveloperExecutionError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

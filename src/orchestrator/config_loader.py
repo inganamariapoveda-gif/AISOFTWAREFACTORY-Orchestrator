@@ -33,7 +33,9 @@ REQUIRED_HUMAN_GATES = frozenset(
         "HUMAN_CRITICAL_APPROVAL",
     }
 )
-REQUIRED_AGENT_ROLES = ("director", "developer")
+# CLAUDE-EXECUTION-001: modos de permiso admitidos para agents.developer
+# cuando enabled: true (handshake seguro con Claude Code CLI, §17 roadmap).
+ALLOWED_DEVELOPER_PERMISSION_MODES = frozenset({"plan"})
 REQUIRED_PERMISSION_DENY_KEYS = (
     "deny.production",
     "deny.git_push",
@@ -140,14 +142,65 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
 
 
 def _validate_agents(data: dict[str, Any], path: Path) -> None:
-    for role in REQUIRED_AGENT_ROLES:
-        agent = _require(data, f"agents.{role}", path)
-        if not isinstance(agent, dict):
-            raise ConfigError(f"'agents.{role}' must be a mapping in {path}")
-        if agent.get("enabled") is not False:
-            raise ConfigError(
-                f"agent '{role}' must have enabled: false in BOOTSTRAP ({path})"
-            )
+    # Director permanece con enabled: false de forma inamovible en este
+    # incremento (CLAUDE-EXECUTION-001 solo autoriza al Developer, §0 D1/D2).
+    director = _require(data, "agents.director", path)
+    if not isinstance(director, dict):
+        raise ConfigError(f"'agents.director' must be a mapping in {path}")
+    if director.get("enabled") is not False:
+        raise ConfigError(f"agent 'director' must have enabled: false ({path})")
+
+    developer = _require(data, "agents.developer", path)
+    if not isinstance(developer, dict):
+        raise ConfigError(f"'agents.developer' must be a mapping in {path}")
+    developer_enabled = developer.get("enabled")
+    if not isinstance(developer_enabled, bool):
+        raise ConfigError(
+            f"agent 'developer' must declare a boolean 'enabled' ({path})"
+        )
+    if developer_enabled:
+        _validate_developer_handshake_config(developer, path)
+
+
+def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
+    """CLAUDE-EXECUTION-001: si developer.enabled es true, exige declarar
+    todos los campos del handshake seguro con Claude Code CLI. Falla cerrado
+    si falta cualquiera o tiene un valor inválido."""
+    executable = developer.get("executable")
+    if not isinstance(executable, str) or not executable:
+        raise ConfigError(
+            f"'agents.developer.executable' must be a non-empty string when enabled ({path})"
+        )
+    if developer.get("output_format") != "json":
+        raise ConfigError(
+            f"'agents.developer.output_format' must be 'json' when enabled ({path})"
+        )
+    max_turns = developer.get("max_turns")
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+        raise ConfigError(
+            f"'agents.developer.max_turns' must be a positive integer when enabled ({path})"
+        )
+    timeout_seconds = developer.get("timeout_seconds")
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 1
+    ):
+        raise ConfigError(
+            f"'agents.developer.timeout_seconds' must be a positive integer when enabled ({path})"
+        )
+    if developer.get("permission_mode") not in ALLOWED_DEVELOPER_PERMISSION_MODES:
+        raise ConfigError(
+            "'agents.developer.permission_mode' must be one of "
+            f"{sorted(ALLOWED_DEVELOPER_PERMISSION_MODES)} when enabled ({path})"
+        )
+    # CORRECTION-001, hallazgo 2: defensa en profundidad — permission_mode
+    # plan no es la única barrera; --restricted quita las herramientas que
+    # ejecutan comandos/código. No se permite un default silencioso.
+    if developer.get("restricted") is not True:
+        raise ConfigError(
+            f"'agents.developer.restricted' must be true when enabled ({path})"
+        )
 
 
 def _validate_gates(data: dict[str, Any], path: Path) -> None:

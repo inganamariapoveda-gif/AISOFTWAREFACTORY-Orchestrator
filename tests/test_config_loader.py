@@ -116,8 +116,13 @@ class LoadRealConfigTests(unittest.TestCase):
     def test_core_config_loads(self) -> None:
         config = load_core_config(CONFIG_DIR)
         self.assertTrue(config.policies["fail_closed"])
+        # Director permanece deshabilitado (D1/D2, §0); Developer se habilita
+        # a partir de CLAUDE-EXECUTION-001 exclusivamente para el handshake
+        # seguro con Claude Code CLI (--permission-mode plan, sin edición).
         self.assertFalse(config.agents["agents"]["director"]["enabled"])
-        self.assertFalse(config.agents["agents"]["developer"]["enabled"])
+        self.assertTrue(config.agents["agents"]["developer"]["enabled"])
+        self.assertEqual(config.agents["agents"]["developer"]["permission_mode"], "plan")
+        self.assertTrue(config.agents["agents"]["developer"]["restricted"])
 
     def test_sample_project_rules_load(self) -> None:
         rules = load_project_rules(SAMPLE_RULES_PATH)
@@ -273,7 +278,12 @@ allowed_commands: []
                 load_core_config(tmp)
             self.assertIn("director", str(ctx.exception))
 
-    def test_developer_enabled_true_rejected(self) -> None:
+    def test_developer_enabled_true_without_handshake_config_rejected(self) -> None:
+        # A partir de CLAUDE-EXECUTION-001, developer.enabled: true está
+        # permitido, pero SOLO si declara el handshake completo (executable,
+        # output_format, max_turns, timeout_seconds, permission_mode). Aquí
+        # se habilita sin ninguno de esos campos: debe seguir fallando
+        # cerrado (ConfigError), por 'developer.executable' ausente.
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             agents = _baseline_agents()
@@ -282,6 +292,112 @@ allowed_commands: []
             with self.assertRaises(ConfigError) as ctx:
                 load_core_config(tmp)
             self.assertIn("developer", str(ctx.exception))
+
+
+def _valid_developer_handshake() -> dict:
+    return {
+        "role": "developer",
+        "enabled": True,
+        "executable": "claude",
+        "output_format": "json",
+        "max_turns": 1,
+        "timeout_seconds": 60,
+        "permission_mode": "plan",
+        "restricted": True,
+    }
+
+
+class DeveloperHandshakeConfigTests(unittest.TestCase):
+    """CLAUDE-EXECUTION-001: developer.enabled: true exige el handshake
+    completo; cada campo ausente o inválido falla cerrado."""
+
+    def _load_with_developer(self, developer: dict) -> None:
+        """`developer` debe ser el diccionario COMPLETO a escribir (no un
+        parche): permite tanto sobreescribir un valor como eliminar una
+        clave para simular un campo ausente."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            agents["agents"]["developer"] = developer
+            _write_core_config(tmp, agents=agents)
+            load_core_config(tmp)
+
+    def _load_with_developer_override(self, **overrides) -> None:
+        developer = _valid_developer_handshake()
+        developer.update(overrides)
+        self._load_with_developer(developer)
+
+    def test_complete_valid_handshake_config_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            agents["agents"]["developer"] = _valid_developer_handshake()
+            _write_core_config(tmp, agents=agents)
+            config = load_core_config(tmp)
+            self.assertTrue(config.agents["agents"]["developer"]["enabled"])
+            self.assertEqual(
+                config.agents["agents"]["developer"]["permission_mode"], "plan"
+            )
+
+    def test_missing_executable_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            developer = _valid_developer_handshake()
+            del developer["executable"]
+            self._load_with_developer(developer)
+        self.assertIn("developer.executable", str(ctx.exception))
+
+    def test_output_format_not_json_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_developer_override(output_format="text")
+        self.assertIn("developer.output_format", str(ctx.exception))
+
+    def test_max_turns_not_positive_int_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_developer_override(max_turns=0)
+        self.assertIn("developer.max_turns", str(ctx.exception))
+
+    def test_timeout_seconds_missing_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            developer = _valid_developer_handshake()
+            del developer["timeout_seconds"]
+            self._load_with_developer(developer)
+        self.assertIn("developer.timeout_seconds", str(ctx.exception))
+
+    def test_permission_mode_other_than_plan_rejected(self) -> None:
+        # Ningún modo de bypass ni edición está autorizado en este incremento.
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_developer_override(permission_mode="bypassPermissions")
+        self.assertIn("developer.permission_mode", str(ctx.exception))
+
+    def test_restricted_missing_rejected(self) -> None:
+        # 8. restricted ausente en AGENTS config -> ConfigError
+        # (CORRECTION-001, hallazgo 2: defensa en profundidad).
+        with self.assertRaises(ConfigError) as ctx:
+            developer = _valid_developer_handshake()
+            del developer["restricted"]
+            self._load_with_developer(developer)
+        self.assertIn("developer.restricted", str(ctx.exception))
+
+    def test_restricted_false_rejected(self) -> None:
+        # 9. restricted: false -> ConfigError.
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_developer_override(restricted=False)
+        self.assertIn("developer.restricted", str(ctx.exception))
+
+    def test_restricted_non_boolean_rejected(self) -> None:
+        # 10. restricted con tipo no booleano -> ConfigError.
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_developer_override(restricted="true")
+        self.assertIn("developer.restricted", str(ctx.exception))
+
+    def test_developer_disabled_does_not_require_handshake_fields(self) -> None:
+        # Compatibilidad con BOOTSTRAP: developer.enabled: false sigue
+        # aceptándose sin declarar ningún campo de handshake.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            _write_core_config(tmp)  # baseline: developer.enabled = False
+            config = load_core_config(tmp)
+            self.assertFalse(config.agents["agents"]["developer"]["enabled"])
 
 
 class OnUnclassifiedTests(unittest.TestCase):
@@ -348,8 +464,9 @@ agents:
 
 class NoShellTrueTests(unittest.TestCase):
     def test_no_shell_true_in_source(self) -> None:
+        # Recursivo: cubre también src/orchestrator/adapters/** (CLAUDE-EXECUTION-001).
         src_dir = REPO_ROOT / "src" / "orchestrator"
-        for path in src_dir.glob("*.py"):
+        for path in src_dir.rglob("*.py"):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("shell=True", text, f"shell=True found in {path}")
 
