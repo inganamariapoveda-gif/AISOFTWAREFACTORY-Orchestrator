@@ -1,0 +1,20 @@
+# AGENTS.yaml — roster declarativo de agentes (BOOTSTRAP)
+#
+# Fuente de verdad: 01_MASTER_SPEC.md §2, §7, §13.
+# En BOOTSTRAP ningún agente se conecta todavía: enabled debe ser false.
+# No incluir API keys, secretos ni credenciales en este archivo.
+
+version: 1
+
+agents:
+  director:
+    role: "director"
+    provider: "openai_api"
+    port: "DirectorPort"
+    enabled: false
+
+  developer:
+    role: "developer"
+    provider: "claude_code_cli"
+    port: "DeveloperPort"
+    enabled: false

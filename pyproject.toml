@@ -1,0 +1,18 @@
+[project]
+name = "aisoftwarefactory-orchestrator"
+version = "0.1.0"
+description = "AISOFTWAREFACTORY Development Orchestrator - BOOTSTRAP increment"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML==6.0.3",
+]
+
+[project.scripts]
+orchestrator = "orchestrator.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,23 @@
+# PROJECT_RULES.yaml — proyecto ficticio SAMPLE (BOOTSTRAP)
+#
+# Fuente de verdad: 01_MASTER_SPEC.md §7, §15.
+# Usado únicamente para probar carga/configuración. No es AIP.
+
+version: 1
+
+project_id: SAMPLE
+name: "Proyecto de ejemplo (ficticio)"
+repo_path: "./projects/SAMPLE"
+
+commands:
+  test: null
+  lint: null
+  tsc: null
+  build: null
+
+protected_paths:
+  - "**/.env*"
+  - "**/migrations/**"
+  - "infra/**"
+
+autonomy_overrides: {}

@@ -1,0 +1,19 @@
+# PERMISSIONS.yaml — mínimo privilegio (BOOTSTRAP)
+#
+# Fuente de verdad: 01_MASTER_SPEC.md §7, §10.
+# El motor falla cerrado si este archivo falta o es inválido.
+
+version: 1
+
+deny:
+  production: true
+  git_push: true
+  git_merge: true
+  irreversible_actions: true
+  env_files: true
+  secret_files: true
+
+# BOOTSTRAP no ejecuta comandos externos (no hay verifier/runner todavía,
+# §17). La lista se mantiene vacía deliberadamente: cualquier comando no
+# declarado aquí queda prohibido por defecto (fail closed).
+allowed_commands: []

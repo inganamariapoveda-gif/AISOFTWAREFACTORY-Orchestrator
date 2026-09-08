@@ -1,0 +1,35 @@
+# GATES.yaml — qué transiciones exigen qué aprobación (BOOTSTRAP)
+#
+# Fuente de verdad: 01_MASTER_SPEC.md §7, §8, §9.
+# Representación declarativa únicamente; la interacción completa con el
+# Director y con la Product Owner no se implementa en este incremento.
+
+version: 1
+
+# VERDE se ejecuta automáticamente dentro de una tarea autorizada (§8).
+automatic_approval:
+  verde: true
+
+# Gate interno de aprobación del Director para AMARILLO expresamente
+# contemplado (§8). No requiere intervención humana.
+director_internal_gate:
+  amarillo_contemplado: true
+
+# Human Gates definidos en la Master Spec (§9).
+human_gates:
+  - name: HUMAN_UI_REVIEW
+    trigger: "el cambio afecta interfaz visible"
+    action: "revisa visualmente -> APROBADO o describe el problema"
+  - name: HUMAN_FUNCTIONAL_TEST
+    trigger: "el cambio afecta comportamiento funcional"
+    action: "prueba funcionalmente -> APROBADO o describe el problema"
+  - name: HUMAN_BUSINESS_DECISION
+    trigger: "decision material no contemplada, escalada desde BLOCKED"
+    action: "decide entre las alternativas presentadas"
+  - name: HUMAN_CRITICAL_APPROVAL
+    trigger: "accion clasificada ROJO no prohibida"
+    action: "aprueba o rechaza explicitamente"
+
+# Toda decisión material no contemplada se detiene y escala (§0, §8).
+escalation:
+  decision_material_no_contemplada: "BLOCKED_THEN_HUMAN_BUSINESS_DECISION"
