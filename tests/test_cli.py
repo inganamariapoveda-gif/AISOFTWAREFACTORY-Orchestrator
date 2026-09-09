@@ -30,7 +30,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator import app  # noqa: E402
-from orchestrator.adapters.claude_code import EXPECTED_HANDSHAKE_RESULT  # noqa: E402
+from orchestrator.adapters.claude_code import (  # noqa: E402
+    EXPECTED_HANDSHAKE_RESULT,
+    EXPECTED_WRITE_RESULT,
+    WRITE_PROBE_AFTER_CONTENT,
+    WRITE_PROBE_TARGET_FILENAME,
+)
+from orchestrator.sandbox import SANDBOX_PREFIX  # noqa: E402
 from orchestrator.store import Store  # noqa: E402
 
 
@@ -188,6 +194,34 @@ class CliFixtureTestCase(unittest.TestCase):
             "restricted": True,
         }
         developer.update(overrides)
+        data["agents"]["developer"] = developer
+        _write_yaml(self.config_dir / "AGENTS.yaml", data)
+
+    def enable_write_probe(self, **write_probe_overrides) -> None:
+        """CLAUDE-EXECUTION-002: habilita developer + write_probe con una
+        configuración válida (permission_mode/restricted/max_turns/
+        timeout_seconds propios, independientes del handshake read-only,
+        que permanece en "plan")."""
+        data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
+        write_probe = {
+            "enabled": True,
+            "permission_mode": "acceptEdits",
+            "restricted": True,
+            "max_turns": 3,
+            "timeout_seconds": 90,
+        }
+        write_probe.update(write_probe_overrides)
+        developer = {
+            "role": "developer",
+            "enabled": True,
+            "executable": "claude",
+            "output_format": "json",
+            "max_turns": 1,
+            "timeout_seconds": 60,
+            "permission_mode": "plan",
+            "restricted": True,
+            "write_probe": write_probe,
+        }
         data["agents"]["developer"] = developer
         _write_yaml(self.config_dir / "AGENTS.yaml", data)
 
@@ -464,6 +498,106 @@ class DeveloperProbeEnabledTests(CliFixtureTestCase):
         ):
             rc = self.run_cli("developer-probe")
         self.assertNotEqual(rc, 0)
+
+
+def _sandbox_dirs(root: Path) -> list[str]:
+    return [p.name for p in root.iterdir() if p.name.startswith(SANDBOX_PREFIX)]
+
+
+class DeveloperWriteProbeDisabledTests(CliFixtureTestCase):
+    """Escenario obligatorio 22 (CLAUDE-EXECUTION-002): write_probe
+    deshabilitado/ausente -> CLI rechaza sin invocar subprocess."""
+
+    def test_write_probe_rejected_when_not_declared(self) -> None:
+        self.enable_developer()  # developer habilitado, sin write_probe
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            rc = self.run_cli("developer-write-probe")
+        self.assertNotEqual(rc, 0)
+        mock_run.assert_not_called()
+        self.assertEqual(_sandbox_dirs(self.root), [])
+
+    def test_write_probe_rejected_when_explicitly_disabled(self) -> None:
+        self.enable_write_probe(enabled=False)
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            rc = self.run_cli("developer-write-probe")
+        self.assertNotEqual(rc, 0)
+        mock_run.assert_not_called()
+
+
+class DeveloperWriteProbeEnabledTests(CliFixtureTestCase):
+    """Verifica el wiring end-to-end de `developer-write-probe`: creación
+    del sandbox, invocación del adaptador (subprocess mockeado) y limpieza
+    del sandbox tanto en éxito como en fallo controlado."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.enable_write_probe()
+
+    def test_write_probe_success_cleans_sandbox_and_prints_summary(self) -> None:
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": EXPECTED_WRITE_RESULT,
+                "session_id": "s1",
+                "num_turns": 2,
+                "duration_ms": 321,
+            }
+        )
+
+        def fake_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / WRITE_PROBE_TARGET_FILENAME).write_text(
+                WRITE_PROBE_AFTER_CONTENT, encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", side_effect=fake_run
+        ) as mock_run:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = self.run_cli("developer-write-probe")
+
+        self.assertEqual(rc, 0)
+        mock_run.assert_called_once()
+        self.assertIn(EXPECTED_WRITE_RESULT, stdout.getvalue())
+
+        # 25. sandbox se limpia después de éxito.
+        self.assertEqual(_sandbox_dirs(self.root), [])
+
+    def test_write_probe_controlled_failure_still_cleans_sandbox(self) -> None:
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "NOT_THE_RIGHT_TEXT",
+                "session_id": "s1",
+                "num_turns": 1,
+                "duration_ms": 10,
+            }
+        )
+
+        def fake_run(args, **kwargs):
+            # No modifica TARGET.txt: la evaluación fallará por evidencia
+            # de filesystem, además de por el texto de 'result' incorrecto.
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", side_effect=fake_run
+        ):
+            rc = self.run_cli("developer-write-probe")
+
+        self.assertNotEqual(rc, 0)
+
+        # 26. sandbox se limpia después de fallo controlado (finally).
+        self.assertEqual(_sandbox_dirs(self.root), [])
 
 
 if __name__ == "__main__":

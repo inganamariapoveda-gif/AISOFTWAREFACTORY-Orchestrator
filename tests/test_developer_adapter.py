@@ -1,7 +1,11 @@
-"""Pruebas del adaptador ClaudeCodeAdapter (DeveloperPort) — CLAUDE-EXECUTION-001.
+"""Pruebas del adaptador ClaudeCodeAdapter (DeveloperPort) —
+CLAUDE-EXECUTION-001 (handshake read-only) y CLAUDE-EXECUTION-002
+(write-probe determinista en sandbox efímero).
 
 No dependen de llamadas reales a Claude: subprocess.run y shutil.which se
-mockean siempre en esta suite. La única invocación real autorizada es la
+mockean siempre en esta suite, y cualquier "modificación de filesystem" de
+Claude se simula escribiendo directamente en un directorio temporal real
+(nunca dentro del repositorio). La única invocación real autorizada es la
 prueba LIVE manual descrita en el informe de entrega, fuera de esta suite.
 """
 
@@ -21,11 +25,21 @@ if str(SRC_DIR) not in sys.path:
 
 from orchestrator.adapters.claude_code import (  # noqa: E402
     EXPECTED_HANDSHAKE_RESULT,
+    EXPECTED_WRITE_RESULT,
     HANDSHAKE_PROMPT,
+    WRITE_PROBE_AFTER_CONTENT,
+    WRITE_PROBE_BEFORE_CONTENT,
+    WRITE_PROBE_DO_NOT_TOUCH_CONTENT,
+    WRITE_PROBE_DO_NOT_TOUCH_FILENAME,
+    WRITE_PROBE_PROMPT,
+    WRITE_PROBE_TARGET_FILENAME,
     DeveloperExecutionError,
     DeveloperResult,
+    DeveloperWriteResult,
     _build_args,
+    prepare_sandbox_files,
     run_handshake,
+    run_write_probe,
 )
 
 # Lista de flags que nunca deben aparecer en argv, sin importar el escenario
@@ -73,6 +87,85 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
     return subprocess.CompletedProcess(
         args=["claude"], returncode=returncode, stdout=stdout, stderr=stderr
     )
+
+
+def _valid_write_probe_developer_config(**write_probe_overrides) -> dict:
+    """developer_config COMPLETO (executable/output_format compartidos +
+    write_probe.* propio), tal como lo recibe run_write_probe()."""
+    write_probe = {
+        "max_turns": 3,
+        "timeout_seconds": 90,
+        "permission_mode": "acceptEdits",
+        "restricted": True,
+    }
+    write_probe.update(write_probe_overrides)
+    return {
+        "executable": "claude",
+        "output_format": "json",
+        "write_probe": write_probe,
+    }
+
+
+def _valid_write_result_payload(**overrides) -> dict:
+    payload = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": EXPECTED_WRITE_RESULT,
+        "session_id": "sess-write-1",
+        "num_turns": 2,
+        "duration_ms": 987,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _fake_subprocess_run(mutate_fn, *, returncode: int = 0, stdout: str = ""):
+    """Sustituto de subprocess.run(): en vez de invocar un proceso real,
+    aplica `mutate_fn(cwd)` sobre el directorio recibido en kwargs['cwd']
+    (simulando lo que Claude habría escrito en el sandbox) y devuelve un
+    CompletedProcess con el (returncode, stdout) indicados. `mutate_fn`
+    puede ser None para simular "Claude no tocó nada"."""
+
+    def _run(args, **kwargs):
+        if mutate_fn is not None:
+            mutate_fn(Path(kwargs["cwd"]))
+        return subprocess.CompletedProcess(
+            args=args, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    return _run
+
+
+def _write_target_after(cwd: Path) -> None:
+    (cwd / WRITE_PROBE_TARGET_FILENAME).write_text(WRITE_PROBE_AFTER_CONTENT, encoding="utf-8")
+
+
+def _leave_target_unchanged(cwd: Path) -> None:
+    pass
+
+
+def _write_target_wrong_content(cwd: Path) -> None:
+    (cwd / WRITE_PROBE_TARGET_FILENAME).write_text("WRONG_CONTENT", encoding="utf-8")
+
+
+def _write_target_after_and_touch_do_not_touch(cwd: Path) -> None:
+    _write_target_after(cwd)
+    (cwd / WRITE_PROBE_DO_NOT_TOUCH_FILENAME).write_text("MODIFIED", encoding="utf-8")
+
+
+def _write_target_after_and_create_extra_file(cwd: Path) -> None:
+    _write_target_after(cwd)
+    (cwd / "EXTRA.txt").write_text("unexpected", encoding="utf-8")
+
+
+def _write_target_after_and_delete_do_not_touch(cwd: Path) -> None:
+    _write_target_after(cwd)
+    (cwd / WRITE_PROBE_DO_NOT_TOUCH_FILENAME).unlink()
+
+
+def _rename_target(cwd: Path) -> None:
+    (cwd / WRITE_PROBE_TARGET_FILENAME).rename(cwd / "RENAMED.txt")
 
 
 class BuildArgsTests(unittest.TestCase):
@@ -361,6 +454,261 @@ class DeveloperConfigValidationTests(unittest.TestCase):
                 run_handshake(
                     developer_config=developer_config,
                     prompt=HANDSHAKE_PROMPT,
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+
+# ============================================================
+# CLAUDE-EXECUTION-002: write-probe (sandbox efímero)
+# ============================================================
+
+
+class PrepareSandboxFilesTests(unittest.TestCase):
+    def test_creates_exact_before_and_do_not_touch_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = Path(tmp)
+            prepare_sandbox_files(sandbox)
+            self.assertEqual(
+                (sandbox / WRITE_PROBE_TARGET_FILENAME).read_text(encoding="utf-8"),
+                WRITE_PROBE_BEFORE_CONTENT,
+            )
+            self.assertEqual(
+                (sandbox / WRITE_PROBE_DO_NOT_TOUCH_FILENAME).read_text(encoding="utf-8"),
+                WRITE_PROBE_DO_NOT_TOUCH_CONTENT,
+            )
+
+
+class WriteProbeTestCase(unittest.TestCase):
+    """Sandbox real (directorio temporal fuera del repo, para no depender
+    de orchestrator.sandbox en estas pruebas de adaptador) con TARGET.txt/
+    DO_NOT_TOUCH.txt ya preparados, como los recibiría run_write_probe()."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.sandbox = Path(self._tmp.name).resolve()
+        prepare_sandbox_files(self.sandbox)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+
+class WriteProbeSuccessTests(WriteProbeTestCase):
+    def test_target_before_to_after_only_passes(self) -> None:
+        # 9. TARGET BEFORE->AFTER únicamente -> PASS. Cubre también 1-8,
+        # 11 y 13 (argv/subprocess/cwd/authorized_root) en una sola llamada.
+        developer_config = _valid_write_probe_developer_config(max_turns=5)
+        payload = _valid_write_result_payload()
+
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ) as mock_which, mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            side_effect=_fake_subprocess_run(_write_target_after, stdout=json.dumps(payload)),
+        ) as mock_run:
+            result = run_write_probe(
+                developer_config=developer_config,
+                cwd=self.sandbox,
+                authorized_root=self.sandbox,
+            )
+
+        mock_which.assert_called_once_with("claude")
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        argv = call_args[0]
+
+        # 4. argv contiene acceptEdits
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "5")
+        # 5. argv contiene --restricted
+        self.assertIn("--restricted", argv)
+        # ningún flag prohibido
+        joined = " ".join(argv)
+        for fragment in NEVER_ALLOWED_ARGV_FRAGMENTS:
+            self.assertNotIn(fragment, joined)
+
+        # 6. shell=False
+        self.assertIs(call_kwargs["shell"], False)
+        # 7. prompt enviado mediante stdin
+        self.assertEqual(call_kwargs["input"], WRITE_PROBE_PROMPT)
+        # 8. prompt no aparece en argv
+        self.assertTrue(all(WRITE_PROBE_PROMPT not in a for a in argv))
+        # 2. cwd de subprocess == sandbox; 3. authorized_root == sandbox
+        self.assertEqual(call_kwargs["cwd"], str(self.sandbox))
+        self.assertEqual(call_kwargs["timeout"], 90)
+
+        self.assertIsInstance(result, DeveloperWriteResult)
+        self.assertTrue(result.success)
+        self.assertEqual(result.result_text, EXPECTED_WRITE_RESULT)
+        self.assertEqual(result.changed_paths, (WRITE_PROBE_TARGET_FILENAME,))
+        self.assertEqual(result.created_paths, ())
+        self.assertEqual(result.deleted_paths, ())
+        self.assertEqual(result.session_id, "sess-write-1")
+        self.assertEqual(result.num_turns, 2)
+        self.assertEqual(result.duration_ms, 987)
+
+        # Evidencia independiente adicional: releer los archivos reales.
+        self.assertEqual(
+            (self.sandbox / WRITE_PROBE_TARGET_FILENAME).read_text(encoding="utf-8"),
+            WRITE_PROBE_AFTER_CONTENT,
+        )
+        self.assertEqual(
+            (self.sandbox / WRITE_PROBE_DO_NOT_TOUCH_FILENAME).read_text(encoding="utf-8"),
+            WRITE_PROBE_DO_NOT_TOUCH_CONTENT,
+        )
+
+
+class WriteProbeFailClosedTests(WriteProbeTestCase):
+    def _expect_failure(
+        self,
+        mutate_fn,
+        *,
+        returncode: int = 0,
+        payload: dict | None = None,
+        developer_config: dict | None = None,
+    ) -> None:
+        if developer_config is None:
+            developer_config = _valid_write_probe_developer_config()
+        stdout = json.dumps(payload) if payload is not None else ""
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            side_effect=_fake_subprocess_run(mutate_fn, returncode=returncode, stdout=stdout),
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_write_probe(
+                    developer_config=developer_config,
+                    cwd=self.sandbox,
+                    authorized_root=self.sandbox,
+                )
+
+    def test_target_unchanged_fails_closed(self) -> None:
+        # 10. TARGET no cambia -> FAIL
+        self._expect_failure(_leave_target_unchanged, payload=_valid_write_result_payload())
+
+    def test_target_wrong_content_fails_closed(self) -> None:
+        # 11. TARGET termina con contenido distinto de AFTER -> FAIL
+        self._expect_failure(_write_target_wrong_content, payload=_valid_write_result_payload())
+
+    def test_do_not_touch_modified_fails_closed(self) -> None:
+        # 12. DO_NOT_TOUCH cambia -> FAIL
+        self._expect_failure(
+            _write_target_after_and_touch_do_not_touch, payload=_valid_write_result_payload()
+        )
+
+    def test_extra_file_created_fails_closed(self) -> None:
+        # 13. archivo adicional creado -> FAIL
+        self._expect_failure(
+            _write_target_after_and_create_extra_file, payload=_valid_write_result_payload()
+        )
+
+    def test_do_not_touch_deleted_fails_closed(self) -> None:
+        # 14. archivo eliminado -> FAIL
+        self._expect_failure(
+            _write_target_after_and_delete_do_not_touch, payload=_valid_write_result_payload()
+        )
+
+    def test_target_renamed_fails_closed(self) -> None:
+        # 15. archivo renombrado -> FAIL (se ve como delete + create)
+        self._expect_failure(_rename_target, payload=_valid_write_result_payload())
+
+    def test_claude_says_ok_but_filesystem_wrong_fails_closed(self) -> None:
+        # 16. respuesta CLAUDE_WRITE_OK pero filesystem incorrecto -> FAIL.
+        # La evidencia de filesystem tiene prioridad sobre la narrativa.
+        self._expect_failure(_leave_target_unchanged, payload=_valid_write_result_payload())
+
+    def test_filesystem_correct_but_response_wrong_fails_closed(self) -> None:
+        # 17. filesystem correcto pero respuesta distinta -> FAIL
+        self._expect_failure(
+            _write_target_after,
+            payload=_valid_write_result_payload(result="NOT_THE_RIGHT_TEXT"),
+        )
+
+    def test_missing_type_fails_closed(self) -> None:
+        # 18a. type ausente -> FAIL
+        payload = _valid_write_result_payload()
+        del payload["type"]
+        self._expect_failure(_write_target_after, payload=payload)
+
+    def test_subtype_not_success_fails_closed(self) -> None:
+        # 18b. subtype != success -> FAIL
+        self._expect_failure(
+            _write_target_after, payload=_valid_write_result_payload(subtype="failure")
+        )
+
+    def test_is_error_true_fails_closed(self) -> None:
+        # 18c. is_error inválido -> FAIL
+        self._expect_failure(
+            _write_target_after, payload=_valid_write_result_payload(is_error=True)
+        )
+
+    def test_timeout_fails_closed(self) -> None:
+        # 19. timeout -> FAIL
+        developer_config = _valid_write_probe_developer_config()
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_write_probe(
+                    developer_config=developer_config,
+                    cwd=self.sandbox,
+                    authorized_root=self.sandbox,
+                )
+
+    def test_nonzero_exit_code_fails_closed(self) -> None:
+        # 20. exit code != 0 -> FAIL
+        self._expect_failure(
+            _write_target_after, returncode=1, payload=_valid_write_result_payload()
+        )
+
+    def test_cwd_outside_authorized_root_fails_before_subprocess(self) -> None:
+        # 21. cwd fuera de authorized_root -> FAIL antes de subprocess.run.
+        outside = Path(tempfile.mkdtemp())
+        try:
+            developer_config = _valid_write_probe_developer_config()
+            with mock.patch(
+                "orchestrator.adapters.claude_code.shutil.which",
+                return_value="/resolved/claude",
+            ), mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run"
+            ) as mock_run:
+                with self.assertRaises(DeveloperExecutionError):
+                    run_write_probe(
+                        developer_config=developer_config,
+                        cwd=outside,
+                        authorized_root=self.sandbox,
+                    )
+            mock_run.assert_not_called()
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+
+class WriteProbeConfigValidationTests(unittest.TestCase):
+    """Defensa en profundidad a nivel de adaptador (además de
+    config_loader): permission_mode/restricted del write_probe."""
+
+    def test_permission_mode_other_than_accept_edits_rejected(self) -> None:
+        developer_config = _valid_write_probe_developer_config(permission_mode="plan")
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_write_probe(
+                    developer_config=developer_config,
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+    def test_restricted_not_true_rejected(self) -> None:
+        developer_config = _valid_write_probe_developer_config(restricted=False)
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_write_probe(
+                    developer_config=developer_config,
                     cwd=REPO_ROOT,
                     authorized_root=REPO_ROOT,
                 )

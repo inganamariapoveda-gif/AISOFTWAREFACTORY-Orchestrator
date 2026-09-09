@@ -1,4 +1,5 @@
-# AGENTS.yaml — roster declarativo de agentes (BOOTSTRAP + CLAUDE-EXECUTION-001)
+# AGENTS.yaml — roster declarativo de agentes
+# (BOOTSTRAP + CLAUDE-EXECUTION-001 + CLAUDE-EXECUTION-002)
 #
 # Fuente de verdad: 01_MASTER_SPEC.md §2, §7, §13.
 # El Director permanece deshabilitado (enabled: false): D1/D2 (§0) reservan
@@ -7,6 +8,11 @@
 # handshake seguro y no interactivo con Claude Code CLI (--permission-mode
 # plan + --restricted, sin edición, sin Bash):
 # ver src/orchestrator/adapters/claude_code.py.
+# write_probe (CLAUDE-EXECUTION-002) es una configuración SEPARADA y
+# explícita para una única escritura determinista dentro de un sandbox
+# efímero (--permission-mode acceptEdits + --restricted). No sustituye ni
+# debilita el handshake read-only anterior, que sigue exclusivamente en
+# "plan".
 # No incluir API keys, secretos ni credenciales en este archivo.
 
 version: 1
@@ -37,3 +43,15 @@ agents:
     # comandos/código (Bash, PowerShell, REPL, etc.). No es un default
     # silencioso: config_loader exige explícitamente restricted: true.
     restricted: true
+
+    # CLAUDE-EXECUTION-002: sandbox de escritura controlada. permission_mode
+    # y restricted PROPIOS, independientes de los de arriba (que siguen en
+    # "plan"). executable/output_format se reutilizan de este mismo bloque
+    # developer, sin duplicarse.
+    write_probe:
+      enabled: true
+      permission_mode: "acceptEdits"
+      restricted: true
+      # Un solo turno: modificar TARGET.txt y responder. Pequeño y acotado.
+      max_turns: 3
+      timeout_seconds: 90

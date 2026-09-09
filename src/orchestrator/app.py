@@ -12,12 +12,16 @@ import json
 import sys
 from pathlib import Path
 
+from . import sandbox as sandbox_mod
 from .adapters.claude_code import (
     HANDSHAKE_PROMPT,
     DeveloperExecutionError,
+    prepare_sandbox_files,
     run_handshake,
+    run_write_probe,
 )
 from .config_loader import ConfigError, OrchestratorConfig, load_core_config, load_project_rules
+from .sandbox import SandboxError
 from .state_machine import StateMachineError
 from .store import InvalidIdError, Store, StoreError, validate_id
 
@@ -162,6 +166,41 @@ def cmd_developer_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_developer_write_probe(args: argparse.Namespace) -> int:
+    """CLAUDE-EXECUTION-002: autoriza una única escritura determinista
+    (TARGET.txt: BEFORE -> AFTER) dentro de un sandbox efímero DENTRO de
+    REPO_ROOT. El sandbox es el único lugar que Claude puede leer/escribir;
+    nunca AIP, FOA, projects/SAMPLE, src/, tests/ ni config/. Se elimina
+    siempre al finalizar (éxito o fallo controlado), vía finally."""
+    config = _require_core_config()
+    developer_config = config.agents.get("agents", {}).get("developer", {})
+    write_probe_config = developer_config.get("write_probe", {})
+    if write_probe_config.get("enabled") is not True:
+        print("error: write_probe is not enabled in AGENTS.yaml", file=sys.stderr)
+        return 1
+
+    sandbox_path = sandbox_mod.create_sandbox(REPO_ROOT)
+    try:
+        prepare_sandbox_files(sandbox_path)
+        result = run_write_probe(
+            developer_config=developer_config,
+            cwd=sandbox_path,
+            authorized_root=sandbox_path,
+        )
+    finally:
+        sandbox_mod.cleanup_sandbox(sandbox_path, repo_root=REPO_ROOT)
+
+    summary = {
+        "success": result.success,
+        "changed_paths": list(result.changed_paths),
+        "created_paths": list(result.created_paths),
+        "deleted_paths": list(result.deleted_paths),
+        "result_text": result.result_text,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     _require_core_config()
     db_path = _ensure_within_repo(Path(args.db_path))
@@ -221,6 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_developer_probe)
 
+    p = sub.add_parser(
+        "developer-write-probe",
+        help="Escritura determinista controlada en un sandbox efímero (TARGET.txt: BEFORE -> AFTER)",
+    )
+    p.set_defaults(func=cmd_developer_write_probe)
+
     return parser
 
 
@@ -236,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         StoreError,
         CliError,
         DeveloperExecutionError,
+        SandboxError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -27,12 +27,15 @@ Reglas de seguridad aplicadas aquí (Master Spec §10, §11):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .. import sandbox as sandbox_mod
 
 # Handshake determinista (CORRECTION-001, hallazgo 1): el texto exacto que
 # debe devolver Claude. No se acepta coincidencia parcial, startswith, ni
@@ -59,6 +62,42 @@ _FORBIDDEN_FLAGS = frozenset(
     }
 )
 
+# ============================================================
+# CLAUDE-EXECUTION-002: write-probe determinista en sandbox efímero.
+#
+# permission_mode propio ("acceptEdits"), separado por completo del
+# handshake read-only anterior (que sigue exclusivamente en "plan"). Nunca
+# se reutiliza ni se debilita _ALLOWED_PERMISSION_MODES.
+# ============================================================
+_WRITE_PROBE_PERMISSION_MODE = "acceptEdits"
+
+WRITE_PROBE_TARGET_FILENAME = "TARGET.txt"
+WRITE_PROBE_DO_NOT_TOUCH_FILENAME = "DO_NOT_TOUCH.txt"
+WRITE_PROBE_BEFORE_CONTENT = "BEFORE"
+WRITE_PROBE_AFTER_CONTENT = "AFTER"
+WRITE_PROBE_DO_NOT_TOUCH_CONTENT = "DO_NOT_TOUCH"
+EXPECTED_WRITE_RESULT = "CLAUDE_WRITE_OK"
+
+_EXPECTED_TARGET_AFTER_BYTES = WRITE_PROBE_AFTER_CONTENT.encode("utf-8")
+_EXPECTED_TARGET_AFTER_SHA256 = hashlib.sha256(_EXPECTED_TARGET_AFTER_BYTES).hexdigest()
+_EXPECTED_TARGET_AFTER_SIZE = len(_EXPECTED_TARGET_AFTER_BYTES)
+
+# Prompt construido enteramente a partir de las constantes anteriores, para
+# no duplicar los valores exactos exigidos en ningún otro lugar. No
+# contiene rutas personales ni secretos.
+WRITE_PROBE_PROMPT = (
+    "You are working ONLY inside the current working directory (a disposable "
+    "sandbox). "
+    f"Modify EXCLUSIVELY the file {WRITE_PROBE_TARGET_FILENAME}: it currently "
+    f"contains exactly \"{WRITE_PROBE_BEFORE_CONTENT}\"; replace its entire "
+    f"content with exactly \"{WRITE_PROBE_AFTER_CONTENT}\" and nothing else. "
+    f"Do not modify {WRITE_PROBE_DO_NOT_TOUCH_FILENAME}. Do not create, "
+    "delete, or rename any file. Do not read or write anything outside this "
+    "directory. Do not run Bash, PowerShell, or any other command. When "
+    "done, reply with exactly one line and nothing else: "
+    f"{EXPECTED_WRITE_RESULT}"
+)
+
 
 class DeveloperExecutionError(Exception):
     """Fallo controlado del adaptador Developer. Nunca se traduce en éxito."""
@@ -72,6 +111,21 @@ class DeveloperResult:
     num_turns: int | None
     duration_ms: int | None
     is_error: bool
+    exit_code: int
+
+
+@dataclass(frozen=True)
+class DeveloperWriteResult:
+    success: bool
+    result_text: str
+    changed_paths: tuple[str, ...]
+    created_paths: tuple[str, ...]
+    deleted_paths: tuple[str, ...]
+    target_before_hash: str | None
+    target_after_hash: str | None
+    session_id: str | None
+    num_turns: int | None
+    duration_ms: int | None
     exit_code: int
 
 
@@ -275,3 +329,226 @@ def run_handshake(
         ) from exc
 
     return _parse_completed_process(completed)
+
+
+# ============================================================
+# CLAUDE-EXECUTION-002: write-probe (sandbox efímero)
+# ============================================================
+
+
+def prepare_sandbox_files(sandbox: Path | str) -> None:
+    """Crea TARGET.txt y DO_NOT_TOUCH.txt con contenido EXACTO dentro del
+    sandbox, ANTES de invocar a Claude. No copia archivos del orquestador
+    ni crea symlinks; no contiene secretos ni datos reales."""
+    sandbox_path = Path(sandbox)
+    (sandbox_path / WRITE_PROBE_TARGET_FILENAME).write_text(
+        WRITE_PROBE_BEFORE_CONTENT, encoding="utf-8"
+    )
+    (sandbox_path / WRITE_PROBE_DO_NOT_TOUCH_FILENAME).write_text(
+        WRITE_PROBE_DO_NOT_TOUCH_CONTENT, encoding="utf-8"
+    )
+
+
+def _validate_write_probe_config(
+    developer_config: dict[str, Any],
+) -> tuple[str, str, int, int, str]:
+    """Valida developer.executable/output_format (compartidos con el
+    handshake read-only) y developer.write_probe.* (independientes:
+    permission_mode/restricted/max_turns/timeout_seconds propios)."""
+    executable = developer_config.get("executable")
+    output_format = developer_config.get("output_format")
+
+    if not isinstance(executable, str) or not executable:
+        raise DeveloperExecutionError("developer.executable must be a non-empty string")
+    if output_format != "json":
+        raise DeveloperExecutionError("developer.output_format must be 'json'")
+
+    write_probe = developer_config.get("write_probe")
+    if not isinstance(write_probe, dict):
+        raise DeveloperExecutionError("developer.write_probe must be a mapping")
+
+    max_turns = write_probe.get("max_turns")
+    timeout_seconds = write_probe.get("timeout_seconds")
+    permission_mode = write_probe.get("permission_mode")
+    restricted = write_probe.get("restricted")
+
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+        raise DeveloperExecutionError("developer.write_probe.max_turns must be a positive integer")
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 1
+    ):
+        raise DeveloperExecutionError(
+            "developer.write_probe.timeout_seconds must be a positive integer"
+        )
+    if permission_mode != _WRITE_PROBE_PERMISSION_MODE:
+        raise DeveloperExecutionError(
+            f"developer.write_probe.permission_mode must be {_WRITE_PROBE_PERMISSION_MODE!r}"
+        )
+    # Defensa en profundidad, independiente de config_loader (mismo patrón
+    # que _validate_developer_config para el handshake read-only).
+    if restricted is not True:
+        raise DeveloperExecutionError("developer.write_probe.restricted must be true")
+
+    return executable, output_format, max_turns, timeout_seconds, permission_mode
+
+
+def run_write_probe(
+    *,
+    developer_config: dict[str, Any],
+    cwd: Path | str,
+    authorized_root: Path | str,
+) -> DeveloperWriteResult:
+    """Ejecuta un único write-probe determinista dentro de un sandbox ya
+    preparado (ver prepare_sandbox_files()). No crea ni elimina el sandbox:
+    esa responsabilidad es de orchestrator.sandbox y de quien orquesta la
+    llamada (app.py).
+
+    Falla cerrado ante cualquier anomalía: configuración incompleta,
+    ejecutable ausente, cwd fuera de authorized_root, timeout, exit code
+    != 0, JSON inválido/inesperado, o evidencia de filesystem que no
+    coincide EXACTAMENTE con el contrato (solo TARGET.txt cambia, a
+    exactamente AFTER; ningún archivo nuevo, eliminado o renombrado;
+    DO_NOT_TOUCH.txt intacto). La evidencia de filesystem tiene prioridad
+    sobre la narrativa de Claude: nunca se convierte un fallo en éxito.
+    """
+    executable_name, output_format, max_turns, timeout_seconds, permission_mode = (
+        _validate_write_probe_config(developer_config)
+    )
+    executable_path = _resolve_executable(executable_name)
+    resolved_cwd = _resolve_cwd(cwd, authorized_root)
+
+    # Snapshot PRE: producido directamente por Python, antes de invocar a
+    # Claude. Nunca se confía en su respuesta narrativa para saber qué
+    # cambió realmente.
+    pre_snapshot = sandbox_mod.snapshot(resolved_cwd)
+
+    args = _build_args(
+        executable_path,
+        output_format=output_format,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+    )
+
+    for arg in args:
+        if arg in _FORBIDDEN_FLAGS:
+            raise DeveloperExecutionError("forbidden flag present in constructed command")
+
+    try:
+        completed = subprocess.run(
+            args,
+            input=WRITE_PROBE_PROMPT,
+            cwd=str(resolved_cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False,
+        )
+    except FileNotFoundError as exc:
+        raise DeveloperExecutionError(
+            f"executable could not be launched: {type(exc).__name__}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DeveloperExecutionError(
+            f"developer execution timed out after {timeout_seconds}s"
+        ) from exc
+
+    # Snapshot POST: independiente de si Claude "dice" haber terminado
+    # correctamente.
+    post_snapshot = sandbox_mod.snapshot(resolved_cwd)
+
+    return _evaluate_write_probe(completed, pre_snapshot, post_snapshot)
+
+
+def _evaluate_write_probe(
+    completed: "subprocess.CompletedProcess[str]",
+    pre_snapshot: dict[str, sandbox_mod.EntrySnapshot],
+    post_snapshot: dict[str, sandbox_mod.EntrySnapshot],
+) -> DeveloperWriteResult:
+    if completed.returncode != 0:
+        raise DeveloperExecutionError(
+            f"developer execution failed: exit_code={completed.returncode}"
+        )
+
+    try:
+        data = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise DeveloperExecutionError("developer output is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise DeveloperExecutionError("developer JSON output is not a JSON object")
+
+    # Handshake determinista (mismo criterio que el read-only, hallazgo 1 de
+    # CORRECTION-001): sin coincidencia parcial ni normalización.
+    if data.get("type") != "result":
+        raise DeveloperExecutionError("developer JSON 'type' is missing or is not 'result'")
+    if data.get("subtype") != "success":
+        raise DeveloperExecutionError("developer JSON 'subtype' is missing or is not 'success'")
+
+    is_error = data.get("is_error")
+    if not isinstance(is_error, bool) or is_error:
+        raise DeveloperExecutionError(f"developer reported is_error={is_error!r}")
+
+    result_text = data.get("result")
+    if not isinstance(result_text, str):
+        raise DeveloperExecutionError("developer JSON missing string 'result' field")
+    if result_text != EXPECTED_WRITE_RESULT:
+        raise DeveloperExecutionError(
+            "developer write-probe 'result' did not match the expected exact text"
+        )
+
+    session_id = data.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise DeveloperExecutionError("developer JSON 'session_id' has unexpected type")
+    num_turns = data.get("num_turns")
+    if num_turns is not None and (not isinstance(num_turns, int) or isinstance(num_turns, bool)):
+        raise DeveloperExecutionError("developer JSON 'num_turns' has unexpected type")
+    duration_ms = data.get("duration_ms")
+    if duration_ms is not None and (
+        not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+    ):
+        raise DeveloperExecutionError("developer JSON 'duration_ms' has unexpected type")
+
+    # Evidencia de filesystem, independiente de la narrativa de Claude: la
+    # respuesta JSON validada arriba NUNCA es suficiente por sí sola.
+    target_pre = pre_snapshot.get(WRITE_PROBE_TARGET_FILENAME)
+    if target_pre is None or target_pre.kind != "file":
+        raise DeveloperExecutionError("TARGET.txt did not exist as a file before the probe")
+
+    pre_paths = set(pre_snapshot)
+    post_paths = set(post_snapshot)
+    created = sorted(post_paths - pre_paths)
+    deleted = sorted(pre_paths - post_paths)
+    changed = sorted(
+        path for path in (pre_paths & post_paths) if pre_snapshot[path] != post_snapshot[path]
+    )
+
+    if created:
+        raise DeveloperExecutionError("write probe created unexpected path(s)")
+    if deleted:
+        raise DeveloperExecutionError("write probe deleted unexpected path(s)")
+    if changed != [WRITE_PROBE_TARGET_FILENAME]:
+        raise DeveloperExecutionError("write probe modified an unexpected set of paths")
+
+    target_post = post_snapshot[WRITE_PROBE_TARGET_FILENAME]
+    if (
+        target_post.kind != "file"
+        or target_post.sha256 != _EXPECTED_TARGET_AFTER_SHA256
+        or target_post.size != _EXPECTED_TARGET_AFTER_SIZE
+    ):
+        raise DeveloperExecutionError("TARGET.txt content after the probe did not match exactly")
+
+    return DeveloperWriteResult(
+        success=True,
+        result_text=result_text,
+        changed_paths=tuple(changed),
+        created_paths=tuple(created),
+        deleted_paths=tuple(deleted),
+        target_before_hash=target_pre.sha256,
+        target_after_hash=target_post.sha256,
+        session_id=session_id,
+        num_turns=num_turns,
+        duration_ms=duration_ms,
+        exit_code=completed.returncode,
+    )

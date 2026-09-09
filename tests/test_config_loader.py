@@ -400,6 +400,107 @@ class DeveloperHandshakeConfigTests(unittest.TestCase):
             self.assertFalse(config.agents["agents"]["developer"]["enabled"])
 
 
+def _valid_write_probe() -> dict:
+    return {
+        "enabled": True,
+        "permission_mode": "acceptEdits",
+        "restricted": True,
+        "max_turns": 3,
+        "timeout_seconds": 90,
+    }
+
+
+class WriteProbeConfigTests(unittest.TestCase):
+    """CLAUDE-EXECUTION-002: agents.developer.write_probe es opt-in; si se
+    declara enabled: true, exige permission_mode==acceptEdits,
+    restricted==true, max_turns y timeout_seconds válidos. Independiente
+    del handshake read-only (developer.permission_mode sigue en "plan")."""
+
+    def _load_with_write_probe(self, write_probe: dict) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            developer = _valid_developer_handshake()
+            developer["write_probe"] = write_probe
+            agents["agents"]["developer"] = developer
+            _write_core_config(tmp, agents=agents)
+            load_core_config(tmp)
+
+    def _load_with_write_probe_override(self, **overrides) -> None:
+        write_probe = _valid_write_probe()
+        write_probe.update(overrides)
+        self._load_with_write_probe(write_probe)
+
+    def test_complete_valid_write_probe_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            developer = _valid_developer_handshake()
+            developer["write_probe"] = _valid_write_probe()
+            agents["agents"]["developer"] = developer
+            _write_core_config(tmp, agents=agents)
+            config = load_core_config(tmp)
+            write_probe = config.agents["agents"]["developer"]["write_probe"]
+            self.assertTrue(write_probe["enabled"])
+            self.assertEqual(write_probe["permission_mode"], "acceptEdits")
+            # El handshake read-only NO se debilita: sigue en "plan".
+            self.assertEqual(
+                config.agents["agents"]["developer"]["permission_mode"], "plan"
+            )
+
+    def test_write_probe_absent_is_accepted(self) -> None:
+        # write_probe es opt-in: su ausencia no debe fallar.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            agents["agents"]["developer"] = _valid_developer_handshake()
+            _write_core_config(tmp, agents=agents)
+            config = load_core_config(tmp)
+            self.assertNotIn("write_probe", config.agents["agents"]["developer"])
+
+    def test_write_probe_disabled_does_not_require_other_fields(self) -> None:
+        self._load_with_write_probe({"enabled": False})
+
+    def test_permission_mode_other_than_accept_edits_rejected(self) -> None:
+        # 23. permission_mode diferente de acceptEdits -> ConfigError.
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe_override(permission_mode="plan")
+        self.assertIn("write_probe.permission_mode", str(ctx.exception))
+
+    def test_permission_mode_bypass_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe_override(permission_mode="bypassPermissions")
+        self.assertIn("write_probe.permission_mode", str(ctx.exception))
+
+    def test_restricted_false_rejected(self) -> None:
+        # 24. restricted != true -> ConfigError.
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe_override(restricted=False)
+        self.assertIn("write_probe.restricted", str(ctx.exception))
+
+    def test_restricted_missing_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            write_probe = _valid_write_probe()
+            del write_probe["restricted"]
+            self._load_with_write_probe(write_probe)
+        self.assertIn("write_probe.restricted", str(ctx.exception))
+
+    def test_max_turns_invalid_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe_override(max_turns=0)
+        self.assertIn("write_probe.max_turns", str(ctx.exception))
+
+    def test_timeout_seconds_invalid_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe_override(timeout_seconds=-1)
+        self.assertIn("write_probe.timeout_seconds", str(ctx.exception))
+
+    def test_enabled_non_boolean_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load_with_write_probe({"enabled": "yes"})
+        self.assertIn("write_probe.enabled", str(ctx.exception))
+
+
 class OnUnclassifiedTests(unittest.TestCase):
     """Hallazgo 3: una acción no clasificada debe fallar cerrado (BLOCKED),
     nunca heredar silenciosamente un nivel aprobable."""

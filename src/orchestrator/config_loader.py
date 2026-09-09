@@ -36,6 +36,11 @@ REQUIRED_HUMAN_GATES = frozenset(
 # CLAUDE-EXECUTION-001: modos de permiso admitidos para agents.developer
 # cuando enabled: true (handshake seguro con Claude Code CLI, §17 roadmap).
 ALLOWED_DEVELOPER_PERMISSION_MODES = frozenset({"plan"})
+
+# CLAUDE-EXECUTION-002: permission_mode propio y separado para el
+# write-probe en sandbox efímero. Nunca se reutiliza para el handshake
+# read-only, que permanece exclusivamente en "plan".
+WRITE_PROBE_PERMISSION_MODE = "acceptEdits"
 REQUIRED_PERMISSION_DENY_KEYS = (
     "deny.production",
     "deny.git_push",
@@ -160,6 +165,10 @@ def _validate_agents(data: dict[str, Any], path: Path) -> None:
         )
     if developer_enabled:
         _validate_developer_handshake_config(developer, path)
+    # Independiente de developer_enabled: si alguien declara write_probe
+    # habilitado, sus campos deben ser válidos de todos modos (fail closed,
+    # sin defaults silenciosos).
+    _validate_write_probe_config(developer, path)
 
 
 def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
@@ -200,6 +209,53 @@ def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) 
     if developer.get("restricted") is not True:
         raise ConfigError(
             f"'agents.developer.restricted' must be true when enabled ({path})"
+        )
+
+
+def _validate_write_probe_config(developer: dict[str, Any], path: Path) -> None:
+    """CLAUDE-EXECUTION-002: agents.developer.write_probe es opt-in y
+    separado del handshake read-only. Si está ausente, no se exige nada
+    (compatibilidad retroactiva). Si está presente, 'enabled' debe ser un
+    booleano explícito; si es true, exige permission_mode=='acceptEdits',
+    restricted==true, max_turns y timeout_seconds válidos. Falla cerrado
+    sin defaults silenciosos que debiliten el control."""
+    write_probe = developer.get("write_probe")
+    if write_probe is None:
+        return
+    if not isinstance(write_probe, dict):
+        raise ConfigError(f"'agents.developer.write_probe' must be a mapping in {path}")
+
+    enabled = write_probe.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ConfigError(
+            f"'agents.developer.write_probe.enabled' must be a boolean when declared ({path})"
+        )
+    if not enabled:
+        return
+
+    if write_probe.get("permission_mode") != WRITE_PROBE_PERMISSION_MODE:
+        raise ConfigError(
+            "'agents.developer.write_probe.permission_mode' must be "
+            f"{WRITE_PROBE_PERMISSION_MODE!r} when enabled ({path})"
+        )
+    if write_probe.get("restricted") is not True:
+        raise ConfigError(
+            f"'agents.developer.write_probe.restricted' must be true when enabled ({path})"
+        )
+    max_turns = write_probe.get("max_turns")
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+        raise ConfigError(
+            f"'agents.developer.write_probe.max_turns' must be a positive integer when enabled ({path})"
+        )
+    timeout_seconds = write_probe.get("timeout_seconds")
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 1
+    ):
+        raise ConfigError(
+            "'agents.developer.write_probe.timeout_seconds' must be a positive integer "
+            f"when enabled ({path})"
         )
 
 
