@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
+from . import evidence as evidence_mod
 from . import sandbox as sandbox_mod
 from .adapters.claude_code import (
     HANDSHAKE_PROMPT,
@@ -21,6 +24,7 @@ from .adapters.claude_code import (
     run_write_probe,
 )
 from .config_loader import ConfigError, OrchestratorConfig, load_core_config, load_project_rules
+from .evidence import EvidenceError
 from .sandbox import SandboxError
 from .state_machine import StateMachineError
 from .store import InvalidIdError, Store, StoreError, validate_id
@@ -201,6 +205,91 @@ def cmd_developer_write_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_fake_evidence_repo(repo_path: Path) -> None:
+    """Configura un repositorio Git ficticio y desechable para
+    evidence-probe. Esto es setup de la DEMOSTRACIÓN (código de
+    probe/CLI), no una capacidad genérica del recolector de evidencia
+    (orchestrator/evidence.py es READ-ONLY por diseño). Identidad LOCAL y
+    claramente ficticia; NUNCA se toca `git config --global`. Sin remote,
+    sin push."""
+    (repo_path / "allowed.txt").write_text("BEFORE", encoding="utf-8")
+    (repo_path / "untouched.txt").write_text("UNCHANGED", encoding="utf-8")
+
+    git_exe = shutil.which("git")
+    if git_exe is None:
+        raise CliError("git executable not found on PATH")
+
+    def _git(*args: str) -> None:
+        try:
+            subprocess.run(
+                [git_exe, *args],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                shell=False,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise CliError(
+                f"git {args[0]} failed while setting up the evidence probe repo "
+                f"(exit_code={exc.returncode})"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CliError(f"git {args[0]} timed out while setting up the evidence probe repo") from exc
+
+    _git("init")
+    _git("config", "user.name", "Evidence Probe")
+    _git("config", "user.email", "evidence-probe@localhost")
+    _git("add", "allowed.txt", "untouched.txt")
+    _git("commit", "-m", "baseline")
+
+
+def cmd_evidence_probe(args: argparse.Namespace) -> int:
+    """EVIDENCE-001: demuestra el recolector reutilizable de evidencia Git
+    sobre un repositorio Git ficticio y desechable, DENTRO de REPO_ROOT.
+    No conecta AIP ni FOA; no invoca Claude Code (no gasta llamada de
+    modelo). El sandbox se crea y elimina con los mismos controles de
+    seguridad que developer-write-probe (prefijo propio, confinado a
+    REPO_ROOT, verificación de identidad antes de seguir cualquier
+    enlace)."""
+    _require_core_config()
+    repo_path = sandbox_mod.create_sandbox(
+        REPO_ROOT, prefix=evidence_mod.GIT_EVIDENCE_PROBE_PREFIX
+    )
+    try:
+        _setup_fake_evidence_repo(repo_path)
+
+        before = evidence_mod.capture_snapshot(repo_path, authorized_root=REPO_ROOT)
+
+        # Modificación EXCLUSIVAMENTE vía Python directo (no Claude, no
+        # subprocess): BEFORE -> AFTER en allowed.txt.
+        (repo_path / "allowed.txt").write_text("AFTER", encoding="utf-8")
+
+        change_evidence = evidence_mod.capture_change_evidence(before, ["allowed.txt"])
+        result = evidence_mod.evaluate(change_evidence, expected_head_unchanged=True)
+    finally:
+        sandbox_mod.cleanup_sandbox(
+            repo_path, repo_root=REPO_ROOT, prefix=evidence_mod.GIT_EVIDENCE_PROBE_PREFIX
+        )
+
+    summary = {
+        "success": result.success,
+        "base_sha": result.base_sha,
+        "current_head_sha": result.current_head_sha,
+        "head_changed": result.head_changed,
+        "changed_paths": list(result.changed_paths),
+        "created_paths": list(result.created_paths),
+        "deleted_paths": list(result.deleted_paths),
+        "renamed_paths": [list(pair) for pair in result.renamed_paths],
+        "untracked_paths": list(result.untracked_paths),
+        "out_of_scope_paths": list(result.out_of_scope_paths),
+        "reason": result.reason,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if result.success else 1
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     _require_core_config()
     db_path = _ensure_within_repo(Path(args.db_path))
@@ -266,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_developer_write_probe)
 
+    p = sub.add_parser(
+        "evidence-probe",
+        help="Demuestra el recolector de evidencia Git sobre un repositorio ficticio desechable",
+    )
+    p.set_defaults(func=cmd_evidence_probe)
+
     return parser
 
 
@@ -282,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         CliError,
         DeveloperExecutionError,
         SandboxError,
+        EvidenceError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

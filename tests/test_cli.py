@@ -36,6 +36,7 @@ from orchestrator.adapters.claude_code import (  # noqa: E402
     WRITE_PROBE_AFTER_CONTENT,
     WRITE_PROBE_TARGET_FILENAME,
 )
+from orchestrator.evidence import EvidenceError, GIT_EVIDENCE_PROBE_PREFIX  # noqa: E402
 from orchestrator.sandbox import SANDBOX_PREFIX  # noqa: E402
 from orchestrator.store import Store  # noqa: E402
 
@@ -598,6 +599,49 @@ class DeveloperWriteProbeEnabledTests(CliFixtureTestCase):
 
         # 26. sandbox se limpia después de fallo controlado (finally).
         self.assertEqual(_sandbox_dirs(self.root), [])
+
+
+def _evidence_repo_dirs(root: Path) -> list[str]:
+    return [p.name for p in root.iterdir() if p.name.startswith(GIT_EVIDENCE_PROBE_PREFIX)]
+
+
+class EvidenceProbeTests(CliFixtureTestCase):
+    """Grupo G (EVIDENCE-001): evidence-probe usa git real (sin Claude,
+    sin llamada al modelo) sobre un repositorio ficticio desechable
+    DENTRO de REPO_ROOT (patchado a self.root en esta fixture)."""
+
+    def test_evidence_probe_success_modifies_only_allowed_file(self) -> None:
+        # 33/34: éxito produce exclusivamente el cambio autorizado;
+        # untouched.txt queda implícitamente intacto (out_of_scope vacío).
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = self.run_cli("evidence-probe")
+
+        self.assertEqual(rc, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertTrue(output["success"])
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["created_paths"], [])
+        self.assertEqual(output["deleted_paths"], [])
+        self.assertEqual(output["renamed_paths"], [])
+        self.assertEqual(output["untracked_paths"], [])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertFalse(output["head_changed"])
+
+        # 35. repo temporal se elimina tras éxito.
+        self.assertEqual(_evidence_repo_dirs(self.root), [])
+
+    def test_evidence_probe_cleans_up_repo_after_controlled_failure(self) -> None:
+        # 36. repo temporal se elimina tras fallo controlado, vía finally,
+        # incluso si la evaluación de evidencia falla internamente.
+        with mock.patch(
+            "orchestrator.app.evidence_mod.capture_change_evidence",
+            side_effect=EvidenceError("simulated failure"),
+        ):
+            rc = self.run_cli("evidence-probe")
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(_evidence_repo_dirs(self.root), [])
 
 
 if __name__ == "__main__":
