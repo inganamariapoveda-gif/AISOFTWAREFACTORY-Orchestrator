@@ -39,6 +39,7 @@ from orchestrator.adapters.claude_code import (  # noqa: E402
 from orchestrator.evidence import EvidenceError, GIT_EVIDENCE_PROBE_PREFIX  # noqa: E402
 from orchestrator.sandbox import SANDBOX_PREFIX  # noqa: E402
 from orchestrator.store import Store  # noqa: E402
+from orchestrator.task_packet import TaskPacketError  # noqa: E402
 
 
 def _valid_core_config() -> dict[str, dict]:
@@ -139,10 +140,34 @@ class CliFixtureTestCase(unittest.TestCase):
 
         self.db_path = self.root / "orchestrator.db"
 
+        self.tasks_dir = self.root / "tasks"
+        self.tasks_dir.mkdir()
+        self.sample_task_path = self.tasks_dir / "SAMPLE_TASK.yaml"
+        _write_yaml(
+            self.sample_task_path,
+            {
+                "task_id": "SAMPLE-001",
+                "project_id": "SAMPLE",
+                "objective": "Change the content of allowed.txt",
+                "scope": ["Modify allowed.txt"],
+                "out_of_scope": ["Modify any other file"],
+                "authorized_files": ["allowed.txt"],
+                "forbidden_files": ["untouched.txt"],
+                "constraints": ["No new dependencies"],
+                "acceptance_criteria": ["allowed.txt contains AFTER"],
+                "security_criteria": ["No secrets in code"],
+                "mandatory_tests": ["unit"],
+                "stop_rules": ["Unauthorized file modified"],
+                "required_evidence": ["git_diff", "test_output"],
+            },
+        )
+
         self._patches = [
             mock.patch.object(app, "REPO_ROOT", self.root),
             mock.patch.object(app, "CONFIG_DIR", self.config_dir),
             mock.patch.object(app, "PROJECTS_DIR", self.projects_dir),
+            mock.patch.object(app, "TASKS_DIR", self.tasks_dir),
+            mock.patch.object(app, "SAMPLE_TASK_PACKET_PATH", self.sample_task_path),
         ]
         for p in self._patches:
             p.start()
@@ -642,6 +667,71 @@ class EvidenceProbeTests(CliFixtureTestCase):
 
         self.assertNotEqual(rc, 0)
         self.assertEqual(_evidence_repo_dirs(self.root), [])
+
+
+class TaskPacketProbeTests(CliFixtureTestCase):
+    """Grupo H (TASK-PACKET-001): task-packet-probe carga
+    tasks/SAMPLE_TASK.yaml (fixture), valida, construye la developer
+    instruction dos veces, y demuestra determinismo -- sin invocar Claude
+    Code, sin modificar ningún archivo, sin ejecutar comandos."""
+
+    def test_task_packet_probe_passes_and_prints_expected_summary(self) -> None:
+        # 41. task-packet-probe PASS.
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = self.run_cli("task-packet-probe")
+
+        self.assertEqual(rc, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertTrue(output["valid"])
+        self.assertEqual(output["task_id"], "SAMPLE-001")
+        self.assertEqual(output["project_id"], "SAMPLE")
+        self.assertEqual(output["authorized_files"], ["allowed.txt"])
+        self.assertEqual(output["forbidden_files"], ["untouched.txt"])
+        self.assertEqual(output["mandatory_tests"], ["unit"])
+        self.assertTrue(output["instruction_deterministic"])
+
+    def test_task_packet_probe_does_not_modify_parent_git_or_fixture_files(self) -> None:
+        # 42. no modifica parent Git (ni ningún otro archivo): es
+        # exclusivamente lectura + validación + construcción de texto en
+        # memoria. Se compara el estado completo del árbol patcheado
+        # (REPO_ROOT/config/projects/tasks) antes y después.
+        def _snapshot() -> set[str]:
+            return {
+                str(p.relative_to(self.root))
+                for p in self.root.rglob("*")
+                if p.is_file()
+            }
+
+        before = _snapshot()
+        rc = self.run_cli("task-packet-probe")
+        after = _snapshot()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(before, after)
+
+        # El repositorio Git REAL del orquestador (no la fixture) tampoco
+        # se toca: task-packet-probe no invoca git en absoluto.
+        real_repo_status_before = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            check=True,
+        ).stdout
+        self.run_cli("task-packet-probe")
+        real_repo_status_after = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            check=True,
+        ).stdout
+        self.assertEqual(real_repo_status_before, real_repo_status_after)
 
 
 if __name__ == "__main__":

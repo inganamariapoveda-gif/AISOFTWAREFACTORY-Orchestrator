@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import evidence as evidence_mod
 from . import sandbox as sandbox_mod
+from . import task_packet as task_packet_mod
 from .adapters.claude_code import (
     HANDSHAKE_PROMPT,
     DeveloperExecutionError,
@@ -28,10 +29,13 @@ from .evidence import EvidenceError
 from .sandbox import SandboxError
 from .state_machine import StateMachineError
 from .store import InvalidIdError, Store, StoreError, validate_id
+from .task_packet import TaskPacketError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config"
 PROJECTS_DIR = REPO_ROOT / "projects"
+TASKS_DIR = REPO_ROOT / "tasks"
+SAMPLE_TASK_PACKET_PATH = TASKS_DIR / "SAMPLE_TASK.yaml"
 DEFAULT_DB_PATH = REPO_ROOT / "orchestrator.db"
 
 
@@ -290,6 +294,33 @@ def cmd_evidence_probe(args: argparse.Namespace) -> int:
     return 0 if result.success else 1
 
 
+def cmd_task_packet_probe(args: argparse.Namespace) -> int:
+    """TASK-PACKET-001: demuestra el contrato Task Packet definition ->
+    validation -> deterministic developer instruction sobre
+    tasks/SAMPLE_TASK.yaml (completamente ficticio). NUNCA invoca Claude
+    Code, NUNCA ejecuta comandos/tests del proyecto, NUNCA modifica
+    ningún archivo: es exclusivamente carga + validación + construcción
+    determinista de texto en memoria."""
+    _require_core_config()
+    packet = task_packet_mod.load_task_packet_from_yaml_file(SAMPLE_TASK_PACKET_PATH)
+
+    instruction_1 = task_packet_mod.build_developer_instruction(packet)
+    instruction_2 = task_packet_mod.build_developer_instruction(packet)
+    instruction_deterministic = instruction_1 == instruction_2
+
+    summary = {
+        "valid": True,
+        "task_id": packet.task_id,
+        "project_id": packet.project_id,
+        "authorized_files": list(packet.authorized_files),
+        "forbidden_files": list(packet.forbidden_files),
+        "mandatory_tests": list(packet.mandatory_tests),
+        "instruction_deterministic": instruction_deterministic,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if instruction_deterministic else 1
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     _require_core_config()
     db_path = _ensure_within_repo(Path(args.db_path))
@@ -361,6 +392,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_evidence_probe)
 
+    p = sub.add_parser(
+        "task-packet-probe",
+        help="Demuestra Task Packet definition -> validation -> deterministic developer instruction",
+    )
+    p.set_defaults(func=cmd_task_packet_probe)
+
     return parser
 
 
@@ -378,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         DeveloperExecutionError,
         SandboxError,
         EvidenceError,
+        TaskPacketError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

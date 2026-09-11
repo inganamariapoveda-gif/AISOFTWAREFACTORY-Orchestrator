@@ -1,0 +1,31 @@
+# TASK-PACKET-001: Task Packet de ejemplo, completamente ficticio.
+# No se refiere a AIP ni FOA; no contiene información real de clientes.
+task_id: SAMPLE-001
+project_id: SAMPLE
+objective: "Cambiar el contenido de allowed.txt de BEFORE a AFTER"
+scope:
+  - "Modificar allowed.txt"
+out_of_scope:
+  - "Modificar cualquier otro archivo"
+  - "Cambiar dependencias"
+authorized_files:
+  - allowed.txt
+forbidden_files:
+  - untouched.txt
+constraints:
+  - "Sin nuevas dependencias"
+  - "Sin cambios de esquema"
+acceptance_criteria:
+  - "allowed.txt contiene AFTER"
+security_criteria:
+  - "Sin secretos en el código"
+  - "Sin cambios de permisos"
+mandatory_tests:
+  - unit
+stop_rules:
+  - "Archivo no autorizado modificado"
+  - "Dependencia nueva detectada"
+  - "Decisión material no contemplada"
+required_evidence:
+  - git_diff
+  - test_output
