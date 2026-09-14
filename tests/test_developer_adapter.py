@@ -38,6 +38,7 @@ from orchestrator.adapters.claude_code import (  # noqa: E402
     DeveloperWriteResult,
     _build_args,
     prepare_sandbox_files,
+    run_developer_task,
     run_handshake,
     run_write_probe,
 )
@@ -709,6 +710,226 @@ class WriteProbeConfigValidationTests(unittest.TestCase):
             with self.assertRaises(DeveloperExecutionError):
                 run_write_probe(
                     developer_config=developer_config,
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+
+# ============================================================
+# TASK-EXECUTION-002: run_developer_task (adaptador genérico de tarea de
+# desarrollo). Reutiliza la MISMA validación de developer_config que el
+# write-probe (_valid_write_probe_developer_config): permission_mode ==
+# acceptEdits, restricted == true. A diferencia del handshake/write-probe,
+# NUNCA exige un texto de 'result' exacto -- solo su estructura.
+# ============================================================
+
+
+def _valid_generic_result_payload(**overrides) -> dict:
+    payload = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "whatever Claude says, never checked verbatim",
+        "session_id": "sess-generic-1",
+        "num_turns": 3,
+        "duration_ms": 4321,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class RunDeveloperTaskTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_valid_success_builds_secure_call_and_parses_structurally(self) -> None:
+        developer_config = _valid_write_probe_developer_config(max_turns=4)
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ) as mock_which, mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            result = run_developer_task(
+                developer_config=developer_config,
+                prompt="STRUCTURED TASK INSTRUCTION",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+
+        mock_which.assert_called_once_with("claude")
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        argv = call_args[0]
+
+        # acceptEdits + --restricted (reutiliza las mismas garantías del
+        # write-probe, D-EXEC-002).
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        self.assertIn("--restricted", argv)
+        joined = " ".join(argv)
+        for fragment in NEVER_ALLOWED_ARGV_FRAGMENTS:
+            self.assertNotIn(fragment, joined)
+
+        # shell=False; prompt SOLO por stdin, nunca en argv.
+        self.assertIs(call_kwargs["shell"], False)
+        self.assertEqual(call_kwargs["input"], "STRUCTURED TASK INSTRUCTION")
+        self.assertTrue(all("STRUCTURED TASK INSTRUCTION" not in a for a in argv))
+        self.assertEqual(call_kwargs["cwd"], str(self.cwd))
+        self.assertEqual(call_kwargs["timeout"], 90)
+
+        self.assertIsInstance(result, DeveloperResult)
+        self.assertTrue(result.success)
+        self.assertFalse(result.is_error)
+        # Nunca exige un texto exacto de 'result' (a diferencia del
+        # handshake/write-probe): cualquier string estructuralmente válido
+        # es aceptado.
+        self.assertEqual(result.result_text, "whatever Claude says, never checked verbatim")
+
+    def test_cwd_outside_authorized_root_rejected_before_subprocess(self) -> None:
+        outside = Path(tempfile.mkdtemp())
+        try:
+            developer_config = _valid_write_probe_developer_config()
+            with mock.patch(
+                "orchestrator.adapters.claude_code.shutil.which",
+                return_value="/resolved/claude",
+            ), mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run"
+            ) as mock_run:
+                with self.assertRaises(DeveloperExecutionError):
+                    run_developer_task(
+                        developer_config=developer_config,
+                        prompt="x",
+                        cwd=outside,
+                        authorized_root=self.cwd,
+                    )
+            mock_run.assert_not_called()
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_timeout_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_nonzero_exit_code_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        completed = _completed(returncode=1, stderr="boom")
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_malformed_json_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        completed = _completed(returncode=0, stdout="not json at all")
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_wrong_subtype_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        payload = _valid_generic_result_payload(subtype="failure")
+        completed = _completed(returncode=0, stdout=json.dumps(payload))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_is_error_true_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        payload = _valid_generic_result_payload(is_error=True)
+        completed = _completed(returncode=0, stdout=json.dumps(payload))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_result_not_str_fails_closed(self) -> None:
+        developer_config = _valid_write_probe_developer_config()
+        payload = _valid_generic_result_payload(result=12345)
+        completed = _completed(returncode=0, stdout=json.dumps(payload))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+
+    def test_permission_mode_other_than_accept_edits_rejected(self) -> None:
+        developer_config = _valid_write_probe_developer_config(permission_mode="plan")
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+    def test_restricted_not_true_rejected(self) -> None:
+        developer_config = _valid_write_probe_developer_config(restricted=False)
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
                     cwd=REPO_ROOT,
                     authorized_root=REPO_ROOT,
                 )

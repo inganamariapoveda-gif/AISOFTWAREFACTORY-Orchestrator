@@ -50,6 +50,13 @@ REQUIRED_PERMISSION_DENY_KEYS = (
     "deny.secret_files",
 )
 
+# TASK-EXECUTION-002 (D-EXEC-001): mismo patrón de identificador simple que
+# task_packet._IDENTIFIER_RE (letra inicial, luego letras/dígitos/guion/guion
+# bajo). Usado tanto para las claves de PROJECT_RULES.commands como para las
+# entradas de PERMISSIONS.allowed_commands: ambas son IDs lógicos, nunca
+# comandos de shell.
+_LOGICAL_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
 
 class ConfigError(Exception):
     """Configuración faltante, inválida o insegura. Falla cerrado."""
@@ -282,6 +289,48 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
     allowed_commands = _require(data, "allowed_commands", path)
     if not isinstance(allowed_commands, list):
         raise ConfigError(f"'allowed_commands' must be a list in {path}")
+    # D-EXEC-001/PERMISSIONS §6: allowed_commands es una lista CERRADA de IDs
+    # lógicos globalmente autorizados -- nunca argv, nunca un string de shell.
+    for idx, item in enumerate(allowed_commands):
+        if not isinstance(item, str) or not item:
+            raise ConfigError(
+                f"'allowed_commands[{idx}]' must be a non-empty string in {path}"
+            )
+        if not _LOGICAL_ID_RE.fullmatch(item):
+            raise ConfigError(
+                f"'allowed_commands[{idx}]' must be a simple logical identifier, "
+                f"not a shell command: {item!r} ({path})"
+            )
+
+
+def _validate_commands(commands: dict[str, Any], path: Path) -> None:
+    """D-EXEC-001: PROJECT_RULES.commands es un mapping ABIERTO
+    logical_id -> argv (lista de strings); no existen slots semánticos fijos
+    (test/lint/tsc/build) en el motor. `commands: {}` es válido. Cada argv se
+    valida aquí SOLO como estructura (lista no vacía de strings no vacíos,
+    sin listas anidadas, sin null, sin string de shell): nunca se interpreta
+    ni se divide un string. Falla cerrado ante cualquier forma inesperada."""
+    for key, value in commands.items():
+        if not isinstance(key, str) or not key:
+            raise ConfigError(f"'commands' key must be a non-empty string in {path}: {key!r}")
+        if "\x00" in key:
+            raise ConfigError(f"'commands' key must not contain NUL characters in {path}: {key!r}")
+        if not _LOGICAL_ID_RE.fullmatch(key):
+            raise ConfigError(
+                f"'commands' key {key!r} must be a simple logical identifier "
+                f"(letters/digits/'-'/'_' only, starting with a letter) in {path}"
+            )
+        if not isinstance(value, list) or not value:
+            raise ConfigError(f"'commands.{key}' must be a non-empty list (argv) in {path}")
+        for idx, item in enumerate(value):
+            if not isinstance(item, str) or not item:
+                raise ConfigError(
+                    f"'commands.{key}[{idx}]' must be a non-empty string in {path}"
+                )
+            if "\x00" in item:
+                raise ConfigError(
+                    f"'commands.{key}[{idx}]' must not contain NUL characters in {path}"
+                )
 
 
 def _validate_project_rules(data: dict[str, Any], path: Path) -> None:
@@ -291,6 +340,7 @@ def _validate_project_rules(data: dict[str, Any], path: Path) -> None:
         raise ConfigError(f"'project_id' must be a non-empty string in {path}")
     if not isinstance(data["commands"], dict):
         raise ConfigError(f"'commands' must be a mapping in {path}")
+    _validate_commands(data["commands"], path)
     if not isinstance(data["protected_paths"], list):
         raise ConfigError(f"'protected_paths' must be a list in {path}")
 
@@ -325,3 +375,47 @@ def load_project_rules(rules_path: Path | str) -> dict[str, Any]:
     data = _load_yaml_mapping(rules_path)
     _validate_project_rules(data, rules_path)
     return data
+
+
+def resolve_project_root(
+    project_rules: dict[str, Any],
+    *,
+    project_id: str,
+    orchestrator_repo_root: Path | str,
+) -> Path:
+    """TASK-EXECUTION-002 (D-EXEC-003): PROJECT_RULES.repo_path es la ÚNICA
+    fuente configurable de autorización del root de un proyecto. El Task
+    Packet nunca define ni amplía este root: aquí solo se usa su
+    `project_id`, exigiendo que coincida EXACTAMENTE con
+    PROJECT_RULES.project_id (misma comprobación que app._require_project_rules,
+    reaplicada aquí porque esta función puede invocarse independientemente).
+
+    repo_path puede ser relativo (se resuelve respecto a
+    orchestrator_repo_root, el root del propio orquestador) o absoluto;
+    siempre se canonicaliza (resolve()). Falla cerrado si el resultado no
+    existe o no es un directorio. Nunca crea el directorio ni corrige la
+    ruta; la validación profunda de que sea un repositorio Git confinado y
+    seguro sigue siendo responsabilidad de orchestrator.evidence."""
+    rules_project_id = project_rules.get("project_id")
+    if rules_project_id != project_id:
+        raise ConfigError(
+            f"PROJECT_RULES project_id {rules_project_id!r} does not match "
+            f"requested project_id {project_id!r}"
+        )
+
+    repo_path = project_rules.get("repo_path")
+    if not isinstance(repo_path, str) or not repo_path:
+        raise ConfigError("'repo_path' must be a non-empty string in PROJECT_RULES")
+
+    orchestrator_root_resolved = Path(orchestrator_repo_root).resolve()
+    candidate = Path(repo_path)
+    if not candidate.is_absolute():
+        candidate = orchestrator_root_resolved / candidate
+    resolved = candidate.resolve()
+
+    if not resolved.exists():
+        raise ConfigError(f"resolved project root does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ConfigError(f"resolved project root is not a directory: {resolved}")
+
+    return resolved

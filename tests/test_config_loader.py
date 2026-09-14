@@ -15,6 +15,7 @@ from orchestrator.config_loader import (  # noqa: E402
     ConfigError,
     load_core_config,
     load_project_rules,
+    resolve_project_root,
 )
 
 CONFIG_DIR = REPO_ROOT / "config"
@@ -570,6 +571,180 @@ class NoShellTrueTests(unittest.TestCase):
         for path in src_dir.rglob("*.py"):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("shell=True", text, f"shell=True found in {path}")
+
+
+# ============================================================
+# TASK-EXECUTION-002: PROJECT_RULES.commands (D-EXEC-001, mapping abierto
+# logical_id -> argv) y PERMISSIONS.allowed_commands (D-EXEC-001, lista
+# cerrada de IDs lógicos).
+# ============================================================
+
+
+class ProjectRulesCommandsTests(unittest.TestCase):
+    """Cada prueba escribe un PROJECT_RULES.yaml mínimo, válido salvo el
+    campo 'commands' bajo prueba."""
+
+    def _write_rules(self, tmp: Path, commands) -> Path:
+        path = tmp / "PROJECT_RULES.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "project_id": "X",
+                    "repo_path": ".",
+                    "commands": commands,
+                    "protected_paths": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_empty_commands_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {})
+            rules = load_project_rules(path)
+            self.assertEqual(rules["commands"], {})
+
+    def test_valid_logical_id_to_argv_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": ["python", "verify_task.py"]})
+            rules = load_project_rules(path)
+            self.assertEqual(rules["commands"]["unit"], ["python", "verify_task.py"])
+
+    def test_string_command_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": "python verify_task.py"})
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+    def test_null_command_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": None})
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+    def test_empty_argv_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": []})
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+    def test_invalid_logical_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(
+                Path(tmp_str), {"unit && evil": ["python", "verify_task.py"]}
+            )
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+    def test_nested_argv_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": [["python"]]})
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+    def test_argv_with_empty_string_element_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            path = self._write_rules(Path(tmp_str), {"unit": ["python", ""]})
+            with self.assertRaises(ConfigError):
+                load_project_rules(path)
+
+
+class AllowedCommandsValidationTests(unittest.TestCase):
+    def test_allowed_commands_entry_must_be_logical_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            permissions = _baseline_permissions()
+            permissions["allowed_commands"] = ["unit && evil"]
+            _write_core_config(tmp, permissions=permissions)
+            with self.assertRaises(ConfigError):
+                load_core_config(tmp)
+
+    def test_allowed_commands_valid_logical_id_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            permissions = _baseline_permissions()
+            permissions["allowed_commands"] = ["unit"]
+            _write_core_config(tmp, permissions=permissions)
+            config = load_core_config(tmp)
+            self.assertEqual(config.permissions["allowed_commands"], ["unit"])
+
+
+class ProjectRootResolutionTests(unittest.TestCase):
+    """Sección 7: resolve_project_root() -- repo_path SOLO desde
+    PROJECT_RULES, nunca del Task Packet; relativo resuelto contra el repo
+    root del orquestador; canonicalizado; debe existir y ser directorio;
+    project_id debe coincidir. No crea nada, no corrige rutas."""
+
+    def test_relative_repo_path_resolves_against_orchestrator_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            orchestrator_root = Path(tmp_str)
+            project_dir = orchestrator_root / "projects" / "X"
+            project_dir.mkdir(parents=True)
+            rules = {
+                "project_id": "X",
+                "repo_path": "./projects/X",
+                "commands": {},
+                "protected_paths": [],
+            }
+            resolved = resolve_project_root(
+                rules, project_id="X", orchestrator_repo_root=orchestrator_root
+            )
+            self.assertEqual(resolved, project_dir.resolve())
+
+    def test_project_id_mismatch_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            orchestrator_root = Path(tmp_str)
+            rules = {
+                "project_id": "X",
+                "repo_path": ".",
+                "commands": {},
+                "protected_paths": [],
+            }
+            with self.assertRaises(ConfigError):
+                resolve_project_root(
+                    rules, project_id="OTHER", orchestrator_repo_root=orchestrator_root
+                )
+
+    def test_nonexistent_repo_path_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            orchestrator_root = Path(tmp_str)
+            rules = {
+                "project_id": "X",
+                "repo_path": "./does/not/exist",
+                "commands": {},
+                "protected_paths": [],
+            }
+            with self.assertRaises(ConfigError):
+                resolve_project_root(
+                    rules, project_id="X", orchestrator_repo_root=orchestrator_root
+                )
+
+    def test_repo_path_pointing_to_a_file_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            orchestrator_root = Path(tmp_str)
+            a_file = orchestrator_root / "a_file.txt"
+            a_file.write_text("x", encoding="utf-8")
+            rules = {
+                "project_id": "X",
+                "repo_path": "./a_file.txt",
+                "commands": {},
+                "protected_paths": [],
+            }
+            with self.assertRaises(ConfigError):
+                resolve_project_root(
+                    rules, project_id="X", orchestrator_repo_root=orchestrator_root
+                )
+
+    def test_missing_repo_path_field_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            orchestrator_root = Path(tmp_str)
+            rules = {"project_id": "X", "commands": {}, "protected_paths": []}
+            with self.assertRaises(ConfigError):
+                resolve_project_root(
+                    rules, project_id="X", orchestrator_repo_root=orchestrator_root
+                )
 
 
 if __name__ == "__main__":

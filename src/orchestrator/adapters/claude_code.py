@@ -552,3 +552,139 @@ def _evaluate_write_probe(
         duration_ms=duration_ms,
         exit_code=completed.returncode,
     )
+
+
+# ============================================================
+# TASK-EXECUTION-002: run_developer_task (adaptador genérico de tarea de
+# desarrollo, D-EXEC-002).
+#
+# Reutiliza EXCLUSIVAMENTE helpers ya existentes (_resolve_executable,
+# _resolve_cwd, _build_args, _FORBIDDEN_FLAGS, _validate_write_probe_config,
+# DeveloperResult): las MISMAS garantías de seguridad que el write-probe
+# (CLAUDE-EXECUTION-002) -- permission-mode acceptEdits, --restricted,
+# shell=False, prompt por stdin, cwd confinado -- sin duplicar esa lógica ni
+# tocar run_handshake()/run_write_probe(). No se introduce ninguna clave de
+# configuración nueva en AGENTS.yaml en este incremento: developer_config
+# debe declarar el mismo bloque `write_probe` ya validado por config_loader.
+#
+# A diferencia del handshake/write-probe (deterministas, con un texto de
+# 'result' exacto exigido), run_developer_task recibe un prompt ARBITRARIO
+# (la developer instruction de un Task Packet) y por tanto NUNCA puede
+# exigir un texto de respuesta específico. Solo valida la ESTRUCTURA del
+# JSON (type/subtype/is_error/result). Claude nunca es autoridad sobre
+# éxito (D-EXEC-002): ese juicio pertenece a capas posteriores (Git
+# Evidence + mandatory tests), fuera de este adaptador.
+# ============================================================
+
+
+def run_developer_task(
+    *,
+    developer_config: dict[str, Any],
+    prompt: str,
+    cwd: Path | str,
+    authorized_root: Path | str,
+) -> DeveloperResult:
+    """Ejecuta una única instrucción de desarrollo estructurada (Task
+    Packet) con Claude Code CLI, dentro de authorized_root.
+
+    Falla cerrado (DeveloperExecutionError) ante cualquier anomalía:
+    configuración incompleta, ejecutable ausente, cwd fuera de
+    authorized_root, timeout, exit code != 0, JSON inválido, is_error
+    verdadero, o forma inesperada. Nunca convierte un fallo en éxito y
+    nunca exige un texto exacto de 'result' (no PASS/SUCCESS/DONE ni
+    equivalente): solo su forma estructural."""
+    executable_name, output_format, max_turns, timeout_seconds, permission_mode = (
+        _validate_write_probe_config(developer_config)
+    )
+    executable_path = _resolve_executable(executable_name)
+    resolved_cwd = _resolve_cwd(cwd, authorized_root)
+
+    args = _build_args(
+        executable_path,
+        output_format=output_format,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+    )
+
+    for arg in args:
+        if arg in _FORBIDDEN_FLAGS:
+            raise DeveloperExecutionError("forbidden flag present in constructed command")
+
+    try:
+        completed = subprocess.run(
+            args,
+            input=prompt,
+            cwd=str(resolved_cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False,
+        )
+    except FileNotFoundError as exc:
+        raise DeveloperExecutionError(
+            f"executable could not be launched: {type(exc).__name__}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DeveloperExecutionError(
+            f"developer execution timed out after {timeout_seconds}s"
+        ) from exc
+
+    return _parse_generic_task_result(completed)
+
+
+def _parse_generic_task_result(
+    completed: "subprocess.CompletedProcess[str]",
+) -> DeveloperResult:
+    """Validación PURAMENTE estructural (D-EXEC-002): nunca exige un texto
+    de 'result' específico. Mismo criterio de tipos que
+    _parse_completed_process()/_evaluate_write_probe() para type/subtype/
+    is_error/session_id/num_turns/duration_ms; la única diferencia
+    deliberada es que aquí NO se compara result_text contra ningún valor
+    fijo (a diferencia del handshake/write-probe, deterministas)."""
+    if completed.returncode != 0:
+        raise DeveloperExecutionError(
+            f"developer execution failed: exit_code={completed.returncode}"
+        )
+
+    try:
+        data = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise DeveloperExecutionError("developer output is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise DeveloperExecutionError("developer JSON output is not a JSON object")
+
+    if data.get("type") != "result":
+        raise DeveloperExecutionError("developer JSON 'type' is missing or is not 'result'")
+    if data.get("subtype") != "success":
+        raise DeveloperExecutionError("developer JSON 'subtype' is missing or is not 'success'")
+
+    is_error = data.get("is_error")
+    if not isinstance(is_error, bool) or is_error:
+        raise DeveloperExecutionError(f"developer reported is_error={is_error!r}")
+
+    result_text = data.get("result")
+    if not isinstance(result_text, str):
+        raise DeveloperExecutionError("developer JSON missing string 'result' field")
+
+    session_id = data.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise DeveloperExecutionError("developer JSON 'session_id' has unexpected type")
+    num_turns = data.get("num_turns")
+    if num_turns is not None and (not isinstance(num_turns, int) or isinstance(num_turns, bool)):
+        raise DeveloperExecutionError("developer JSON 'num_turns' has unexpected type")
+    duration_ms = data.get("duration_ms")
+    if duration_ms is not None and (
+        not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+    ):
+        raise DeveloperExecutionError("developer JSON 'duration_ms' has unexpected type")
+
+    return DeveloperResult(
+        success=True,
+        result_text=result_text,
+        session_id=session_id,
+        num_turns=num_turns,
+        duration_ms=duration_ms,
+        is_error=False,
+        exit_code=completed.returncode,
+    )

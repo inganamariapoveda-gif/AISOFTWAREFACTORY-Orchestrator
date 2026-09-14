@@ -9,11 +9,10 @@ project_id: SAMPLE
 name: "Proyecto de ejemplo (ficticio)"
 repo_path: "./projects/SAMPLE"
 
-commands:
-  test: null
-  lint: null
-  tsc: null
-  build: null
+# TASK-EXECUTION-002 (D-EXEC-001): mapping ABIERTO logical_id -> argv; sin
+# slots semánticos fijos test/lint/tsc/build en el motor. Vacío en SAMPLE:
+# este proyecto ficticio no declara comandos ejecutables reales.
+commands: {}
 
 protected_paths:
   - "**/.env*"

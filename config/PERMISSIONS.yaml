@@ -13,7 +13,13 @@ deny:
   env_files: true
   secret_files: true
 
-# BOOTSTRAP no ejecuta comandos externos (no hay verifier/runner todavía,
-# §17). La lista se mantiene vacía deliberadamente: cualquier comando no
-# declarado aquí queda prohibido por defecto (fail closed).
-allowed_commands: []
+# TASK-EXECUTION-002 (D-EXEC-001): lista CERRADA de IDs lógicos autorizados
+# GLOBALMENTE (nunca argv, nunca un string de shell). Para que un
+# mandatory_test pueda ejecutarse hace falta la INTERSECCIÓN obligatoria de
+# TaskPacket.mandatory_tests ∩ PERMISSIONS.allowed_commands ∩
+# PROJECT_RULES.commands.keys(); PROJECT_RULES.commands[id] produce
+# entonces el argv preautorizado. Cualquier ID ausente de esta lista queda
+# prohibido por defecto (fail closed), sin importar lo que declare
+# PROJECT_RULES de un proyecto.
+allowed_commands:
+  - unit

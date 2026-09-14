@@ -133,7 +133,7 @@ class CliFixtureTestCase(unittest.TestCase):
                 "project_id": "SAMPLE",
                 "name": "Sample",
                 "repo_path": "./projects/SAMPLE",
-                "commands": {"test": None, "lint": None, "tsc": None, "build": None},
+                "commands": {},
                 "protected_paths": ["**/.env*"],
             },
         )
@@ -626,6 +626,18 @@ class DeveloperWriteProbeEnabledTests(CliFixtureTestCase):
         self.assertEqual(_sandbox_dirs(self.root), [])
 
 
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        shell=False,
+        check=True,
+    )
+
+
 def _evidence_repo_dirs(root: Path) -> list[str]:
     return [p.name for p in root.iterdir() if p.name.startswith(GIT_EVIDENCE_PROBE_PREFIX)]
 
@@ -732,6 +744,483 @@ class TaskPacketProbeTests(CliFixtureTestCase):
             check=True,
         ).stdout
         self.assertEqual(real_repo_status_before, real_repo_status_after)
+
+
+# ============================================================
+# TASK-EXECUTION-002: task-execution-probe. Compone TaskPacket -> project
+# authorization -> developer instruction -> generic Claude adapter -> Git
+# Evidence -> mandatory tests -> Human Gate, sobre un repositorio Git
+# TEMPORAL real (nunca disposable-001/AIP).
+#
+# `subprocess` y `shutil` son módulos stdlib compartidos: parchear
+# "orchestrator.adapters.claude_code.subprocess.run" parchea el MISMO
+# objeto módulo que usa orchestrator.evidence internamente (git real). Por
+# eso aquí se parchea "subprocess.run"/"shutil.which" UNA sola vez con un
+# despachador que distingue por el ejecutable invocado: las llamadas a
+# Claude ("/resolved/claude") y al mandatory test ("python") se simulan;
+# CUALQUIER otra invocación (git, usado por Git Evidence) se delega a la
+# implementación REAL guardada antes de parchear. Así el repositorio Git
+# temporal sigue siendo la fuente de verdad ejecutable, y Claude nunca se
+# invoca de verdad.
+# ============================================================
+
+_REAL_SUBPROCESS_RUN = subprocess.run
+_REAL_SHUTIL_WHICH = shutil.which
+
+
+def _init_taskexec_repo(repo_root: Path) -> None:
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / "allowed.txt").write_text("BEFORE", encoding="utf-8")
+    (repo_root / "untouched.txt").write_text("UNCHANGED", encoding="utf-8")
+    _git("init", cwd=repo_root)
+    _git("config", "user.name", "Task Execution Test", cwd=repo_root)
+    _git("config", "user.email", "task-execution-test@localhost", cwd=repo_root)
+    _git("add", "allowed.txt", "untouched.txt", cwd=repo_root)
+    _git("commit", "-m", "baseline", cwd=repo_root)
+
+
+class TaskExecutionProbeTestCase(CliFixtureTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.taskexec_repo = self.root / "taskexec_repo"
+        _init_taskexec_repo(self.taskexec_repo)
+
+        (self.projects_dir / "TASKEXEC").mkdir()
+        _write_yaml(
+            self.projects_dir / "TASKEXEC" / "PROJECT_RULES.yaml",
+            {
+                "version": 1,
+                "project_id": "TASKEXEC",
+                "name": "Task execution test project",
+                "repo_path": "./taskexec_repo",
+                "commands": {"unit": ["python", "-c", "pass"]},
+                "protected_paths": [],
+            },
+        )
+
+        self.taskexec_packet_path = self.tasks_dir / "TASKEXEC_TASK.yaml"
+        self._write_taskexec_packet(mandatory_tests=["unit"])
+
+        self.enable_write_probe()  # developer + write_probe válidos
+        self._set_allowed_commands(["unit"])
+
+    def _write_taskexec_packet(self, *, mandatory_tests: list[str]) -> None:
+        _write_yaml(
+            self.taskexec_packet_path,
+            {
+                "task_id": "TASKEXEC-001",
+                "project_id": "TASKEXEC",
+                "objective": "Change the content of allowed.txt",
+                "scope": ["Modify allowed.txt"],
+                "out_of_scope": ["Modify any other file"],
+                "authorized_files": ["allowed.txt"],
+                "forbidden_files": ["untouched.txt"],
+                "constraints": ["No new dependencies"],
+                "acceptance_criteria": ["allowed.txt contains AFTER"],
+                "security_criteria": ["No secrets in code"],
+                "mandatory_tests": mandatory_tests,
+                "stop_rules": ["Unauthorized file modified"],
+                "required_evidence": ["git_diff", "test_output"],
+            },
+        )
+
+    def _set_allowed_commands(self, allowed: list[str]) -> None:
+        data = yaml.safe_load((self.config_dir / "PERMISSIONS.yaml").read_text(encoding="utf-8"))
+        data["allowed_commands"] = allowed
+        _write_yaml(self.config_dir / "PERMISSIONS.yaml", data)
+
+    def _developer_success_payload(self) -> str:
+        return json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "developer says whatever, never checked verbatim",
+                "session_id": "s1",
+                "num_turns": 1,
+                "duration_ms": 100,
+            }
+        )
+
+    def _developer_writes_allowed_only(self, args, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+        )
+
+    def _test_passes(self, args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    @contextlib.contextmanager
+    def patched_subprocess(self, *, developer=None, test=None):
+        """Despachador único: delega a git REAL cualquier invocación que no
+        sea Claude ("/resolved/claude") ni el mandatory test ("python").
+        `developer`/`test`, si se dan, deben ser mock.MagicMock(side_effect=...)
+        para poder aserir después cuántas veces se invocaron; si son None,
+        una invocación inesperada de ese tipo hace fallar la prueba."""
+
+        def fake_which(name, *a, **kw):
+            if name == "claude":
+                return "/resolved/claude"
+            return _REAL_SHUTIL_WHICH(name, *a, **kw)
+
+        def fake_run(args, **kwargs):
+            exe = args[0] if args else ""
+            if exe == "/resolved/claude":
+                if developer is None:
+                    raise AssertionError("unexpected Claude invocation in this test")
+                return developer(args, **kwargs)
+            if exe == "python":
+                if test is None:
+                    raise AssertionError("unexpected mandatory test invocation in this test")
+                return test(args, **kwargs)
+            return _REAL_SUBPROCESS_RUN(args, **kwargs)
+
+        with mock.patch("shutil.which", side_effect=fake_which), mock.patch(
+            "subprocess.run", side_effect=fake_run
+        ):
+            yield
+
+    def run_task_execution_probe(self) -> tuple[int, str]:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = self.run_cli("task-execution-probe", str(self.taskexec_packet_path))
+        return rc, stdout.getvalue()
+
+    def _assert_head_unchanged_on_disk(self, head_before: str) -> None:
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertEqual(head_before, head_after)
+
+
+class TaskExecutionProbeSuccessTests(TaskExecutionProbeTestCase):
+    def test_success_path_reaches_human_gate_without_commit(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        developer_mock = mock.MagicMock(side_effect=self._developer_writes_allowed_only)
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer_mock, test=test_mock):
+            rc, stdout = self.run_task_execution_probe()
+
+        self.assertEqual(rc, 0)
+        output = json.loads(stdout)
+        self.assertEqual(output["task_id"], "TASKEXEC-001")
+        self.assertEqual(output["project_id"], "TASKEXEC")
+        self.assertEqual(output["state"], "HUMAN_GATE")
+        self.assertEqual(output["human_gate"], "HUMAN_FUNCTIONAL_TEST")
+        self.assertTrue(output["developer_completed"])
+        self.assertTrue(output["head_unchanged"])
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertEqual(output["mandatory_tests"], ["unit"])
+        self.assertTrue(output["tests_passed"])
+        self.assertTrue(output["technical_review"])
+        self.assertTrue(output["security_review"])
+        # CORRECTION-001: la doble validación Git (PRE-TEST y POST-TEST,
+        # ambas contra el mismo BEFORE original) debe haber pasado.
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertTrue(output["post_test_evidence_passed"])
+        self.assertFalse(output["commit_performed"])
+
+        developer_mock.assert_called_once()
+        test_mock.assert_called_once()
+
+        # HEAD del repo REAL nunca cambia (el orquestador nunca hace
+        # commit/add/reset/checkout/clean): allowed.txt queda modificado en
+        # el working tree, pero sin stage ni commit.
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertEqual(head_before, head_after)
+        status_after = _git("status", "--porcelain", cwd=self.taskexec_repo).stdout
+        self.assertIn("allowed.txt", status_after)
+
+
+class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
+    def test_dirty_before_blocks_without_invoking_claude_or_tests(self) -> None:
+        (self.taskexec_repo / "untracked_before.txt").write_text("x", encoding="utf-8")
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        with self.patched_subprocess():
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertFalse(output["developer_completed"])
+        self.assertFalse(output["commit_performed"])
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_developer_touches_unauthorized_file_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            (cwd / "extra_unauthorized.txt").write_text("surprise", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertIn("extra_unauthorized.txt", output["out_of_scope_paths"])
+        self.assertFalse(output["commit_performed"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_developer_touches_forbidden_file_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            (cwd / "untouched.txt").write_text("MODIFIED", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertIn("untouched.txt", output["out_of_scope_paths"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_developer_creates_unexpected_untracked_file_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            (cwd / "unexpected_new.txt").write_text("new", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertIn("unexpected_new.txt", output["out_of_scope_paths"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_head_changes_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            _git("add", "allowed.txt", cwd=cwd)
+            _git("commit", "-m", "unauthorized commit", cwd=cwd)
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(output["head_unchanged"])
+        self.assertFalse(output["commit_performed"])
+        test_mock.assert_not_called()
+        # Este HEAD SÍ cambió, pero por el "developer" simulado (fuera de
+        # banda), nunca por el orquestador: se detecta y se bloquea, no se
+        # revierte.
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertNotEqual(head_before, head_after)
+
+    def test_unknown_mandatory_test_blocks(self) -> None:
+        self._write_taskexec_packet(mandatory_tests=["nonexistent"])
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=test_mock,
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertFalse(output["commit_performed"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_mandatory_test_failure_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="FAIL")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertFalse(output["tests_passed"])
+        self.assertFalse(output["commit_performed"])
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_developer_malformed_result_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="not json", stderr="")
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(output["developer_completed"])
+        self.assertFalse(output["commit_performed"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_developer_timeout_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=90)
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(output["developer_completed"])
+        self.assertFalse(output["commit_performed"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+
+class TaskExecutionProbePostTestMutationTests(TaskExecutionProbeTestCase):
+    """CORRECTION-001 (SECURITY_REVIEW: CHANGES_REQUESTED): un mandatory
+    test preautorizado que retorna exit code 0 pero muta el repositorio
+    DURANTE su ejecución debe bloquear igualmente, nunca alcanzar
+    HUMAN_GATE. El developer en los tres casos es correcto (modifica
+    únicamente allowed.txt, PRE-TEST evidence PASS); la mutación ocurre
+    exclusivamente dentro del propio proceso del mandatory test simulado.
+    Sin rollback automático en ningún caso: el repo temporal queda como
+    quedó, y se limpia únicamente por el teardown normal de
+    tempfile.TemporaryDirectory()."""
+
+    def test_case_a_forbidden_mutation_after_test_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "untouched.txt").write_text("MUTATED_BY_TEST", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertIsNone(output["human_gate"])
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertFalse(output["post_test_evidence_passed"])
+        self.assertIn("untouched.txt", output["out_of_scope_paths"])
+        self.assertFalse(output["security_review"])
+        self.assertFalse(output["commit_performed"])
+        # Estado real del repo temporal: untouched.txt SÍ quedó mutado (el
+        # orquestador no revierte nada); solo se detecta y se bloquea.
+        self.assertEqual(
+            (self.taskexec_repo / "untouched.txt").read_text(encoding="utf-8"),
+            "MUTATED_BY_TEST",
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_case_b_untracked_after_test_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "unexpected_from_test.txt").write_text("surprise", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertFalse(output["post_test_evidence_passed"])
+        self.assertIn("unexpected_from_test.txt", output["out_of_scope_paths"])
+        self.assertFalse(output["security_review"])
+        self.assertFalse(output["commit_performed"])
+        self.assertTrue((self.taskexec_repo / "unexpected_from_test.txt").exists())
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_case_c_head_change_after_test_blocks(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _git("add", "allowed.txt", cwd=cwd)
+            _git("commit", "-m", "unauthorized commit by test", cwd=cwd)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertFalse(output["head_unchanged"])
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertFalse(output["post_test_evidence_passed"])
+        self.assertFalse(output["security_review"])
+        self.assertFalse(output["commit_performed"])
+        # Este HEAD SÍ cambió -- por el mandatory test simulado, nunca por
+        # el orquestador -- y NO se revierte: solo se detecta y se bloquea.
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertNotEqual(head_before, head_after)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+# PROJECT_RULES.yaml — proyecto piloto desechable DISPOSABLE
+#
+# Fuente de verdad: 01_MASTER_SPEC.md §7, §15; TASK-EXECUTION-002
+# (D-EXEC-001/D-EXEC-003). Esta tarea SOLO crea esta configuración; no
+# accede al workspace disposable-001 real (fuera de alcance §2).
+
+version: 1
+
+project_id: DISPOSABLE
+name: "Piloto desechable (disposable-001)"
+
+# Relativo al repo del propio orquestador (D-EXEC-003): resuelto por
+# config_loader.resolve_project_root() respecto al REPO ROOT del
+# orquestador, nunca respecto al Task Packet.
+repo_path: "../_AISOFTWAREFACTORY_PILOT/disposable-001"
+
+# D-EXEC-001: mapping ABIERTO logical_id -> argv (lista exacta).
+commands:
+  unit:
+    - python
+    - verify_task.py
+
+protected_paths:
+  - "**/.env*"
+  - "**/migrations/**"
+  - "infra/**"
+
+autonomy_overrides: {}
