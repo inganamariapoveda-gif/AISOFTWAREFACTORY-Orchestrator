@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -632,6 +633,73 @@ def run_developer_task(
     return _parse_generic_task_result(completed)
 
 
+# TASK-EXECUTION-003: diagnóstico seguro y acotado de un fallo de
+# run_developer_task (exit_code != 0). Nunca expone el prompt (enviado por
+# stdin, ni siquiera visible aquí) ni el stdout/stderr crudos completos;
+# nunca expone el campo JSON `result` (puede contener contenido arbitrario
+# del modelo). Solo campos ESTRUCTURALES allowlisted de un stdout JSON, y un
+# fragmento acotado/saneado de stderr.
+_FAILURE_DIAGNOSTIC_ALLOWED_STDOUT_FIELDS: tuple[str, ...] = (
+    "type",
+    "subtype",
+    "is_error",
+    "api_error_status",
+    "stop_reason",
+    "permission_denials",
+)
+
+_FAILURE_DIAGNOSTIC_MAX_STDERR_CHARS = 500
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_stderr_diagnostic(stderr: str) -> str:
+    """Convierte stderr en un fragmento de diagnóstico ACOTADO Y SANEADO:
+    saltos de línea -> espacio, caracteres de control eliminados, espacios
+    colapsados/trim, y recortado a lo sumo a
+    _FAILURE_DIAGNOSTIC_MAX_STDERR_CHARS caracteres. Nunca intenta
+    interpretar credenciales; simplemente acota el texto crudo."""
+    if not stderr:
+        return ""
+    no_newlines = stderr.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    no_control = _CONTROL_CHARS_RE.sub(" ", no_newlines)
+    collapsed = " ".join(no_control.split())
+    return collapsed[:_FAILURE_DIAGNOSTIC_MAX_STDERR_CHARS]
+
+
+def _build_failure_diagnostic(completed: "subprocess.CompletedProcess[str]") -> str:
+    """Construye el diagnóstico saneado y acotado para exit_code != 0.
+    Conserva SIEMPRE exit_code. Si stdout es JSON válido (objeto), extrae
+    ÚNICAMENTE los campos allowlisted presentes (nunca `result`, nunca
+    session/usage/transcript). Si stdout no es JSON válido y stderr está
+    vacío, reporta solamente `stdout_present=true` sin reproducir su
+    contenido. stderr, si no está vacío, se añade saneado y acotado."""
+    parts = [f"exit_code={completed.returncode}"]
+
+    stdout = completed.stdout or ""
+    parsed: dict[str, Any] | None = None
+    if stdout:
+        try:
+            candidate = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            candidate = None
+        if isinstance(candidate, dict):
+            parsed = candidate
+
+    if parsed is not None:
+        for field in _FAILURE_DIAGNOSTIC_ALLOWED_STDOUT_FIELDS:
+            if field in parsed:
+                parts.append(f"{field}={parsed[field]!r}")
+
+    sanitized_stderr = _sanitize_stderr_diagnostic(completed.stderr or "")
+    if sanitized_stderr:
+        parts.append(f"stderr={sanitized_stderr!r}")
+    elif parsed is None and stdout:
+        parts.append("stdout_present=true")
+
+    return "; ".join(parts)
+
+
 def _parse_generic_task_result(
     completed: "subprocess.CompletedProcess[str]",
 ) -> DeveloperResult:
@@ -643,7 +711,7 @@ def _parse_generic_task_result(
     fijo (a diferencia del handshake/write-probe, deterministas)."""
     if completed.returncode != 0:
         raise DeveloperExecutionError(
-            f"developer execution failed: exit_code={completed.returncode}"
+            f"developer execution failed: {_build_failure_diagnostic(completed)}"
         )
 
     try:

@@ -936,5 +936,148 @@ class RunDeveloperTaskTests(unittest.TestCase):
         mock_run.assert_not_called()
 
 
+# ============================================================
+# TASK-EXECUTION-003: safe failure diagnostics de run_developer_task cuando
+# el proceso Claude termina con exit_code != 0. Nunca expone el prompt
+# (enviado por stdin), nunca expone el campo JSON `result` ni stdout/stderr
+# crudos completos; solo campos estructurales allowlisted de un stdout JSON
+# y un fragmento acotado/saneado de stderr.
+# ============================================================
+
+
+class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_and_capture_error(
+        self,
+        *,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        prompt: str = "STRUCTURED PROMPT SECRET_PROMPT_MARKER_XYZ",
+    ) -> str:
+        developer_config = _valid_write_probe_developer_config()
+        completed = _completed(returncode=returncode, stdout=stdout, stderr=stderr)
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            with self.assertRaises(DeveloperExecutionError) as cm:
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt=prompt,
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+        return str(cm.exception)
+
+    def test_nonzero_exit_with_normal_stderr_includes_exit_code_and_sanitized_stderr(
+        self,
+    ) -> None:
+        # A. exit code != 0 + stderr normal: el error contiene exit_code y
+        # el stderr saneado/acotado.
+        message = self._run_and_capture_error(returncode=1, stderr="permission denied")
+        self.assertIn("exit_code=1", message)
+        self.assertIn("permission denied", message)
+
+    def test_stderr_over_limit_is_bounded_to_500_chars(self) -> None:
+        # B. stderr > 500 chars: nunca expone más del límite.
+        long_stderr = "X" * 2000
+        message = self._run_and_capture_error(returncode=1, stderr=long_stderr)
+        self.assertIn("exit_code=1", message)
+        self.assertLessEqual(message.count("X"), 500)
+
+    def test_stdout_json_error_extracts_only_allowlisted_fields(self) -> None:
+        # C. stdout JSON: extrae ÚNICAMENTE campos allowlisted.
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "api_error_status": 429,
+                "stop_reason": "max_turns",
+                "permission_denials": ["Bash"],
+                "result": "SECRET_CONTENT_SHOULD_NOT_APPEAR",
+                "session_id": "sess-should-not-appear-either",
+                "usage": {"input_tokens": 111},
+                "modelUsage": {"claude": {"inputTokens": 5}},
+            }
+        )
+        message = self._run_and_capture_error(returncode=1, stdout=payload)
+        self.assertIn("exit_code=1", message)
+        self.assertIn("error", message)
+        self.assertIn("429", message)
+        self.assertIn("max_turns", message)
+        self.assertIn("Bash", message)
+        self.assertNotIn("SECRET_CONTENT_SHOULD_NOT_APPEAR", message)
+        self.assertNotIn("sess-should-not-appear-either", message)
+        self.assertNotIn("input_tokens", message)
+        self.assertNotIn("modelUsage", message)
+
+    def test_stdout_result_secret_never_appears_in_error(self) -> None:
+        # D. stdout JSON contiene result: "SECRET_CONTENT_SHOULD_NOT_APPEAR"
+        # -- el error final NUNCA debe contener ese valor.
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "result": "SECRET_CONTENT_SHOULD_NOT_APPEAR",
+            }
+        )
+        message = self._run_and_capture_error(returncode=1, stdout=payload)
+        self.assertNotIn("SECRET_CONTENT_SHOULD_NOT_APPEAR", message)
+
+    def test_non_json_stdout_with_empty_stderr_reports_presence_only(self) -> None:
+        # E. stdout no JSON + stderr vacío: solo indica stdout_present=true,
+        # sin reproducir el contenido de stdout.
+        message = self._run_and_capture_error(
+            returncode=1, stdout="raw text SECRET_STDOUT_MARKER not json", stderr=""
+        )
+        self.assertIn("exit_code=1", message)
+        self.assertIn("stdout_present=true", message)
+        self.assertNotIn("SECRET_STDOUT_MARKER", message)
+
+    def test_prompt_never_appears_in_any_diagnostic(self) -> None:
+        # F. ningún diagnostic incluye el prompt.
+        secret_prompt = "STRUCTURED PROMPT SECRET_PROMPT_MARKER_XYZ"
+        message = self._run_and_capture_error(
+            returncode=1,
+            stdout=json.dumps({"type": "result", "subtype": "error", "is_error": True}),
+            stderr="some stderr text",
+            prompt=secret_prompt,
+        )
+        self.assertNotIn(secret_prompt, message)
+        self.assertNotIn("SECRET_PROMPT_MARKER_XYZ", message)
+
+    def test_success_path_still_works(self) -> None:
+        # G. success path sigue funcionando igual: no se toca en absoluto.
+        developer_config = _valid_write_probe_developer_config()
+        completed = _completed(
+            returncode=0, stdout=json.dumps(_valid_generic_result_payload())
+        )
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            result = run_developer_task(
+                developer_config=developer_config,
+                prompt="x",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        self.assertTrue(result.success)
+        self.assertEqual(
+            result.result_text, "whatever Claude says, never checked verbatim"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
