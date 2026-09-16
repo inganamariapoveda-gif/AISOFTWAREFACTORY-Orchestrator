@@ -1225,6 +1225,214 @@ class TaskExecutionProbePostTestMutationTests(TaskExecutionProbeTestCase):
 
 
 # ============================================================
+# TASK-EXECUTION-004: captura de Git Evidence POST-FAILURE cuando
+# run_developer_task fue REALMENTE invocado y lanzó DeveloperExecutionError.
+# Nunca se asume "no hubo modificaciones": se captura evidencia Git contra
+# el MISMO `before` original (nunca un nuevo baseline), reutilizando
+# EXACTAMENTE las mismas reglas de GitEvidence ya usadas en PRE/POST-TEST.
+# Nunca se ejecutan mandatory tests tras un fallo del developer, y nunca
+# hay rollback automático.
+# ============================================================
+
+
+class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase):
+    def test_a_developer_fails_without_modifying_repo(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            # Falla SIN tocar el filesystem del repo en absoluto.
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="developer crashed"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["developer_completed"])
+        self.assertEqual(output["changed_paths"], [])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertTrue(output["head_unchanged"])
+        self.assertIn("developer execution failed:", output["reason"])
+        self.assertIn("exit_code=1", output["reason"])
+        self.assertIn("developer crashed", output["reason"])
+        self.assertIn("post-failure Git evidence captured", output["reason"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_b_developer_partially_modifies_authorized_file_then_fails(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            # Modificación PARCIAL de un authorized_file antes del fallo.
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="crashed mid-edit"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["developer_completed"])
+        self.assertIn("allowed.txt", output["changed_paths"])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertTrue(output["head_unchanged"])
+        # Mandatory tests NUNCA se ejecutan tras un fallo del developer.
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+        # Sin rollback: la modificación parcial sigue en disco (evidencia
+        # ejecutable, no revertida automáticamente).
+        self.assertEqual(
+            (self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL"
+        )
+
+    def test_c_developer_touches_out_of_scope_file_then_fails(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            (cwd / "untouched.txt").write_text("MODIFIED", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="crashed after forbidden edit"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertIn("allowed.txt", output["changed_paths"])
+        self.assertIn("untouched.txt", output["out_of_scope_paths"])
+        # Evidencia SÍ pudo determinarse aquí: head_unchanged refleja el
+        # estado Git real (True), no la señal fail-closed "not verified".
+        self.assertTrue(output["head_unchanged"])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_d_developer_moves_head_then_fails(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            _git("add", "allowed.txt", cwd=cwd)
+            _git("commit", "-m", "unauthorized commit by developer", cwd=cwd)
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="crashed after committing"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["head_unchanged"])
+        test_mock.assert_not_called()
+        # HEAD SÍ cambió -- por el developer simulado, nunca por el
+        # orquestador -- y NO se revierte: solo se detecta y se bloquea.
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertNotEqual(head_before, head_after)
+
+    def test_e_post_failure_evidence_capture_failure_fails_closed(self) -> None:
+        def fake_developer_run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="boom"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ), mock.patch(
+            "orchestrator.app.evidence_mod.capture_change_evidence",
+            side_effect=EvidenceError("simulated post-failure evidence failure"),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["developer_completed"])
+        # Valores conservadores: changed_paths/out_of_scope_paths nunca se
+        # inventan (siguen vacíos). head_unchanged=False aquí es la señal
+        # FAIL-CLOSED "not verified" (CORRECTION-001) -- Claude SÍ fue
+        # invocado y la evidencia Git post-fallo no pudo determinarse, así
+        # que nunca se afirma implícitamente que HEAD no cambió.
+        self.assertEqual(output["changed_paths"], [])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertFalse(output["head_unchanged"])
+        self.assertIn("developer execution failed:", output["reason"])
+        self.assertIn(
+            "post-failure Git evidence could not be determined safely", output["reason"]
+        )
+        self.assertIn("HEAD unchanged not verified", output["reason"])
+        test_mock.assert_not_called()
+
+    def test_f_dirty_before_never_attempts_post_failure_capture(self) -> None:
+        # El bloqueo PRE-DEVELOPER (working tree sucio) ocurre ANTES de
+        # invocar run_developer_task; por tanto NUNCA debe capturarse
+        # evidencia post-failure -- capture_change_evidence no debe
+        # invocarse en absoluto en este camino.
+        (self.taskexec_repo / "untracked_before.txt").write_text("x", encoding="utf-8")
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        with self.patched_subprocess(), mock.patch(
+            "orchestrator.app.evidence_mod.capture_change_evidence"
+        ) as mock_capture_change_evidence:
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(output["state"], "HUMAN_GATE")
+        self.assertFalse(output["developer_completed"])
+        mock_capture_change_evidence.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_g_success_path_unaffected(self) -> None:
+        # Camino positivo existente: developer success -> PRE-TEST evidence
+        # -> tests -> POST-TEST evidence -> HUMAN_GATE, sin cambios.
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        developer_mock = mock.MagicMock(side_effect=self._developer_writes_allowed_only)
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer_mock, test=test_mock):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(output["state"], "HUMAN_GATE")
+        self.assertEqual(output["human_gate"], "HUMAN_FUNCTIONAL_TEST")
+        self.assertTrue(output["developer_completed"])
+        self.assertTrue(output["tests_passed"])
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertTrue(output["post_test_evidence_passed"])
+        developer_mock.assert_called_once()
+        test_mock.assert_called_once()
+        head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        self.assertEqual(head_before, head_after)
+
+
+# ============================================================
 # TASK-EXECUTION-003: developer execution role boundary. Verifica que
 # app._build_developer_execution_prompt() reutiliza TAL CUAL
 # task_packet_mod.build_developer_instruction(packet) (sin modificar

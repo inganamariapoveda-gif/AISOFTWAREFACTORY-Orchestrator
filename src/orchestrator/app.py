@@ -495,7 +495,45 @@ def execute_task_packet(
             authorized_root=project_root,
         )
     except DeveloperExecutionError as exc:
-        return _blocked(f"developer execution failed: {exc}")
+        # TASK-EXECUTION-004: Claude fue REALMENTE invocado y falló
+        # (DeveloperExecutionError). Nunca asumir que no hubo
+        # modificaciones: run_developer_task puede fallar DESPUÉS de que
+        # Claude ya haya escrito parcialmente en el repositorio. Se captura
+        # evidencia Git POST-FAILURE contra el MISMO `before` original
+        # (nunca un nuevo baseline post-Claude), reutilizando EXACTAMENTE
+        # las mismas reglas de GitEvidence ya usadas en PRE/POST-TEST más
+        # abajo. Nunca se ejecutan mandatory tests, nunca hay rollback (ni
+        # git restore/reset/checkout/clean), y la narrativa de Claude nunca
+        # es autoridad: si la propia evidencia Git no puede determinarse de
+        # forma segura, fail closed con los valores conservadores por
+        # defecto de _blocked() -- nunca se inventan changed_paths/
+        # out_of_scope_paths/head_unchanged.
+        try:
+            post_failure_change_evidence = evidence_mod.capture_change_evidence(
+                before, packet.authorized_files
+            )
+        except EvidenceError:
+            # CORRECTION-001: head_unchanged=True es la señal fail-closed
+            # correcta ÚNICAMENTE cuando ninguna capa posterior a un
+            # bloqueo PRE-DEVELOPER llegó a alterar el repositorio (Claude
+            # nunca fue invocado). Aquí Claude SÍ fue invocado y la propia
+            # evidencia Git post-fallo no pudo determinarse: heredar el
+            # default True de _blocked() afirmaría implícitamente "HEAD no
+            # cambió" sin haberlo verificado. head_unchanged=False expresa
+            # aquí, de forma fail-closed, "no verificado" -- NUNCA se
+            # inventa que HEAD sí cambió.
+            return _blocked(
+                f"developer execution failed: {exc}; "
+                "post-failure Git evidence could not be determined safely; "
+                "HEAD unchanged not verified",
+                head_unchanged=False,
+            )
+        return _blocked(
+            f"developer execution failed: {exc}; post-failure Git evidence captured",
+            head_unchanged=not post_failure_change_evidence.head_changed,
+            changed_paths=list(post_failure_change_evidence.changed_paths),
+            out_of_scope_paths=list(post_failure_change_evidence.out_of_scope_paths),
+        )
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
     # (HEAD unchanged, scope, forbidden_files). Debe pasar ANTES de
