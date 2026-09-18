@@ -72,6 +72,15 @@ _FORBIDDEN_FLAGS = frozenset(
 # ============================================================
 _WRITE_PROBE_PERMISSION_MODE = "acceptEdits"
 
+# ============================================================
+# TASK-EXECUTION-005: presupuesto de la ejecución genérica de un Developer
+# Task Packet (run_developer_task), separado por completo del write-probe
+# de arriba y del handshake read-only. Mismo permission_mode que el
+# write-probe (ambos autorizan edición real), pero max_turns/timeout_seconds
+# son PROPIOS y no se comparten (ver developer.task_execution en AGENTS.yaml).
+# ============================================================
+_TASK_EXECUTION_PERMISSION_MODE = "acceptEdits"
+
 WRITE_PROBE_TARGET_FILENAME = "TARGET.txt"
 WRITE_PROBE_DO_NOT_TOUCH_FILENAME = "DO_NOT_TOUCH.txt"
 WRITE_PROBE_BEFORE_CONTENT = "BEFORE"
@@ -556,17 +565,22 @@ def _evaluate_write_probe(
 
 
 # ============================================================
-# TASK-EXECUTION-002: run_developer_task (adaptador genérico de tarea de
+# TASK-EXECUTION-002/005: run_developer_task (adaptador genérico de tarea de
 # desarrollo, D-EXEC-002).
 #
 # Reutiliza EXCLUSIVAMENTE helpers ya existentes (_resolve_executable,
-# _resolve_cwd, _build_args, _FORBIDDEN_FLAGS, _validate_write_probe_config,
-# DeveloperResult): las MISMAS garantías de seguridad que el write-probe
-# (CLAUDE-EXECUTION-002) -- permission-mode acceptEdits, --restricted,
-# shell=False, prompt por stdin, cwd confinado -- sin duplicar esa lógica ni
-# tocar run_handshake()/run_write_probe(). No se introduce ninguna clave de
-# configuración nueva en AGENTS.yaml en este incremento: developer_config
-# debe declarar el mismo bloque `write_probe` ya validado por config_loader.
+# _resolve_cwd, _build_args, _FORBIDDEN_FLAGS, DeveloperResult): las MISMAS
+# garantías de seguridad que el write-probe (CLAUDE-EXECUTION-002) --
+# permission-mode acceptEdits, --restricted, shell=False, prompt por stdin,
+# cwd confinado -- sin duplicar esa lógica ni tocar
+# run_handshake()/run_write_probe(). TASK-EXECUTION-005: run_developer_task
+# ya NO reutiliza developer.write_probe como configuración operacional --
+# EXECUTION-DIAG-002 mostró que 3 turnos (presupuesto del write-probe,
+# pensado para una única escritura mínima determinista) no es un
+# presupuesto fiable para una instrucción de desarrollo genérica arbitraria.
+# Usa exclusivamente developer.task_execution (_validate_task_execution_config),
+# un bloque de configuración separado e independiente: cambiar
+# write_probe.max_turns nunca afecta a run_developer_task, y viceversa.
 #
 # A diferencia del handshake/write-probe (deterministas, con un texto de
 # 'result' exacto exigido), run_developer_task recibe un prompt ARBITRARIO
@@ -576,6 +590,56 @@ def _evaluate_write_probe(
 # éxito (D-EXEC-002): ese juicio pertenece a capas posteriores (Git
 # Evidence + mandatory tests), fuera de este adaptador.
 # ============================================================
+
+
+def _validate_task_execution_config(
+    developer_config: dict[str, Any],
+) -> tuple[str, str, int, int, str]:
+    """TASK-EXECUTION-005: valida developer.executable/output_format
+    (compartidos con el handshake/write-probe) y developer.task_execution.*
+    (presupuesto PROPIO e independiente de write_probe: max_turns/
+    timeout_seconds/permission_mode/restricted propios). Falla cerrado sin
+    fallback a write_probe: si task_execution falta o es inválido, esto
+    lanza DeveloperExecutionError -- run_developer_task nunca ejecuta con un
+    presupuesto ajeno al declarado explícitamente para este propósito."""
+    executable = developer_config.get("executable")
+    output_format = developer_config.get("output_format")
+
+    if not isinstance(executable, str) or not executable:
+        raise DeveloperExecutionError("developer.executable must be a non-empty string")
+    if output_format != "json":
+        raise DeveloperExecutionError("developer.output_format must be 'json'")
+
+    task_execution = developer_config.get("task_execution")
+    if not isinstance(task_execution, dict):
+        raise DeveloperExecutionError("developer.task_execution must be a mapping")
+
+    if task_execution.get("enabled") is not True:
+        raise DeveloperExecutionError("developer.task_execution.enabled must be true")
+
+    max_turns = task_execution.get("max_turns")
+    timeout_seconds = task_execution.get("timeout_seconds")
+    permission_mode = task_execution.get("permission_mode")
+    restricted = task_execution.get("restricted")
+
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+        raise DeveloperExecutionError("developer.task_execution.max_turns must be a positive integer")
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 1
+    ):
+        raise DeveloperExecutionError(
+            "developer.task_execution.timeout_seconds must be a positive integer"
+        )
+    if permission_mode != _TASK_EXECUTION_PERMISSION_MODE:
+        raise DeveloperExecutionError(
+            f"developer.task_execution.permission_mode must be {_TASK_EXECUTION_PERMISSION_MODE!r}"
+        )
+    if restricted is not True:
+        raise DeveloperExecutionError("developer.task_execution.restricted must be true")
+
+    return executable, output_format, max_turns, timeout_seconds, permission_mode
 
 
 def run_developer_task(
@@ -593,9 +657,10 @@ def run_developer_task(
     authorized_root, timeout, exit code != 0, JSON inválido, is_error
     verdadero, o forma inesperada. Nunca convierte un fallo en éxito y
     nunca exige un texto exacto de 'result' (no PASS/SUCCESS/DONE ni
-    equivalente): solo su forma estructural."""
+    equivalente): solo su forma estructural. TASK-EXECUTION-005: usa
+    EXCLUSIVAMENTE developer.task_execution, nunca developer.write_probe."""
     executable_name, output_format, max_turns, timeout_seconds, permission_mode = (
-        _validate_write_probe_config(developer_config)
+        _validate_task_execution_config(developer_config)
     )
     executable_path = _resolve_executable(executable_name)
     resolved_cwd = _resolve_cwd(cwd, authorized_root)

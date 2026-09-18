@@ -228,7 +228,11 @@ class CliFixtureTestCase(unittest.TestCase):
         """CLAUDE-EXECUTION-002: habilita developer + write_probe con una
         configuración válida (permission_mode/restricted/max_turns/
         timeout_seconds propios, independientes del handshake read-only,
-        que permanece en "plan")."""
+        que permanece en "plan"). TASK-EXECUTION-005: también declara
+        developer.task_execution (config PROPIA e independiente de
+        write_probe, ver claude_code._validate_task_execution_config), ya
+        que los tests de TaskExecutionProbe* reutilizan esta misma fixture
+        para ejercitar run_developer_task a través del CLI real."""
         data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
         write_probe = {
             "enabled": True,
@@ -238,6 +242,13 @@ class CliFixtureTestCase(unittest.TestCase):
             "timeout_seconds": 90,
         }
         write_probe.update(write_probe_overrides)
+        task_execution = {
+            "enabled": True,
+            "permission_mode": "acceptEdits",
+            "restricted": True,
+            "max_turns": 8,
+            "timeout_seconds": 90,
+        }
         developer = {
             "role": "developer",
             "enabled": True,
@@ -248,6 +259,7 @@ class CliFixtureTestCase(unittest.TestCase):
             "permission_mode": "plan",
             "restricted": True,
             "write_probe": write_probe,
+            "task_execution": task_execution,
         }
         data["agents"]["developer"] = developer
         _write_yaml(self.config_dir / "AGENTS.yaml", data)

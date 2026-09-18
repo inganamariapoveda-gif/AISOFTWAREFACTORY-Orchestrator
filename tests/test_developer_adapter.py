@@ -107,6 +107,26 @@ def _valid_write_probe_developer_config(**write_probe_overrides) -> dict:
     }
 
 
+def _valid_task_execution_developer_config(**task_execution_overrides) -> dict:
+    """TASK-EXECUTION-005: developer_config COMPLETO (executable/
+    output_format compartidos + task_execution.* propio), tal como lo
+    recibe run_developer_task(). Independiente por completo de
+    write_probe: este dict NUNCA declara la clave 'write_probe'."""
+    task_execution = {
+        "enabled": True,
+        "max_turns": 8,
+        "timeout_seconds": 90,
+        "permission_mode": "acceptEdits",
+        "restricted": True,
+    }
+    task_execution.update(task_execution_overrides)
+    return {
+        "executable": "claude",
+        "output_format": "json",
+        "task_execution": task_execution,
+    }
+
+
 def _valid_write_result_payload(**overrides) -> dict:
     payload = {
         "type": "result",
@@ -748,7 +768,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_valid_success_builds_secure_call_and_parses_structurally(self) -> None:
-        developer_config = _valid_write_probe_developer_config(max_turns=4)
+        developer_config = _valid_task_execution_developer_config(max_turns=4)
         completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
 
         with mock.patch(
@@ -794,7 +814,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
     def test_cwd_outside_authorized_root_rejected_before_subprocess(self) -> None:
         outside = Path(tempfile.mkdtemp())
         try:
-            developer_config = _valid_write_probe_developer_config()
+            developer_config = _valid_task_execution_developer_config()
             with mock.patch(
                 "orchestrator.adapters.claude_code.shutil.which",
                 return_value="/resolved/claude",
@@ -813,7 +833,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
             shutil.rmtree(outside, ignore_errors=True)
 
     def test_timeout_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         with mock.patch(
             "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
         ), mock.patch(
@@ -829,7 +849,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_nonzero_exit_code_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         completed = _completed(returncode=1, stderr="boom")
         with mock.patch(
             "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
@@ -845,7 +865,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_malformed_json_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         completed = _completed(returncode=0, stdout="not json at all")
         with mock.patch(
             "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
@@ -861,7 +881,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_wrong_subtype_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         payload = _valid_generic_result_payload(subtype="failure")
         completed = _completed(returncode=0, stdout=json.dumps(payload))
         with mock.patch(
@@ -878,7 +898,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_is_error_true_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         payload = _valid_generic_result_payload(is_error=True)
         completed = _completed(returncode=0, stdout=json.dumps(payload))
         with mock.patch(
@@ -895,7 +915,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_result_not_str_fails_closed(self) -> None:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         payload = _valid_generic_result_payload(result=12345)
         completed = _completed(returncode=0, stdout=json.dumps(payload))
         with mock.patch(
@@ -912,7 +932,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
                 )
 
     def test_permission_mode_other_than_accept_edits_rejected(self) -> None:
-        developer_config = _valid_write_probe_developer_config(permission_mode="plan")
+        developer_config = _valid_task_execution_developer_config(permission_mode="plan")
         with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
             with self.assertRaises(DeveloperExecutionError):
                 run_developer_task(
@@ -924,7 +944,7 @@ class RunDeveloperTaskTests(unittest.TestCase):
         mock_run.assert_not_called()
 
     def test_restricted_not_true_rejected(self) -> None:
-        developer_config = _valid_write_probe_developer_config(restricted=False)
+        developer_config = _valid_task_execution_developer_config(restricted=False)
         with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
             with self.assertRaises(DeveloperExecutionError):
                 run_developer_task(
@@ -934,6 +954,216 @@ class RunDeveloperTaskTests(unittest.TestCase):
                     authorized_root=REPO_ROOT,
                 )
         mock_run.assert_not_called()
+
+    def test_task_execution_missing_fails_closed(self) -> None:
+        # F. developer.task_execution ausente por completo: fail closed,
+        # SIN fallback a write_probe.
+        developer_config = {"executable": "claude", "output_format": "json"}
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+    def test_task_execution_present_but_write_probe_only_fails_closed(self) -> None:
+        # F (variante): solo write_probe declarado, sin task_execution: NO
+        # hay fallback implícito al bloque write_probe.
+        developer_config = _valid_write_probe_developer_config()
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+    def test_task_execution_enabled_false_fails_closed(self) -> None:
+        # G. developer.task_execution.enabled == false: fail closed.
+        developer_config = _valid_task_execution_developer_config(enabled=False)
+        with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=developer_config,
+                    prompt="x",
+                    cwd=REPO_ROOT,
+                    authorized_root=REPO_ROOT,
+                )
+        mock_run.assert_not_called()
+
+    def test_task_execution_max_turns_invalid_fails_closed(self) -> None:
+        # J. max_turns inválido (cero, negativo o no entero): fail closed.
+        for invalid_max_turns in (0, -1, "8", None):
+            developer_config = _valid_task_execution_developer_config(
+                max_turns=invalid_max_turns
+            )
+            with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+                with self.assertRaises(DeveloperExecutionError):
+                    run_developer_task(
+                        developer_config=developer_config,
+                        prompt="x",
+                        cwd=REPO_ROOT,
+                        authorized_root=REPO_ROOT,
+                    )
+            mock_run.assert_not_called()
+
+    def test_task_execution_timeout_invalid_fails_closed(self) -> None:
+        # K. timeout_seconds inválido (cero, negativo o no entero): fail
+        # closed.
+        for invalid_timeout in (0, -1, "90", None):
+            developer_config = _valid_task_execution_developer_config(
+                timeout_seconds=invalid_timeout
+            )
+            with mock.patch("orchestrator.adapters.claude_code.subprocess.run") as mock_run:
+                with self.assertRaises(DeveloperExecutionError):
+                    run_developer_task(
+                        developer_config=developer_config,
+                        prompt="x",
+                        cwd=REPO_ROOT,
+                        authorized_root=REPO_ROOT,
+                    )
+            mock_run.assert_not_called()
+
+
+class GenericTaskConfigIndependenceTests(unittest.TestCase):
+    """TASK-EXECUTION-005: run_developer_task usa EXCLUSIVAMENTE
+    developer.task_execution -- nunca developer.write_probe -- y ese
+    presupuesto es independiente en ambas direcciones del write-probe y del
+    handshake."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_generic_task_argv_uses_task_execution_max_turns_eight(self) -> None:
+        # A. El argv de run_developer_task contiene --max-turns 8 (el
+        # presupuesto propio de task_execution, distinto de write_probe).
+        developer_config = _valid_task_execution_developer_config()
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            run_developer_task(
+                developer_config=developer_config,
+                prompt="x",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "8")
+
+    def test_write_probe_argv_still_uses_max_turns_three(self) -> None:
+        # B. run_write_probe sigue usando --max-turns 3, sin importar el
+        # cambio anterior en run_developer_task.
+        developer_config = _valid_write_probe_developer_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp).resolve()
+            prepare_sandbox_files(cwd)
+            completed = _completed(
+                returncode=0, stdout=json.dumps(_valid_write_result_payload())
+            )
+            with mock.patch(
+                "orchestrator.adapters.claude_code.shutil.which",
+                return_value="/resolved/claude",
+            ), mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run",
+                side_effect=_fake_subprocess_run(_write_target_after, stdout=completed.stdout),
+            ) as mock_run:
+                run_write_probe(
+                    developer_config=developer_config,
+                    cwd=cwd,
+                    authorized_root=cwd,
+                )
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "3")
+
+    def test_handshake_argv_still_uses_max_turns_one(self) -> None:
+        # C. el handshake sigue usando --max-turns 1.
+        developer_config = _valid_developer_config()
+        completed = _completed(
+            returncode=0, stdout=json.dumps(_valid_result_payload())
+        )
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            run_handshake(
+                developer_config=developer_config,
+                prompt=HANDSHAKE_PROMPT,
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "1")
+
+    def test_changing_write_probe_max_turns_does_not_affect_generic_task(self) -> None:
+        # D. cambiar write_probe.max_turns en la config de prueba NO afecta
+        # run_developer_task (que ni siquiera lee esa clave).
+        developer_config = _valid_task_execution_developer_config()
+        developer_config["write_probe"] = {
+            "enabled": True,
+            "permission_mode": "acceptEdits",
+            "restricted": True,
+            "max_turns": 999,
+            "timeout_seconds": 90,
+        }
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            run_developer_task(
+                developer_config=developer_config,
+                prompt="x",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "8")
+
+    def test_changing_task_execution_max_turns_does_not_affect_write_probe(self) -> None:
+        # E. cambiar task_execution.max_turns en la config de prueba NO
+        # afecta run_write_probe (que ni siquiera lee esa clave).
+        developer_config = _valid_write_probe_developer_config()
+        developer_config["task_execution"] = {
+            "enabled": True,
+            "permission_mode": "acceptEdits",
+            "restricted": True,
+            "max_turns": 999,
+            "timeout_seconds": 90,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp).resolve()
+            prepare_sandbox_files(cwd)
+            completed = _completed(
+                returncode=0, stdout=json.dumps(_valid_write_result_payload())
+            )
+            with mock.patch(
+                "orchestrator.adapters.claude_code.shutil.which",
+                return_value="/resolved/claude",
+            ), mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run",
+                side_effect=_fake_subprocess_run(_write_target_after, stdout=completed.stdout),
+            ) as mock_run:
+                run_write_probe(
+                    developer_config=developer_config,
+                    cwd=cwd,
+                    authorized_root=cwd,
+                )
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "3")
 
 
 # ============================================================
@@ -961,7 +1191,7 @@ class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
         stderr: str = "",
         prompt: str = "STRUCTURED PROMPT SECRET_PROMPT_MARKER_XYZ",
     ) -> str:
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         completed = _completed(returncode=returncode, stdout=stdout, stderr=stderr)
         with mock.patch(
             "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
@@ -1058,7 +1288,7 @@ class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
 
     def test_success_path_still_works(self) -> None:
         # G. success path sigue funcionando igual: no se toca en absoluto.
-        developer_config = _valid_write_probe_developer_config()
+        developer_config = _valid_task_execution_developer_config()
         completed = _completed(
             returncode=0, stdout=json.dumps(_valid_generic_result_payload())
         )

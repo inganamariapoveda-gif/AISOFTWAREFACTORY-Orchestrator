@@ -47,11 +47,31 @@ agents:
     # CLAUDE-EXECUTION-002: sandbox de escritura controlada. permission_mode
     # y restricted PROPIOS, independientes de los de arriba (que siguen en
     # "plan"). executable/output_format se reutilizan de este mismo bloque
-    # developer, sin duplicarse.
+    # developer, sin duplicarse. write_probe es una prueba mínima
+    # determinista (un solo archivo, un texto exacto): su presupuesto de
+    # turnos NUNCA debe reutilizarse como presupuesto operacional de una
+    # tarea de desarrollo genérica (ver task_execution más abajo).
     write_probe:
       enabled: true
       permission_mode: "acceptEdits"
       restricted: true
       # Un solo turno: modificar TARGET.txt y responder. Pequeño y acotado.
       max_turns: 3
+      timeout_seconds: 90
+
+    # TASK-EXECUTION-005: presupuesto SEPARADO e independiente para la
+    # ejecución de un Developer Task Packet genérico (run_developer_task).
+    # permission_mode/restricted comparten el mismo valor que write_probe
+    # (acceptEdits + restricted) porque ambos autorizan edición real, pero
+    # max_turns/timeout_seconds son PROPIOS: una instrucción de desarrollo
+    # arbitraria (EXECUTION-DIAG-002) puede necesitar más turnos agentic que
+    # la escritura mínima determinista del write_probe. executable/
+    # output_format se reutilizan de este mismo bloque developer, sin
+    # duplicarse. Cambiar este bloque NUNCA afecta write_probe ni el
+    # handshake, y viceversa.
+    task_execution:
+      enabled: true
+      permission_mode: "acceptEdits"
+      restricted: true
+      max_turns: 8
       timeout_seconds: 90
