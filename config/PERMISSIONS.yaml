@@ -23,3 +23,5 @@ deny:
 # PROJECT_RULES de un proyecto.
 allowed_commands:
   - unit
+  - lint
+  - build

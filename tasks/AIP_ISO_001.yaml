@@ -1,0 +1,100 @@
+# AIP-ISO-001: primer Task Packet real contra la copia aislada de AIP
+# (proyecto AIP_ISO). Preparado por AIP-ISO-PILOT-001-PREP. NO se ejecuta
+# todavia: la ejecucion requiere autorizacion expresa del Director.
+task_id: AIP-ISO-001
+project_id: AIP_ISO
+objective: "Corregir exclusivamente la representacion visual de tamanos de archivo utilizada por CorrespondencePage (funcion formatBytes). Comportamiento EXACTO requerido para sizeBytes entero no negativo: 0 -> '0 B'; 100 -> '100 B'; 1023 -> '1023 B'; 1024 -> '1 KB'; 1536 -> '1.5 KB'; 1048576 -> '1 MB'; 20971520 -> '20 MB'. Reglas: sizeBytes < 1024 muestra el entero seguido de ' B'; 1024 <= sizeBytes < 1048576 muestra KB en base 1024; sizeBytes >= 1048576 muestra MB en base 1024; maximo 1 decimal cuando sea necesario; sin '.0' innecesario; sin decimales innecesarios; no cambiar el valor de entrada; no cambiar los limites de upload. El comportamiento para valores negativos o no validos esta FUERA DE ALCANCE: no inventar una nueva politica."
+scope:
+  - "Modificar unicamente la funcion de formato de tamano de archivo (formatBytes) usada por CorrespondencePage"
+  - "Definir formatBytes como funcion pura y exportada en el helper local src/pages/CorrespondencePage/formatBytes.ts"
+  - "CorrespondencePage.tsx unicamente importa y usa formatBytes desde ese helper; no exporta helpers adicionales ni formatBytes"
+  - "Crear o ajustar un test puro para formatBytes en CorrespondencePage.test.ts, importando desde formatBytes.ts"
+  - "Mantener intacto el resto del comportamiento de la pagina"
+out_of_scope:
+  - "Logica de upload"
+  - "CORRESPONDENCE_MAX_FILE_SIZE_BYTES"
+  - "Tipos MIME"
+  - "Validacion de archivos"
+  - "Carga, consulta o eliminacion de documentos"
+  - "Supabase"
+  - "Autenticacion (auth)"
+  - "Autorizacion"
+  - "Aislamiento de tenants (tenant isolation)"
+  - "RLS"
+  - "Rutas y ProtectedRoute"
+  - "API clients"
+  - "Base de datos y migraciones"
+  - "Variables de entorno"
+  - "Estilos y CSS"
+  - "Dependencias"
+  - "Arquitectura"
+  - "Cualquier comportamiento distinto al formato de tamano de archivo"
+  - "Refactorizar funciones no relacionadas"
+authorized_files:
+  - src/pages/CorrespondencePage/CorrespondencePage.tsx
+  - src/pages/CorrespondencePage/formatBytes.ts
+  - src/pages/CorrespondencePage/CorrespondencePage.test.ts
+forbidden_files:
+  - package.json
+  - pnpm-lock.yaml
+  - CLAUDE.md
+  - src/services/supabaseClient.ts
+  - src/api-client/mode.ts
+constraints:
+  - "Sin nuevas dependencias"
+  - "Sin modificar package.json ni pnpm-lock.yaml"
+  - "Sin acceso a produccion"
+  - "Sin credenciales, sin variables de entorno nuevas y sin crear archivos .env"
+  - "Sin acceso al AIP original"
+  - "Cualquier archivo fuera de authorized_files debe resultar out_of_scope segun la evidencia Git"
+  - "Warning baseline preexistente de Oxlint (no es objeto de esta tarea, no corregir): 1 warning react(only-export-components) en src/pages/InventoryPage/InventoryPage.tsx, 0 errores"
+  - "Warning baseline preexistente de Vite build (no es objeto de esta tarea, no corregir): aviso de chunk mayor de 500 kB"
+  - "La tarea NO puede introducir nuevos warnings relacionados con los archivos modificados; en particular ningun nuevo warning react(only-export-components), por lo que CorrespondencePage.tsx no debe exportar nada nuevo"
+  - "Human Gate estandar HUMAN_FUNCTIONAL_TEST: confirmacion funcional humana final de la regla aprobada, sin Supabase, credenciales, servidor ni produccion, solo despues de que la evidencia automatica pase"
+  - "No realizar commit antes de aprobacion humana"
+acceptance_criteria:
+  - "formatBytes(0) devuelve '0 B'"
+  - "formatBytes(100) devuelve '100 B'"
+  - "formatBytes(1023) devuelve '1023 B'"
+  - "formatBytes(1024) devuelve '1 KB'"
+  - "formatBytes(1536) devuelve '1.5 KB'"
+  - "formatBytes(1048576) devuelve '1 MB'"
+  - "formatBytes(20971520) devuelve '20 MB'"
+  - "Existe un test unitario automatizado que cubre esos siete casos"
+  - "Ninguna salida contiene '.0' innecesario y ninguna tiene mas de 1 decimal"
+  - "formatBytes es una funcion pura, definida en formatBytes.ts e importada por CorrespondencePage.tsx"
+  - "CorrespondencePage.tsx no exporta formatBytes ni ningun helper adicional"
+  - "oxlint no reporta ningun warning nuevo respecto al baseline (solo el de InventoryPage.tsx)"
+  - "El comportamiento restante de CorrespondencePage no cambia"
+security_criteria:
+  - "Cero cambios de autenticacion o autorizacion"
+  - "Cero cambios de tenant isolation o RLS"
+  - "Cero cambios de Supabase"
+  - "Cero cambios de secretos o variables de entorno"
+  - "Cero cambios de uploads o de sus limites"
+  - "Cero dependencias nuevas"
+  - "package.json y pnpm-lock.yaml intactos"
+  - "Ningun acceso a produccion"
+  - "Ningun acceso al AIP original"
+  - "Ningun archivo fuera de authorized_files modificado"
+mandatory_tests:
+  - unit
+  - lint
+  - build
+stop_rules:
+  - "Se requiere un cuarto archivo o cualquier archivo fuera de authorized_files (formatBytes.ts esta expresamente autorizado como tercer archivo)"
+  - "Se requiere una dependencia nueva"
+  - "Se requiere modificar package.json o pnpm-lock.yaml"
+  - "Aparece la necesidad de tocar upload, Supabase, auth, permisos o RLS"
+  - "Una prueba exige credenciales"
+  - "Falla unit, lint o build"
+  - "La evidencia Git detecta un path fuera de alcance"
+  - "HEAD cambia"
+  - "Aparece una decision funcional no contemplada"
+  - "Claude solicita ampliar la arquitectura"
+  - "No puede implementarse sin modificar logica distinta del formato"
+required_evidence:
+  - git_before
+  - git_after
+  - git_diff
+  - test_output

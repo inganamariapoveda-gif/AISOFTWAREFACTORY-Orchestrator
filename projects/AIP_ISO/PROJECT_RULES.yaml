@@ -1,0 +1,32 @@
+# PROJECT_RULES.yaml — copia aislada REAL de AIP para el primer piloto (AIP_ISO)
+#
+# Esquema idéntico al de DISPOSABLE/SAMPLE (sin claves nuevas). El repo
+# apunta EXCLUSIVAMENTE a la copia aislada; nunca al AIP original.
+
+version: 1
+
+project_id: AIP_ISO
+name: "AIP copia aislada (piloto)"
+
+# Relativo al repo del propio orquestador (D-EXEC-003): resuelto por
+# config_loader.resolve_project_root().
+repo_path: "../_AISOFTWAREFACTORY_PILOT/aip-isolated"
+
+# D-EXEC-001: mapping ABIERTO logical_id -> argv (lista exacta, sin shell).
+commands:
+  unit:
+    - pnpm.cmd
+    - test
+  lint:
+    - pnpm.cmd
+    - lint
+  build:
+    - pnpm.cmd
+    - build
+
+protected_paths:
+  - "**/.env*"
+  - "**/migrations/**"
+  - "infra/**"
+
+autonomy_overrides: {}
