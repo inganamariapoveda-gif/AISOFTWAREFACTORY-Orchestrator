@@ -1,0 +1,61 @@
+{
+  "task_id": "AIP-ISO-001",
+  "project_id": "AIP_ISO",
+  "orchestrator_task_packet_commit": "e3bfbcf45ed59315e3dc168b5191e62769d0607a",
+  "aip_isolated_baseline": "1f39450cf998fe2982e6d207a8dfad689abfbf93",
+  "aip_isolated_result_commit": "989462331976eaa8dd24eb70804a646a0dd52603",
+  "aip_isolated_branch": "task/aip-iso-001",
+  "commit_subject": "fix: format correspondence file sizes",
+  "state_before_human_approval": "HUMAN_GATE",
+  "human_gate": "HUMAN_FUNCTIONAL_TEST",
+  "human_result": "APROBADO",
+  "final_state": "HUMAN_APPROVED",
+  "developer_completed": true,
+  "head_unchanged_during_execution": true,
+  "authorized_paths": [
+    "src/pages/CorrespondencePage/CorrespondencePage.tsx",
+    "src/pages/CorrespondencePage/formatBytes.ts",
+    "src/pages/CorrespondencePage/CorrespondencePage.test.ts"
+  ],
+  "actual_committed_paths": [
+    "src/pages/CorrespondencePage/CorrespondencePage.tsx",
+    "src/pages/CorrespondencePage/formatBytes.ts",
+    "src/pages/CorrespondencePage/CorrespondencePage.test.ts"
+  ],
+  "out_of_scope_paths": [],
+  "unit_tests": {
+    "result": "PASS",
+    "passed": 223,
+    "total": 223
+  },
+  "lint": {
+    "result": "PASS",
+    "errors": 0,
+    "baseline_warnings": 1,
+    "new_warnings": 0
+  },
+  "build": {
+    "result": "PASS",
+    "typescript": "PASS",
+    "vite": "PASS",
+    "new_warnings": 0
+  },
+  "technical_review": true,
+  "security_review": true,
+  "pre_test_evidence_passed": true,
+  "post_test_evidence_passed": true,
+  "package_json_unchanged": true,
+  "pnpm_lock_unchanged": true,
+  "security_sensitive_changes": false,
+  "aip_original_accessed": false,
+  "push_performed": false,
+  "merge_performed": false,
+  "known_orchestrator_reporting_gap": {
+    "changed_paths_omitted_created_untracked": true,
+    "test_evidence_not_exposed_in_execution_result": true
+  },
+  "known_non_blocking_product_observation": {
+    "near_one_mib_rounding": "values immediately below 1 MiB can display as 1024 KB because unit selection occurs before decimal rounding",
+    "status": "OUT_OF_SCOPE_NOT_A_FAILURE"
+  }
+}
