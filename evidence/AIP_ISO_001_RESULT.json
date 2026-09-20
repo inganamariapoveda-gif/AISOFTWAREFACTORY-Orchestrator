@@ -9,7 +9,7 @@
   "state_before_human_approval": "HUMAN_GATE",
   "human_gate": "HUMAN_FUNCTIONAL_TEST",
   "human_result": "APROBADO",
-  "final_state": "HUMAN_APPROVED",
+  "final_state": "COMPLETED",
   "developer_completed": true,
   "head_unchanged_during_execution": true,
   "authorized_paths": [
