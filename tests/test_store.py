@@ -1392,6 +1392,95 @@ class TransitionTaskStateGuardTests(SuspensionTestCase):
         self.assertEqual(self.store.get_task("T-1")["status"], "BLOCKED")
 
 
+class WaitingCapacityCandidatesTests(SuspensionTestCase):
+    """CAPACITY-WAKEUP-001: API de descubrimiento de solo lectura para resume-due."""
+
+    def wait(self, task_id: str, **overrides) -> None:
+        self.make_task(task_id)
+        self.store.suspend_for_capacity(task_id, **_suspend_fields(**overrides))
+
+    def test_zero_waiting_tasks_returns_an_empty_list(self) -> None:
+        self.make_task("T-1")  # DEVELOPING, no WAITING
+        self.assertEqual(self.store.list_waiting_capacity_candidates(), [])
+
+    def test_one_valid_waiting_task(self) -> None:
+        self.wait("T-1")
+        self.assertEqual(
+            self.store.list_waiting_capacity_candidates(),
+            [{"task_id": "T-1", "next_retry_at": T1}],
+        )
+
+    def test_several_waiting_tasks_are_ordered_by_task_id(self) -> None:
+        for task_id in ("T-3", "T-1", "T-2"):
+            self.wait(task_id)
+        ids = [c["task_id"] for c in self.store.list_waiting_capacity_candidates()]
+        self.assertEqual(ids, ["T-1", "T-2", "T-3"])
+
+    def test_only_waiting_tasks_are_returned(self) -> None:
+        self.wait("T-1")
+        self.make_task("T-2")  # DEVELOPING
+        self.make_task("T-3", status="BACKLOG")
+        self.make_task("T-4")
+        self.store.transition_task("T-4", "BLOCKED", "setup", "director")
+        ids = [c["task_id"] for c in self.store.list_waiting_capacity_candidates()]
+        self.assertEqual(ids, ["T-1"])
+
+    def test_orphan_waiting_task_appears_with_no_retry_time(self) -> None:
+        self.wait("T-1")
+        self.store._conn.execute("DELETE FROM task_suspension WHERE task_id = 'T-1'")
+        self.store._conn.commit()
+        self.assertEqual(
+            self.store.list_waiting_capacity_candidates(),
+            [{"task_id": "T-1", "next_retry_at": None}],
+        )
+
+    def test_invalid_timestamp_is_returned_verbatim_for_the_caller_to_judge(self) -> None:
+        self.wait("T-1")
+        self.store._conn.execute("UPDATE task_suspension SET next_retry_at = 'tomorrow'")
+        self.store._conn.commit()
+        self.assertEqual(
+            self.store.list_waiting_capacity_candidates(),
+            [{"task_id": "T-1", "next_retry_at": "tomorrow"}],
+        )
+
+    def test_only_minimal_metadata_is_exposed(self) -> None:
+        self.wait("T-1")
+        (candidate,) = self.store.list_waiting_capacity_candidates()
+        self.assertEqual(set(candidate), {"task_id", "next_retry_at"})
+
+    def test_discovery_is_read_only(self) -> None:
+        self.wait("T-1")
+        self.wait("T-2")
+        self.store._conn.execute("DELETE FROM task_suspension WHERE task_id = 'T-2'")
+        self.store._conn.commit()
+        before = "\n".join(self.store._conn.iterdump())
+        self.store.list_waiting_capacity_candidates()
+        self.assertEqual("\n".join(self.store._conn.iterdump()), before)
+        self.assertFalse(self.store._conn.in_transaction)
+
+    def test_a_task_that_stops_waiting_disappears_from_the_next_discovery(self) -> None:
+        self.wait("T-1")
+        self.store.block_waiting_capacity("T-1", reason="closed", actor="orchestrator")
+        self.assertEqual(self.store.list_waiting_capacity_candidates(), [])
+
+    def test_opening_a_corrupt_database_fails_without_leaking_the_connection(self) -> None:
+        corrupt = Path(self._tmp.name) / "corrupt.db"
+        corrupt.write_bytes(b"not a sqlite database" * 50)
+        with self.assertRaises(sqlite3.DatabaseError):
+            Store(corrupt)
+        corrupt.unlink()  # en Windows falla si quedó un handle abierto
+        self.assertFalse(corrupt.exists())
+
+    def test_the_query_is_parameterized(self) -> None:
+        source = inspect.getsource(self.store.list_waiting_capacity_candidates)
+        self.assertNotIn("f\"", source)
+        self.assertNotIn("%s", source)
+        from orchestrator import store as store_mod
+
+        self.assertIn("?", store_mod._SELECT_WAITING_CANDIDATES_SQL)
+        self.assertNotIn(WAITING, store_mod._SELECT_WAITING_CANDIDATES_SQL)
+
+
 class ParameterizedSqlTests(unittest.TestCase):
     def test_store_never_builds_sql_with_string_interpolation(self) -> None:
         source = (SRC_DIR / "orchestrator" / "store.py").read_text(encoding="utf-8")

@@ -1206,20 +1206,36 @@ def _finish_fresh_task(store: Store, task_id: str, result: dict[str, Any]) -> in
     return EXIT_BLOCKED_OR_ERROR
 
 
-def _block_waiting_and_emit(store: Store, task: dict[str, Any], reason: str) -> int:
+def _block_waiting(
+    store: Store, task: dict[str, Any], reason: str
+) -> tuple[int, dict[str, Any]]:
     store.block_waiting_capacity(task["id"], reason=reason, actor=PERSISTED_ACTOR)
-    _emit(_persisted_blocked_result(task["id"], task["project_id"], reason))
-    return EXIT_BLOCKED_OR_ERROR
+    return EXIT_BLOCKED_OR_ERROR, _persisted_blocked_result(
+        task["id"], task["project_id"], reason
+    )
 
 
 def cmd_resume_capacity(args: argparse.Namespace) -> int:
     """Reanuda UNA tarea en WAITING_FOR_CLAUDE_CAPACITY. Solo actúa cuando se
     invoca (sin sleep ni worker). Todo se recupera de SQLite + archivos
-    actuales + Git: no se pide de nuevo ni el packet ni el repo ni hashes."""
-    task_id = validate_id(args.task_id, "task_id")
+    actuales + Git: no se pide de nuevo ni el packet ni el repo ni hashes.
+
+    Interfaz pública sin cambios: imprime el resultado (JSON) y devuelve el
+    exit code. La lógica vive en _resume_capacity_core, que TAMBIÉN usa
+    `resume-due` (un solo núcleo, sin duplicar ninguna validación)."""
+    exit_code, result = _resume_capacity_core(args.task_id, args.db_path)
+    _emit(result)
+    return exit_code
+
+
+def _resume_capacity_core(task_id_arg: str, db_path_arg: str) -> tuple[int, dict[str, Any]]:
+    """Núcleo ÚNICO de la reanudación: devuelve (exit_code, resultado
+    estructurado) sin imprimir. Las excepciones (CliError, StoreError,
+    ConfigError...) se propagan exactamente como antes."""
+    task_id = validate_id(task_id_arg, "task_id")
     config = _require_core_config()
     capacity_wait = _capacity_wait_config(config)
-    db_path = _ensure_within_repo(Path(args.db_path))
+    db_path = _ensure_within_repo(Path(db_path_arg))
 
     with Store(db_path) as store:
         task = store.get_task(task_id)
@@ -1241,12 +1257,9 @@ def cmd_resume_capacity(args: argparse.Namespace) -> int:
             store.transition_task(
                 task_id, STATE_BLOCKED, _REASON_SUSPENSION_MISSING, PERSISTED_ACTOR
             )
-            _emit(
-                _persisted_blocked_result(
-                    task_id, task["project_id"], _REASON_SUSPENSION_MISSING
-                )
+            return EXIT_BLOCKED_OR_ERROR, _persisted_blocked_result(
+                task_id, task["project_id"], _REASON_SUSPENSION_MISSING
             )
-            return EXIT_BLOCKED_OR_ERROR
 
         # --- PRE-CLAIM: nada de Claude ni de reclamar hasta pasar todo ---
         try:
@@ -1256,37 +1269,34 @@ def cmd_resume_capacity(args: argparse.Namespace) -> int:
             if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                 raise ValueError("invalid capacity_wait_count")
         except (ValueError, KeyError, TypeError):
-            return _block_waiting_and_emit(store, task, _REASON_INVALID_RECORD)
+            return _block_waiting(store, task, _REASON_INVALID_RECORD)
 
         now = _now_utc()
         if capacity_wait is None or capacity_wait.get("auto_wait") is not True:
-            return _block_waiting_and_emit(store, task, _REASON_AUTO_WAIT_DISABLED)
+            return _block_waiting(store, task, _REASON_AUTO_WAIT_DISABLED)
         # max_attempts = N permite N suspensiones: count == N todavía se
         # reanuda; count > N es una política excedida (inconsistencia).
         if count > capacity_wait["max_attempts"]:
-            return _block_waiting_and_emit(store, task, _REASON_LIMIT_REACHED)
+            return _block_waiting(store, task, _REASON_LIMIT_REACHED)
         if (now - started_at).total_seconds() >= capacity_wait["max_wait_seconds"]:
-            return _block_waiting_and_emit(store, task, _REASON_LIMIT_REACHED)
+            return _block_waiting(store, task, _REASON_LIMIT_REACHED)
         if now < next_retry_at:
             # No se reclama, no se invoca a Claude, no se modifica la DB.
-            _emit(
-                {
-                    "task_id": task_id,
-                    "project_id": task["project_id"],
-                    "state": STATE_WAITING_FOR_CLAUDE_CAPACITY,
-                    "human_gate": None,
-                    "developer_completed": False,
-                    "commit_performed": False,
-                    "reason": _PUBLIC_REASON_NOT_DUE,
-                    **_capacity_public_fields(
-                        capacity_wait,
-                        count,
-                        suspension["capacity_wait_started_at"],
-                        suspension["next_retry_at"],
-                    ),
-                }
-            )
-            return EXIT_WAITING_FOR_CAPACITY
+            return EXIT_WAITING_FOR_CAPACITY, {
+                "task_id": task_id,
+                "project_id": task["project_id"],
+                "state": STATE_WAITING_FOR_CLAUDE_CAPACITY,
+                "human_gate": None,
+                "developer_completed": False,
+                "commit_performed": False,
+                "reason": _PUBLIC_REASON_NOT_DUE,
+                **_capacity_public_fields(
+                    capacity_wait,
+                    count,
+                    suspension["capacity_wait_started_at"],
+                    suspension["next_retry_at"],
+                ),
+            }
 
         # --- CLAIM ATÓMICO: solo un proceso puede ganar (el perdedor recibe
         # StoreError y NUNCA llega a Claude) ---
@@ -1379,7 +1389,9 @@ def _execute_claimed_resume(
     )
 
 
-def _run_claimed_resume(store: Store, task: dict[str, Any], suspension: dict[str, Any]) -> int:
+def _run_claimed_resume(
+    store: Store, task: dict[str, Any], suspension: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
     task_id = task["id"]
     block_reason: str | None = None
     result: dict[str, Any] | None = None
@@ -1409,8 +1421,9 @@ def _run_claimed_resume(store: Store, task: dict[str, Any], suspension: dict[str
 
     if block_reason is not None:
         store.block_claimed_resume(task_id, reason=block_reason, actor=PERSISTED_ACTOR)
-        _emit(_persisted_blocked_result(task_id, task["project_id"], block_reason))
-        return EXIT_BLOCKED_OR_ERROR
+        return EXIT_BLOCKED_OR_ERROR, _persisted_blocked_result(
+            task_id, task["project_id"], block_reason
+        )
 
     assert result is not None
     state = result["state"]
@@ -1426,8 +1439,123 @@ def _run_claimed_resume(store: Store, task: dict[str, Any], suspension: dict[str
             task_id, reason=_REASON_PIPELINE_BLOCKED, actor=PERSISTED_ACTOR
         )
         exit_code = EXIT_BLOCKED_OR_ERROR
-    _emit(result)
-    return exit_code
+    return exit_code, result
+
+
+# ============================================================
+# CAPACITY-WAKEUP-001: resume-due (latido operacional).
+#
+# Un mecanismo externo (p. ej. Windows Task Scheduler, instalado en un
+# incremento posterior con su propio Human Gate) invoca `resume-due`
+# periódicamente. Cada invocación procesa COMO MÁXIMO UNA tarea y reutiliza
+# el núcleo ÚNICO de resume-capacity (_resume_capacity_core): no hay segunda
+# versión de la reanudación. Sin sleep, sin bucle, sin worker, sin lock
+# propio (el scheduler usará MultipleInstances = IgnoreNew).
+# ============================================================
+
+RESUME_DUE_OK = 0
+RESUME_DUE_INFRASTRUCTURE_ERROR = 1
+
+# Solo campos ya permitidos del resultado de resume-capacity: nunca `reason`
+# (podría llevar el diagnóstico heredado), stdout, stderr, session_id, usage
+# ni prompt.
+_RESUME_DUE_SAFE_FIELDS = (
+    "developer_failure_category",
+    "capacity_wait_count",
+    "next_retry_at",
+)
+
+
+def _select_resume_due_candidate(
+    candidates: list[dict[str, Any]], now: datetime
+) -> str | None:
+    """Elige, de forma DETERMINISTA, la ÚNICA tarea a procesar:
+
+    1. Si hay WAITING inconsistente (sin suspensión, es decir next_retry_at
+       None, o con un next_retry_at que no se puede parsear como UTC
+       timezone-aware): la de menor task_id. Nunca se ignora eternamente:
+       la lógica fail-closed de resume-capacity la cierra sin Claude.
+    2. Si no, la VENCIDA (now >= next_retry_at) con next_retry_at más
+       antiguo; empate por task_id ASC.
+    3. Si ninguna está vencida: None (no-op).
+
+    El timestamp se parsea con la misma semántica que resume-capacity
+    (_parse_utc); nunca se compara léxicamente."""
+    inconsistent: list[str] = []
+    due: list[tuple[datetime, str]] = []
+    for candidate in candidates:
+        task_id = candidate["task_id"]
+        raw = candidate["next_retry_at"]
+        if raw is None:
+            inconsistent.append(task_id)
+            continue
+        try:
+            retry_at = _parse_utc(raw)
+        except (ValueError, TypeError):
+            inconsistent.append(task_id)
+            continue
+        if now >= retry_at:
+            due.append((retry_at, task_id))
+    if inconsistent:
+        return min(inconsistent)
+    if due:
+        return min(due)[1]
+    return None
+
+
+def _task_is_no_longer_waiting(db_path: Path, task_id: str) -> bool:
+    """True si OTRO proceso ya movió la tarea fuera de WAITING (carrera
+    limpia). Cualquier duda -> False (se trata como error de infraestructura)."""
+    try:
+        with Store(db_path) as store:
+            task = store.get_task(task_id)
+    except Exception:  # noqa: BLE001 - la duda se trata como error real
+        return False
+    return task is not None and task["status"] != STATE_WAITING_FOR_CLAUDE_CAPACITY
+
+
+def cmd_resume_due(args: argparse.Namespace) -> int:
+    """Heartbeat: procesa COMO MÁXIMO una tarea vencida (o inconsistente) en
+    WAITING_FOR_CLAUDE_CAPACITY. Exit 0 en todo resultado operacional normal
+    (sin DB, sin candidato, HUMAN_GATE, WAITING otra vez, BLOCKED, carrera
+    perdida limpiamente); exit 1 SOLO ante un error de infraestructura o una
+    excepción inesperada. Los resultados reales quedan trazados en SQLite."""
+    try:
+        db_path = _ensure_within_repo(Path(args.db_path))
+        if not db_path.is_file():
+            # NO se instancia Store: hacerlo crearía una SQLite vacía.
+            _emit({"status": "no_db"})
+            return RESUME_DUE_OK
+
+        with Store(db_path) as store:
+            candidates = store.list_waiting_capacity_candidates()
+        task_id = _select_resume_due_candidate(candidates, _now_utc())
+        if task_id is None:
+            _emit({"status": "no_due_task", "waiting_tasks": len(candidates)})
+            return RESUME_DUE_OK
+
+        try:
+            _exit_code, result = _resume_capacity_core(task_id, str(db_path))
+        except (CliError, StoreError):
+            if _task_is_no_longer_waiting(db_path, task_id):
+                _emit({"status": "race_lost", "task_id": task_id})
+                return RESUME_DUE_OK
+            raise
+
+        summary: dict[str, Any] = {
+            "status": "processed",
+            "task_id": task_id,
+            "final_state": result.get("state"),
+        }
+        for field in _RESUME_DUE_SAFE_FIELDS:
+            if field in result:
+                summary[field] = result[field]
+        _emit(summary)
+        return RESUME_DUE_OK
+    except Exception as exc:  # noqa: BLE001 - un error de infraestructura NO se oculta
+        _emit({"status": "infrastructure_error", "error_type": type(exc).__name__})
+        print(f"error: {type(exc).__name__}", file=sys.stderr)
+        return RESUME_DUE_INFRASTRUCTURE_ERROR
 
 
 def cmd_history(args: argparse.Namespace) -> int:
@@ -1533,6 +1661,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("task_id")
     p.set_defaults(func=cmd_resume_capacity)
+
+    p = sub.add_parser(
+        "resume-due",
+        help=(
+            "Heartbeat: procesa COMO MÁXIMO una tarea vencida en "
+            "WAITING_FOR_CLAUDE_CAPACITY (exit 0 operacional, 1 solo error de infraestructura)"
+        ),
+    )
+    p.set_defaults(func=cmd_resume_due)
 
     return parser
 

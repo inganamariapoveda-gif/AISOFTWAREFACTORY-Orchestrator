@@ -3925,6 +3925,543 @@ class StatelessProbeRegressionTests(PersistedExecutionTestCase):
             )
 
 
+class ResumeDueTestCase(PersistedExecutionTestCase):
+    """CAPACITY-WAKEUP-001: `resume-due` (latido). Todo con DB temporal, reloj
+    falso y Developer simulado: jamás Claude real, jamás Windows, jamás sleep."""
+
+    RESULT_KEYS = {
+        "status",
+        "task_id",
+        "final_state",
+        "developer_failure_category",
+        "capacity_wait_count",
+        "next_retry_at",
+    }
+
+    def resume_due(self, developer=None, test=None) -> tuple[int, dict | None, mock.MagicMock]:
+        test = test or mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer, test=test):
+            rc, result = self.capture("resume-due")
+        return rc, result, test
+
+    def add_task(self, n: int) -> str:
+        """Proyecto + repo + Task Packet independientes (TASKEXEC<n>-001)."""
+        project_id = f"TASKEXEC{n}"
+        task_id = f"{project_id}-001"
+        repo = self.root / f"taskexec_repo{n}"
+        _init_taskexec_repo(repo)
+        (self.projects_dir / project_id).mkdir()
+        _write_yaml(
+            self.projects_dir / project_id / "PROJECT_RULES.yaml",
+            {
+                "version": 1,
+                "project_id": project_id,
+                "name": f"Task execution test project {n}",
+                "repo_path": f"./taskexec_repo{n}",
+                "commands": {"unit": ["python", "-c", "pass"]},
+                "protected_paths": [],
+            },
+        )
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["task_id"] = task_id
+        packet["project_id"] = project_id
+        packet["authorized_files"] = ["allowed.txt", "new_authorized.txt"]
+        _write_yaml(self.tasks_dir / f"{project_id}_TASK.yaml", packet)
+        return task_id
+
+    def suspend_extra(self, n: int) -> str:
+        task_id = self.add_task(n)
+        with self.patched_subprocess(
+            developer=self.developer_capacity(),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc, _result = self.capture("run-task", str(self.tasks_dir / f"TASKEXEC{n}_TASK.yaml"))
+        self.assertEqual(rc, 10)
+        return task_id
+
+    def status_of(self, task_id: str) -> str:
+        with Store(self.db_path) as store:
+            task = store.get_task(task_id)
+        assert task is not None
+        return task["status"]
+
+    def three_waiting(self, *, same_instant: bool) -> list[str]:
+        """TASKEXEC-001, TASKEXEC2-001, TASKEXEC3-001 en WAITING. Si no es el
+        mismo instante, se suspenden en orden INVERSO al task_id: la más antigua
+        es TASKEXEC3-001."""
+        ids: list[str] = []
+        if same_instant:
+            self.suspend_with_partial()
+            ids = [TASK_ID, self.suspend_extra(2), self.suspend_extra(3)]
+        else:
+            ids.append(self.suspend_extra_reverse(3))
+            self.clock.advance(60)
+            ids.append(self.suspend_extra_reverse(2))
+            self.clock.advance(60)
+            self.suspend_with_partial()
+            ids.append(TASK_ID)
+        return ids
+
+    def suspend_extra_reverse(self, n: int) -> str:
+        return self.suspend_extra(n)
+
+    def waiting_ids(self) -> list[str]:
+        with Store(self.db_path) as store:
+            return [c["task_id"] for c in store.list_waiting_capacity_candidates()]
+
+
+class ResumeDueNoOpTests(ResumeDueTestCase):
+    def test_missing_database_is_a_safe_noop_without_store_or_file(self) -> None:
+        developer = self.never_called()
+        with mock.patch("orchestrator.app.Store") as store_mock:
+            rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        self.assertEqual(result, {"status": "no_db"})
+        store_mock.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+        self.assertFalse(REAL_ORCHESTRATOR_DB.exists())
+        developer.assert_not_called()
+        test.assert_not_called()
+
+    def test_database_without_waiting_tasks_reports_no_due_task(self) -> None:
+        self.assertEqual(self.run_cli("init-storage"), 0)
+        dump = self.dump_db()
+        developer = self.never_called()
+        rc, result, _test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "no_due_task")
+        self.assertEqual(self.dump_db(), dump)
+        developer.assert_not_called()
+
+    def test_waiting_task_that_is_not_yet_due_is_left_untouched(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1799)  # now < next_retry_at
+        dump = self.dump_db()
+        files = self.repo_files()
+        developer = self.never_called()
+        rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "no_due_task")
+        self.assertNotIn("task_id", result)
+        self.assertEqual(self.dump_db(), dump)  # DB intacta
+        self.assertEqual(self.repo_files(), files)
+        developer.assert_not_called()
+        test.assert_not_called()
+
+    def test_due_boundary_is_inclusive(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)  # now == next_retry_at
+        rc, result, _test = self.resume_due(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+
+    def test_timestamps_are_compared_as_datetimes_not_lexically(self) -> None:
+        # Mismo instante que now (10:30Z) escrito con otro offset: lexicográficamente
+        # "...T05:30-05:00" < "...T10:30+00:00", pero como instante NO ha vencido.
+        self.suspend_with_partial()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("UPDATE task_suspension SET next_retry_at = '2026-01-01T05:31:00-05:00'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.clock.advance(1800)  # 10:30Z; retry_at = 10:31Z
+        developer = self.never_called()
+        rc, result, _test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "no_due_task")
+        developer.assert_not_called()
+
+    def test_no_due_task_never_loads_configuration(self) -> None:
+        self.suspend_with_partial()
+        self.corrupt_core_config()  # ningún candidato vencido: no se toca la config
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "no_due_task")
+
+
+class ResumeDueProcessingTests(ResumeDueTestCase):
+    def test_one_due_task_reaches_human_gate_through_the_resume_core(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        developer = self.developer_completes()
+        rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["task_id"], TASK_ID)
+        self.assertEqual(result["final_state"], "HUMAN_GATE")
+        developer.assert_called_once()
+        test.assert_called_once()
+        self.assertEqual(developer.seen["allowed_before"], "PARTIAL")  # continuó desde el parcial
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+        self.assertIsNone(self.suspension())
+        pairs = self.history_pairs()
+        self.assertIn((WAITING, "DEVELOPING"), pairs)
+        self.assertEqual(pairs[-1], ("SECURITY_REVIEW", "HUMAN_GATE"))
+
+    def test_three_due_tasks_are_processed_one_per_run_oldest_first(self) -> None:
+        ids = self.three_waiting(same_instant=False)  # [T3, T2, T1] en orden de antigüedad
+        self.clock.advance(3600)  # las tres vencidas
+        processed: list[str] = []
+        for run in range(3):
+            developer = self.developer_completes()
+            rc, result, _test = self.resume_due(developer=developer)
+            self.assertEqual(rc, 0)
+            assert result is not None
+            self.assertEqual(result["status"], "processed")
+            developer.assert_called_once()  # como máximo UNA por invocación
+            processed.append(result["task_id"])
+            self.assertEqual(len(self.waiting_ids()), 2 - run)
+        self.assertEqual(processed, ids)
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual((rc, result["status"]), (0, "no_due_task"))
+        for task_id in ids:
+            self.assertEqual(self.status_of(task_id), "HUMAN_GATE")
+
+    def test_ties_are_broken_by_task_id(self) -> None:
+        ids = self.three_waiting(same_instant=True)
+        self.clock.advance(1800)
+        processed = []
+        for _ in range(3):
+            rc, result, _test = self.resume_due(developer=self.developer_completes())
+            self.assertEqual(rc, 0)
+            processed.append(result["task_id"])
+        self.assertEqual(processed, sorted(ids))
+
+    def test_waiting_again_exits_zero_and_does_not_process_a_second_task(self) -> None:
+        self.suspend_with_partial()
+        second = self.suspend_extra(2)
+        self.clock.advance(1800)
+        developer = self.developer_capacity()
+        rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)  # el 10 de resume-capacity NO se propaga
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["task_id"], TASK_ID)
+        self.assertEqual(result["final_state"], WAITING)
+        self.assertEqual(result["capacity_wait_count"], 2)
+        developer.assert_called_once()
+        test.assert_not_called()
+        self.assertEqual(self.status_of(TASK_ID), WAITING)
+        self.assertEqual(self.status_of(second), WAITING)  # la segunda NO se tocó
+        self.assertEqual(self.store_suspension_count(second), 1)
+
+    def store_suspension_count(self, task_id: str) -> int:
+        with Store(self.db_path) as store:
+            suspension = store.get_suspension(task_id)
+        assert suspension is not None
+        return suspension["capacity_wait_count"]
+
+    def test_blocked_result_exits_zero_and_does_not_process_a_second_task(self) -> None:
+        self.set_capacity_wait(max_attempts=1)
+        self.suspend_with_partial()
+        second = self.suspend_extra(2)
+        self.clock.advance(1800)
+        developer = self.developer_capacity()  # segundo límite -> excede max_attempts
+        rc, result, _test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["task_id"], TASK_ID)
+        self.assertEqual(result["final_state"], "BLOCKED")
+        self.assertEqual(self.status_of(TASK_ID), "BLOCKED")
+        self.assertEqual(self.status_of(second), WAITING)
+        self.assertLessEqual(developer.call_count, 1)
+
+    def test_at_most_one_developer_call_and_never_in_parallel(self) -> None:
+        self.three_waiting(same_instant=True)
+        self.clock.advance(1800)
+        active = {"now": 0, "max": 0}
+
+        def on_run():
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            self.assertEqual(active["now"], 1)
+            active["now"] -= 1
+
+        developer = self.developer_completes(on_run=on_run)
+        rc, _result, _test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        self.assertEqual(developer.call_count, 1)
+        self.assertEqual(active["max"], 1)
+        self.assertEqual(len(self.waiting_ids()), 2)
+
+
+class ResumeDueInconsistencyTests(ResumeDueTestCase):
+    def _sql(self, statement: str) -> None:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(statement)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_orphan_waiting_is_closed_as_blocked_without_claude_and_exits_zero(self) -> None:
+        self.suspend_with_partial()
+        self._sql("DELETE FROM task_suspension")
+        files = self.repo_files()
+        developer = self.never_called()
+        rc, result, test = self.resume_due(developer=developer)  # NO vencida: da igual
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["task_id"], TASK_ID)
+        self.assertEqual(result["final_state"], "BLOCKED")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.task()["status"], "BLOCKED")
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_SUSPENSION_MISSING)
+        self.assertEqual(self.repo_files(), files)
+        self.assert_partial_edits()
+
+    def test_orphan_is_selected_before_an_older_due_task(self) -> None:
+        older = self.suspend_extra(2)  # más antigua y vencida
+        self.clock.advance(60)
+        self.suspend_with_partial()
+        self._sql(f"DELETE FROM task_suspension WHERE task_id = '{TASK_ID}'")
+        self.clock.advance(3600)
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["task_id"], TASK_ID)
+        self.assertEqual(result["final_state"], "BLOCKED")
+        self.assertEqual(self.status_of(older), WAITING)  # esperará a la siguiente invocación
+
+    def test_invalid_timestamp_is_closed_fail_closed_without_claude(self) -> None:
+        self.suspend_with_partial()
+        self._sql("UPDATE task_suspension SET next_retry_at = 'tomorrow'")
+        developer = self.never_called()
+        rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["final_state"], "BLOCKED")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_INVALID_RECORD)
+
+    def test_naive_timestamp_is_treated_as_invalid(self) -> None:
+        self.suspend_with_partial()
+        self._sql("UPDATE task_suspension SET next_retry_at = '2026-01-01T10:30:00'")
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["final_state"], "BLOCKED")
+
+    def test_orphan_appearing_after_a_run_is_picked_up_by_the_next_one(self) -> None:
+        self.suspend_with_partial()
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual(result["status"], "no_due_task")
+        self._sql("DELETE FROM task_suspension")
+        rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual((rc, result["final_state"]), (0, "BLOCKED"))
+
+
+class ResumeDueSecurityTests(ResumeDueTestCase):
+    def assert_blocked_without_developer(self, reason: str) -> None:
+        self.clock.advance(1800)
+        files = self.repo_files()
+        developer = self.never_called()
+        rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)  # BLOCKED es un resultado operacional
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["final_state"], "BLOCKED")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.history()[-1]["reason"], reason)
+        self.assertEqual(self.repo_files(), files)  # ediciones parciales preservadas
+        self.assert_partial_edits()
+
+    def test_changed_task_packet_blocks_without_developer(self) -> None:
+        self.suspend_with_partial()
+        self.taskexec_packet_path.write_text(
+            self.taskexec_packet_path.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+        )
+        self.assert_blocked_without_developer(app._REASON_IDENTITY_CHANGED)
+
+    def test_changed_working_tree_fingerprint_blocks_without_developer(self) -> None:
+        self.suspend_with_partial()
+        (self.taskexec_repo / "new_authorized.txt").write_text("TAMPERED", encoding="utf-8")
+        self.clock.advance(1800)
+        developer = self.never_called()
+        rc, result, _test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["final_state"], "BLOCKED")
+        developer.assert_not_called()
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_CONTINUITY_BROKEN)
+        self.assertEqual(
+            (self.taskexec_repo / "new_authorized.txt").read_text(encoding="utf-8"), "TAMPERED"
+        )
+
+    def test_head_change_blocks_without_developer(self) -> None:
+        self.suspend_with_partial()
+        _git("commit", "--allow-empty", "-m", "external commit", cwd=self.taskexec_repo)
+        self.assert_blocked_without_developer(app._REASON_CONTINUITY_BROKEN)
+
+    def test_race_between_discovery_and_processing_is_a_clean_noop(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        real_core = app._resume_capacity_core
+        db_path = self.db_path
+
+        def racing_core(task_id, db_arg):
+            with Store(db_path) as other:  # otro proceso gana la carrera
+                other.block_waiting_capacity(task_id, reason="other process", actor="other")
+            return real_core(task_id, db_arg)
+
+        developer = self.never_called()
+        with mock.patch.object(app, "_resume_capacity_core", racing_core):
+            rc, result, test = self.resume_due(developer=developer)
+        self.assertEqual(rc, 0)
+        self.assertEqual(result, {"status": "race_lost", "task_id": TASK_ID})
+        developer.assert_not_called()
+        test.assert_not_called()
+        closes = [e for e in self.history() if e["to_status"] == "BLOCKED"]
+        self.assertEqual([e["reason"] for e in closes], ["other process"])
+
+    def test_output_is_limited_to_safe_public_fields(self) -> None:
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["objective"] = SENTINELS[5]
+        _write_yaml(self.taskexec_packet_path, packet)
+        rc, _first, _test = self.run_task(developer=self.developer_capacity(stderr=SENTINELS[4]))
+        self.assertEqual(rc, 10)
+        tables_before = self.table_names()
+        self.clock.advance(1800)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.patched_subprocess(
+            developer=self.developer_capacity(stderr=SENTINELS[4]),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc = self.run_cli("resume-due")
+        self.assertEqual(rc, 0)
+        raw = out.getvalue()
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, raw)
+        result = json.loads(raw)
+        self.assertLessEqual(set(result), self.RESULT_KEYS)
+        for forbidden in ("reason", "stdout", "stderr", "session_id", "usage", "prompt"):
+            self.assertNotIn(forbidden, result)
+        self.assertNotIn(SENTINELS[5], self.dump_db())
+        self.assertEqual(self.table_names(), tables_before)  # sin cambio de schema
+
+    def table_names(self) -> set[str]:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            return {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        finally:
+            conn.close()
+
+
+class ResumeDueInfrastructureErrorTests(ResumeDueTestCase):
+    def resume_due_capturing_stderr(self) -> tuple[int, dict | None, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, result, _test = self.resume_due(developer=self.never_called())
+        return rc, result, err.getvalue()
+
+    def test_corrupt_database_is_an_infrastructure_error(self) -> None:
+        self.db_path.write_bytes(b"this is definitely not a sqlite database" * 20)
+        rc, result, stderr = self.resume_due_capturing_stderr()
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "infrastructure_error")
+        self.assertEqual(set(result), {"status", "error_type"})
+        self.assertNotIn("sqlite database", stderr)  # solo el tipo, sin mensajes internos
+
+    def test_unloadable_configuration_with_a_due_task_is_an_infrastructure_error(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        self.corrupt_core_config()
+        rc, result, _stderr = self.resume_due_capturing_stderr()
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "infrastructure_error")
+        self.assertEqual(self.task()["status"], WAITING)  # nada se cambió
+
+    def test_unexpected_exception_is_an_infrastructure_error(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        with mock.patch.object(app, "_resume_capacity_core", side_effect=RuntimeError("boom secret")):
+            rc, result, stderr = self.resume_due_capturing_stderr()
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result, {"status": "infrastructure_error", "error_type": "RuntimeError"})
+        self.assertNotIn("boom secret", stderr)
+        self.assertEqual(self.task()["status"], WAITING)
+
+    def test_a_still_waiting_task_failing_in_the_core_is_not_hidden_as_a_race(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        with mock.patch.object(app, "_resume_capacity_core", side_effect=app.CliError("broken")):
+            rc, result, _stderr = self.resume_due_capturing_stderr()
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "infrastructure_error")
+
+
+class ResumeDueRegressionTests(ResumeDueTestCase):
+    def test_resume_capacity_behavior_and_exit_codes_are_unchanged(self) -> None:
+        self.suspend_with_partial()
+        # No vencida: exit 10, sin Developer, DB intacta.
+        dump = self.dump_db()
+        developer = self.never_called()
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertEqual(result["state"], WAITING)
+        self.assertEqual(self.dump_db(), dump)
+        # Vencida: HUMAN_GATE, exit 0, JSON con el mismo shape de siempre.
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertNotIn("status", result)
+
+    def test_resume_capacity_still_fails_for_a_task_that_is_not_waiting(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        self.resume(developer=self.developer_completes())
+        rc, _result, _test = self.resume(developer=self.never_called())
+        self.assertEqual(rc, 1)
+
+    def test_the_stateless_probe_is_unaffected(self) -> None:
+        with mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=self.developer_completes(),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        store_mock.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_resume_due_is_registered_and_takes_no_arguments(self) -> None:
+        choices = app.build_parser()._subparsers._group_actions[0].choices
+        self.assertIn("resume-due", choices)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_cli("resume-due", "TASKEXEC-001")
+
+    def test_resume_due_source_has_no_sleep_loop_worker_or_scheduler_code(self) -> None:
+        import inspect
+
+        source = "".join(
+            inspect.getsource(obj)
+            for obj in (app.cmd_resume_due, app._select_resume_due_candidate)
+        )
+        for needle in ("sleep", "while ", "threading", "Thread", "subprocess", "schtasks", "Register-"):
+            self.assertNotIn(needle, source, needle)
+
+
 class PersistedStaticSafetyTests(unittest.TestCase):
     def test_no_sleep_scheduler_session_resume_or_destructive_git_in_sources(self) -> None:
         for name in ("app.py", "adapters/claude_code.py", "store.py"):

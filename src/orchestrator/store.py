@@ -150,6 +150,15 @@ _UPDATE_SUSPENSION_SQL = (
     "UPDATE task_suspension SET working_tree_fingerprint = ?, touched_paths_json = ?, "
     "capacity_wait_count = ?, next_retry_at = ?, updated_at = ? WHERE task_id = ?"
 )
+# CAPACITY-WAKEUP-001: candidatos WAITING. `task` es la fuente del estado;
+# LEFT JOIN para NO ocultar tareas WAITING sin task_suspension (huérfanas).
+# Solo metadata mínima (id y next_retry_at, NULL si no hay suspensión).
+_SELECT_WAITING_CANDIDATES_SQL = (
+    "SELECT t.id, s.next_retry_at FROM task t "
+    "LEFT JOIN task_suspension s ON s.task_id = t.id "
+    "WHERE t.status = ? ORDER BY t.id ASC"
+)
+
 # CAPACITY-RESUME-EXECUTION-002 CORRECTION-002: mismas sentencias y convención
 # que create_task (evento inicial NULL -> BACKLOG, "task created", "system").
 _INSERT_TASK_SQL = (
@@ -228,8 +237,14 @@ class Store:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._conn = sqlite3.connect(self._db_path)
-        self._conn.execute("PRAGMA foreign_keys = ON;")
-        self._init_schema()
+        try:
+            self._conn.execute("PRAGMA foreign_keys = ON;")
+            self._init_schema()
+        except BaseException:
+            # DB inaccesible o corrupta: no se deja la conexión (y el archivo)
+            # abierta; el heartbeat la reporta como error de infraestructura.
+            self._conn.close()
+            raise
 
     def _init_schema(self) -> None:
         with closing(self._conn.cursor()) as cur:
@@ -422,6 +437,21 @@ class Store:
         siguen en `touched_paths_json`) o None. Solo lectura."""
         validate_id(task_id, "task_id")
         return self._fetch_suspension(task_id)
+
+    def list_waiting_capacity_candidates(self) -> list[dict[str, Any]]:
+        """CAPACITY-WAKEUP-001: descubrimiento de tareas en
+        WAITING_FOR_CLAUDE_CAPACITY. SOLO LECTURA (un SELECT parametrizado):
+        no reclama, no transiciona y no modifica nada.
+
+        Devuelve [{"task_id": str, "next_retry_at": str | None}] ordenado por
+        task_id ASC (determinista). Incluye TAMBIÉN las inconsistentes: una
+        tarea WAITING sin suspensión (next_retry_at None) y una suspensión con
+        next_retry_at corrupto (se devuelve tal cual; el llamador lo parsea).
+        Nunca devuelve hashes, paths, huella, datos de Claude ni contenido."""
+        with closing(self._conn.cursor()) as cur:
+            cur.execute(_SELECT_WAITING_CANDIDATES_SQL, (STATE_WAITING_FOR_CLAUDE_CAPACITY,))
+            rows = cur.fetchall()
+        return [{"task_id": row[0], "next_retry_at": row[1]} for row in rows]
 
     @staticmethod
     def _validated_identity(
