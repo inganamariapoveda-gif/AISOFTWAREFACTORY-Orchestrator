@@ -41,6 +41,19 @@ ALLOWED_DEVELOPER_PERMISSION_MODES = frozenset({"plan"})
 # write-probe en sandbox efímero. Nunca se reutiliza para el handshake
 # read-only, que permanece exclusivamente en "plan".
 WRITE_PROBE_PERMISSION_MODE = "acceptEdits"
+# CAPACITY-RESUME-FOUNDATION-001: developer.capacity_wait (espera automática
+# ante una señal estructurada de capacidad de Claude). Bloque OPCIONAL; si
+# falta, equivale a auto_wait desactivado. Si existe, sus cuatro claves son
+# obligatorias (sin defaults silenciosos) y no se admiten claves extra.
+CAPACITY_WAIT_KEYS = frozenset(
+    {"auto_wait", "retry_interval_seconds", "max_attempts", "max_wait_seconds"}
+)
+CAPACITY_WAIT_RETRY_INTERVAL_MIN_SECONDS = 60
+CAPACITY_WAIT_RETRY_INTERVAL_MAX_SECONDS = 86400
+CAPACITY_WAIT_MAX_ATTEMPTS_MIN = 1
+CAPACITY_WAIT_MAX_ATTEMPTS_MAX = 100
+CAPACITY_WAIT_MAX_WAIT_MAX_SECONDS = 604800
+
 REQUIRED_PERMISSION_DENY_KEYS = (
     "deny.production",
     "deny.git_push",
@@ -176,6 +189,9 @@ def _validate_agents(data: dict[str, Any], path: Path) -> None:
     # habilitado, sus campos deben ser válidos de todos modos (fail closed,
     # sin defaults silenciosos).
     _validate_write_probe_config(developer, path)
+    # Igual que write_probe: independiente de developer_enabled, un bloque
+    # capacity_wait declarado debe ser válido de todos modos.
+    _validate_capacity_wait_config(developer, path)
 
 
 def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
@@ -264,6 +280,69 @@ def _validate_write_probe_config(developer: dict[str, Any], path: Path) -> None:
             "'agents.developer.write_probe.timeout_seconds' must be a positive integer "
             f"when enabled ({path})"
         )
+
+
+def _require_bounded_int(
+    block: dict[str, Any], key: str, minimum: int, maximum: int, path: Path
+) -> int:
+    """Entero REAL (nunca bool) dentro de [minimum, maximum]. Falla cerrado."""
+    value = block.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError(
+            f"'agents.developer.capacity_wait.{key}' must be an integer "
+            f"(not a boolean) in {path}"
+        )
+    if value < minimum or value > maximum:
+        raise ConfigError(
+            f"'agents.developer.capacity_wait.{key}' must be between {minimum} "
+            f"and {maximum} in {path}"
+        )
+    return value
+
+
+def _validate_capacity_wait_config(developer: dict[str, Any], path: Path) -> None:
+    """CAPACITY-RESUME-FOUNDATION-001: valida el bloque OPCIONAL
+    agents.developer.capacity_wait. Ausente -> no se exige nada (equivale a
+    auto_wait desactivado, el comportamiento actual). Presente -> debe ser un
+    mapping con EXACTAMENTE las claves auto_wait (bool real),
+    retry_interval_seconds (60..86400), max_attempts (1..100) y
+    max_wait_seconds (>= retry_interval_seconds, <= 604800); enteros reales,
+    nunca bool. Cualquier clave desconocida, tipo incorrecto o valor fuera de
+    límites falla cerrado."""
+    if "capacity_wait" not in developer:
+        return
+    block = developer["capacity_wait"]
+    if not isinstance(block, dict):
+        raise ConfigError(f"'agents.developer.capacity_wait' must be a mapping in {path}")
+
+    unknown = sorted(str(key) for key in block if key not in CAPACITY_WAIT_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"'agents.developer.capacity_wait' has unknown key(s) {unknown} in {path}"
+        )
+    missing = sorted(CAPACITY_WAIT_KEYS - set(block))
+    if missing:
+        raise ConfigError(
+            f"'agents.developer.capacity_wait' is missing required key(s) {missing} in {path}"
+        )
+
+    if not isinstance(block["auto_wait"], bool):
+        raise ConfigError(
+            f"'agents.developer.capacity_wait.auto_wait' must be a boolean in {path}"
+        )
+    retry_interval = _require_bounded_int(
+        block,
+        "retry_interval_seconds",
+        CAPACITY_WAIT_RETRY_INTERVAL_MIN_SECONDS,
+        CAPACITY_WAIT_RETRY_INTERVAL_MAX_SECONDS,
+        path,
+    )
+    _require_bounded_int(
+        block, "max_attempts", CAPACITY_WAIT_MAX_ATTEMPTS_MIN, CAPACITY_WAIT_MAX_ATTEMPTS_MAX, path
+    )
+    _require_bounded_int(
+        block, "max_wait_seconds", retry_interval, CAPACITY_WAIT_MAX_WAIT_MAX_SECONDS, path
+    )
 
 
 def _validate_gates(data: dict[str, Any], path: Path) -> None:

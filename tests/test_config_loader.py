@@ -502,6 +502,175 @@ class WriteProbeConfigTests(unittest.TestCase):
         self.assertIn("write_probe.enabled", str(ctx.exception))
 
 
+def _valid_capacity_wait(**overrides) -> dict:
+    block = {
+        "auto_wait": True,
+        "retry_interval_seconds": 1800,
+        "max_attempts": 12,
+        "max_wait_seconds": 28800,
+    }
+    block.update(overrides)
+    return block
+
+
+class CapacityWaitConfigTests(unittest.TestCase):
+    """CAPACITY-RESUME-FOUNDATION-001: agents.developer.capacity_wait es un
+    bloque OPCIONAL (ausente == auto_wait desactivado). Si existe, sus cuatro
+    claves son obligatorias, sin claves extra, con enteros REALES (nunca
+    bool) dentro de límites. Solo configuración: el motor todavía no
+    suspende ni reanuda."""
+
+    def _load(self, block, *, developer_enabled: bool = True):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            developer = (
+                _valid_developer_handshake() if developer_enabled else {"enabled": False}
+            )
+            developer["capacity_wait"] = block
+            agents["agents"]["developer"] = developer
+            _write_core_config(tmp, agents=agents)
+            return load_core_config(tmp)
+
+    def _assert_rejected(self, block, expected_fragment: str) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            self._load(block)
+        self.assertIn(expected_fragment, str(ctx.exception))
+
+    # ---- válido / ausente ----
+
+    def test_approved_block_is_accepted_exactly(self) -> None:
+        config = self._load(_valid_capacity_wait())
+        block = config.agents["agents"]["developer"]["capacity_wait"]
+        self.assertEqual(
+            block,
+            {
+                "auto_wait": True,
+                "retry_interval_seconds": 1800,
+                "max_attempts": 12,
+                "max_wait_seconds": 28800,
+            },
+        )
+
+    def test_real_repository_config_has_the_approved_block(self) -> None:
+        block = load_core_config(CONFIG_DIR).agents["agents"]["developer"]["capacity_wait"]
+        self.assertIs(block["auto_wait"], True)
+        self.assertEqual(block["retry_interval_seconds"], 1800)
+        self.assertEqual(block["max_attempts"], 12)
+        self.assertEqual(block["max_wait_seconds"], 28800)
+
+    def test_absent_block_is_accepted_and_means_auto_wait_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            agents = _baseline_agents()
+            agents["agents"]["developer"] = _valid_developer_handshake()
+            _write_core_config(tmp, agents=agents)
+            config = load_core_config(tmp)
+        developer = config.agents["agents"]["developer"]
+        self.assertNotIn("capacity_wait", developer)
+        # Sin bloque no hay espera automática: ningún default silencioso.
+        self.assertFalse(developer.get("capacity_wait", {}).get("auto_wait", False))
+
+    def test_auto_wait_false_is_a_valid_explicit_disable(self) -> None:
+        config = self._load(_valid_capacity_wait(auto_wait=False))
+        self.assertIs(config.agents["agents"]["developer"]["capacity_wait"]["auto_wait"], False)
+
+    def test_block_is_validated_even_when_developer_is_disabled(self) -> None:
+        self._load(_valid_capacity_wait(), developer_enabled=False)
+        with self.assertRaises(ConfigError):
+            self._load(_valid_capacity_wait(max_attempts=0), developer_enabled=False)
+
+    # ---- forma ----
+
+    def test_block_must_be_a_mapping(self) -> None:
+        for bogus in (None, True, [], "on", 5):
+            with self.subTest(block=bogus):
+                self._assert_rejected(bogus, "capacity_wait' must be a mapping")
+
+    def test_unknown_keys_are_rejected(self) -> None:
+        for extra in ("auto_retry", "max_turns", "retry_interval", "notes"):
+            with self.subTest(extra=extra):
+                self._assert_rejected(_valid_capacity_wait(**{extra: 1}), "unknown key")
+
+    def test_every_key_is_required(self) -> None:
+        for key in ("auto_wait", "retry_interval_seconds", "max_attempts", "max_wait_seconds"):
+            with self.subTest(missing=key):
+                block = _valid_capacity_wait()
+                del block[key]
+                self._assert_rejected(block, "missing required key")
+
+    # ---- auto_wait ----
+
+    def test_auto_wait_must_be_a_real_boolean(self) -> None:
+        for bogus in (1, 0, "true", "yes", None, [], 1.0):
+            with self.subTest(auto_wait=bogus):
+                self._assert_rejected(
+                    _valid_capacity_wait(auto_wait=bogus), "capacity_wait.auto_wait"
+                )
+
+    # ---- enteros reales, nunca bool ----
+
+    def test_integers_must_not_be_booleans(self) -> None:
+        for key in ("retry_interval_seconds", "max_attempts", "max_wait_seconds"):
+            for bogus in (True, False):
+                with self.subTest(key=key, value=bogus):
+                    self._assert_rejected(
+                        _valid_capacity_wait(**{key: bogus}), f"capacity_wait.{key}"
+                    )
+
+    def test_integers_must_not_be_floats_or_strings(self) -> None:
+        for key in ("retry_interval_seconds", "max_attempts", "max_wait_seconds"):
+            for bogus in (1800.0, "1800", None, [1800]):
+                with self.subTest(key=key, value=bogus):
+                    self._assert_rejected(
+                        _valid_capacity_wait(**{key: bogus}), f"capacity_wait.{key}"
+                    )
+
+    # ---- límites ----
+
+    def test_retry_interval_bounds(self) -> None:
+        for bad in (59, 30, 0, -1, 86401):
+            with self.subTest(retry=bad):
+                self._assert_rejected(
+                    _valid_capacity_wait(retry_interval_seconds=bad, max_wait_seconds=604800),
+                    "capacity_wait.retry_interval_seconds",
+                )
+        for good in (60, 86400):
+            with self.subTest(retry=good):
+                self._load(
+                    _valid_capacity_wait(retry_interval_seconds=good, max_wait_seconds=604800)
+                )
+
+    def test_max_attempts_bounds(self) -> None:
+        for bad in (0, -1, 101):
+            with self.subTest(attempts=bad):
+                self._assert_rejected(
+                    _valid_capacity_wait(max_attempts=bad), "capacity_wait.max_attempts"
+                )
+        for good in (1, 100):
+            with self.subTest(attempts=good):
+                self._load(_valid_capacity_wait(max_attempts=good))
+
+    def test_max_wait_must_not_be_below_retry_interval(self) -> None:
+        self._assert_rejected(
+            _valid_capacity_wait(retry_interval_seconds=1800, max_wait_seconds=1799),
+            "capacity_wait.max_wait_seconds",
+        )
+        # Igual al intervalo: válido (mínimo permitido).
+        self._load(_valid_capacity_wait(retry_interval_seconds=1800, max_wait_seconds=1800))
+
+    def test_max_wait_upper_bound(self) -> None:
+        self._assert_rejected(
+            _valid_capacity_wait(max_wait_seconds=604801), "capacity_wait.max_wait_seconds"
+        )
+        self._load(_valid_capacity_wait(max_wait_seconds=604800))
+
+    def test_capacity_wait_keys_do_not_trigger_the_secret_key_filter(self) -> None:
+        # Ningún nombre del bloque coincide con el patrón de "secretos" del
+        # loader: el bloque aprobado carga sin tocar ese filtro.
+        self._load(_valid_capacity_wait())
+
+
 class OnUnclassifiedTests(unittest.TestCase):
     """Hallazgo 3: una acción no clasificada debe fallar cerrado (BLOCKED),
     nunca heredar silenciosamente un nivel aprobable."""

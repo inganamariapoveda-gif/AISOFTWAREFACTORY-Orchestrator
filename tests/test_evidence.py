@@ -13,6 +13,9 @@ directo (setup de prueba, no la capacidad del recolector), siempre en
 directorios temporales fuera del árbol del repositorio del orquestador.
 """
 
+import dataclasses
+import hashlib
+import json
 import subprocess
 import sys
 import tempfile
@@ -28,6 +31,7 @@ if str(SRC_DIR) not in sys.path:
 from orchestrator.evidence import (  # noqa: E402
     EvidenceError,
     GitChangeEvidence,
+    WorkingTreeFingerprint,
     _iter_status_records_z,
     _normalize_allowed_paths,
     _parse_diff_name_status_z,
@@ -36,6 +40,7 @@ from orchestrator.evidence import (  # noqa: E402
     _union_touched_paths,
     capture_change_evidence,
     capture_snapshot,
+    capture_working_tree_fingerprint,
     evaluate,
 )
 
@@ -1053,6 +1058,300 @@ class CommandSecurityTests(EvidenceTestCase):
             with self.assertRaises(EvidenceError):
                 _run_git("git", ["show", "HEAD:allowed.txt"], cwd=self.repo_root)
         mock_run.assert_not_called()
+
+
+# ============================================================
+# CAPACITY-RESUME-FOUNDATION-001: huella de continuidad del working tree.
+# SOLO LECTURA. Repos temporales fuera del árbol del orquestador.
+# ============================================================
+
+BROAD_ALLOWED = ["allowed.txt", "untouched.txt", "new.txt", "renamed.txt", "before.txt", "after.txt", "old.txt"]
+
+
+class WorkingTreeFingerprintTests(EvidenceTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.before = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+
+    def fp(self, before=None) -> WorkingTreeFingerprint:
+        return capture_working_tree_fingerprint(before or self.before, BROAD_ALLOWED)
+
+    def repo_listing(self) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(self.repo_root)): path.read_bytes()
+            for path in sorted(self.repo_root.rglob("*"))
+            if path.is_file() and ".git" not in path.relative_to(self.repo_root).parts
+        }
+
+    # ---- forma y determinismo ----
+
+    def test_clean_tree_is_deterministic_and_reports_no_touched_paths(self) -> None:
+        first, second = self.fp(), self.fp()
+        self.assertEqual(first, second)
+        self.assertRegex(first.fingerprint, r"^[0-9a-f]{64}$")
+        self.assertEqual(first.touched_paths, ())
+        self.assertEqual(first.head_sha, self.real_head())
+        self.assertEqual(first.branch, self.real_branch())
+
+    def test_fingerprint_is_the_sha256_of_the_documented_canonical_json(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        result = self.fp()
+        material = {
+            "version": 1,
+            "head_sha": self.real_head(),
+            "branch": self.real_branch(),
+            "status_entries": [" M allowed.txt"],
+            "touched_paths": ["allowed.txt"],
+            "files": {
+                "allowed.txt": {
+                    "kind": "file",
+                    "size": 5,
+                    "sha256": hashlib.sha256(b"AFTER").hexdigest(),
+                }
+            },
+        }
+        canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(result.fingerprint, hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+
+    def test_two_independent_before_snapshots_of_the_same_repo_agree(self) -> None:
+        # Mismo repo, mismo estado: dos BEFORE capturados por separado dan la
+        # misma huella (nada depende de la identidad del objeto snapshot).
+        other = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+        self.assertEqual(self.fp(self.before), self.fp(other))
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        self.assertEqual(self.fp(self.before), self.fp(other))
+
+    # ---- cada tipo de cambio produce una huella distinta ----
+
+    def test_tracked_content_change_changes_the_fingerprint(self) -> None:
+        clean = self.fp()
+        (self.repo_root / "allowed.txt").write_text("AFTER-1", encoding="utf-8")
+        one = self.fp()
+        (self.repo_root / "allowed.txt").write_text("AFTER-2", encoding="utf-8")
+        two = self.fp()
+        self.assertEqual(one.touched_paths, ("allowed.txt",))
+        self.assertEqual(len({clean.fingerprint, one.fingerprint, two.fingerprint}), 3)
+        # Volver al contenido original restituye exactamente la huella limpia.
+        (self.repo_root / "allowed.txt").write_text("BEFORE", encoding="utf-8")
+        self.assertEqual(self.fp().fingerprint, clean.fingerprint)
+
+    def test_same_size_content_change_is_detected(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AAAAA", encoding="utf-8")
+        one = self.fp()
+        (self.repo_root / "allowed.txt").write_text("BBBBB", encoding="utf-8")
+        self.assertNotEqual(one.fingerprint, self.fp().fingerprint)
+
+    def test_untracked_file_and_its_content_are_covered(self) -> None:
+        clean = self.fp()
+        (self.repo_root / "new.txt").write_text("v1", encoding="utf-8")
+        created = self.fp()
+        (self.repo_root / "new.txt").write_text("v2", encoding="utf-8")
+        edited = self.fp()
+        self.assertEqual(created.touched_paths, ("new.txt",))
+        self.assertEqual(len({clean.fingerprint, created.fingerprint, edited.fingerprint}), 3)
+
+    def test_deletion_changes_the_fingerprint(self) -> None:
+        clean = self.fp()
+        (self.repo_root / "untouched.txt").unlink()
+        deleted = self.fp()
+        self.assertEqual(deleted.touched_paths, ("untouched.txt",))
+        self.assertNotEqual(clean.fingerprint, deleted.fingerprint)
+
+    def test_git_rename_changes_the_fingerprint_and_covers_both_endpoints(self) -> None:
+        clean = self.fp()
+        _git("mv", "allowed.txt", "renamed.txt", cwd=self.repo_root)
+        renamed = self.fp()
+        self.assertEqual(renamed.touched_paths, ("allowed.txt", "renamed.txt"))
+        self.assertNotEqual(clean.fingerprint, renamed.fingerprint)
+
+    def test_filesystem_only_rename_differs_from_a_staged_git_rename(self) -> None:
+        (self.repo_root / "allowed.txt").rename(self.repo_root / "renamed.txt")
+        filesystem = self.fp()
+        self.assertEqual(filesystem.touched_paths, ("allowed.txt", "renamed.txt"))
+        _git("add", "-A", cwd=self.repo_root)  # fixture de prueba: pasa a rename de Git
+        staged = self.fp()
+        self.assertEqual(staged.touched_paths, ("allowed.txt", "renamed.txt"))
+        self.assertNotEqual(filesystem.fingerprint, staged.fingerprint)
+
+    def test_staging_alone_changes_the_fingerprint(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        unstaged = self.fp()
+        _git("add", "allowed.txt", cwd=self.repo_root)
+        staged = self.fp()
+        # Mismo contenido y mismos touched paths: solo cambia el XY de staging.
+        self.assertEqual(unstaged.touched_paths, staged.touched_paths)
+        self.assertNotEqual(unstaged.fingerprint, staged.fingerprint)
+
+    def test_head_change_alone_changes_the_fingerprint(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        _git("add", "allowed.txt", cwd=self.repo_root)
+        _git("commit", "-m", "work", cwd=self.repo_root)
+        first = self.fp()
+        _git("commit", "--allow-empty", "-m", "empty", cwd=self.repo_root)
+        second = self.fp()
+        # Árbol y status idénticos; solo HEAD difiere.
+        self.assertEqual(first.touched_paths, second.touched_paths)
+        self.assertNotEqual(first.head_sha, second.head_sha)
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+    def test_branch_change_alone_changes_the_fingerprint(self) -> None:
+        first = self.fp()
+        _git("checkout", "-b", "another-branch", cwd=self.repo_root)
+        second = self.fp()
+        self.assertEqual(first.head_sha, second.head_sha)
+        self.assertEqual(second.branch, "another-branch")
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+    def test_touched_paths_of_a_mixed_change_are_complete_and_sorted(self) -> None:
+        before = self.make_mixed_changes()
+        result = capture_working_tree_fingerprint(before, BROAD_ALLOWED)
+        self.assertEqual(
+            result.touched_paths,
+            ("after.txt", "allowed.txt", "before.txt", "new.txt", "old.txt"),
+        )
+        self.assertEqual(list(result.touched_paths), sorted(result.touched_paths))
+
+    # ---- ignorados ----
+
+    def test_ignored_files_never_affect_the_fingerprint(self) -> None:
+        _add_and_commit(self.repo_root, ".gitignore", "ignored.log\nnode_modules/\ndist/\n", "ignore")
+        before = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+        clean = capture_working_tree_fingerprint(before, BROAD_ALLOWED)
+        (self.repo_root / "ignored.log").write_text("noise", encoding="utf-8")
+        (self.repo_root / "node_modules" / "pkg").mkdir(parents=True)
+        (self.repo_root / "node_modules" / "pkg" / "index.js").write_text("x", encoding="utf-8")
+        (self.repo_root / "dist").mkdir()
+        (self.repo_root / "dist" / "bundle.js").write_text("y", encoding="utf-8")
+        with_ignored = capture_working_tree_fingerprint(before, BROAD_ALLOWED)
+        self.assertEqual(clean, with_ignored)
+        (self.repo_root / "dist" / "bundle.js").write_text("changed", encoding="utf-8")
+        self.assertEqual(clean, capture_working_tree_fingerprint(before, BROAD_ALLOWED))
+
+    # ---- fail-closed: link-like, no regular file, cambios durante la captura ----
+
+    def test_symlink_touched_path_fails_closed_real(self) -> None:
+        outside = self.authorized_root / "outside.txt"
+        outside.write_text("EXTERNAL", encoding="utf-8")
+        if not _try_make_symlink(self.repo_root / "new.txt", outside, target_is_directory=False):
+            self.skipTest("symlinks are not available in this environment")
+        with self.assertRaises(EvidenceError) as ctx:
+            self.fp()
+        self.assertIn("symlink", str(ctx.exception))
+
+    def test_broken_symlink_touched_path_fails_closed_real(self) -> None:
+        if not _try_make_symlink(
+            self.repo_root / "new.txt", self.authorized_root / "does-not-exist", target_is_directory=False
+        ):
+            self.skipTest("symlinks are not available in this environment")
+        with self.assertRaises(EvidenceError):
+            self.fp()
+
+    def test_path_through_a_symlinked_directory_fails_closed_real(self) -> None:
+        (self.repo_root / "sub").mkdir()
+        (self.repo_root / "sub" / "f.txt").write_text("F", encoding="utf-8")
+        _git("add", "sub/f.txt", cwd=self.repo_root)
+        _git("commit", "-m", "add sub", cwd=self.repo_root)
+        before = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+        external = self.authorized_root / "external_dir"
+        external.mkdir()
+        (external / "f.txt").write_text("EXTERNAL", encoding="utf-8")
+        for child in (self.repo_root / "sub").iterdir():
+            child.unlink()
+        (self.repo_root / "sub").rmdir()
+        if not _try_make_symlink(self.repo_root / "sub", external, target_is_directory=True):
+            self.skipTest("symlinks are not available in this environment")
+        with self.assertRaises(EvidenceError):
+            capture_working_tree_fingerprint(before, BROAD_ALLOWED + ["sub", "sub/f.txt"])
+
+    def test_link_like_touched_path_fails_closed_mocked(self) -> None:
+        # Cubre symlink/junction aunque el entorno no permita crear enlaces.
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        with mock.patch(
+            "orchestrator.evidence._is_link_like", side_effect=lambda p: p.name == "allowed.txt"
+        ):
+            with self.assertRaises(EvidenceError):
+                self.fp()
+
+    def test_reparse_point_touched_path_fails_closed_mocked(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        with mock.patch(
+            "orchestrator.evidence._is_reparse_point", side_effect=lambda p: p.name == "allowed.txt"
+        ):
+            with self.assertRaises(EvidenceError):
+                self.fp()
+
+    def test_a_link_target_is_never_hashed_or_read(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        with mock.patch(
+            "orchestrator.evidence._is_link_like", side_effect=lambda p: p.name == "allowed.txt"
+        ), mock.patch("orchestrator.evidence.hashlib.sha256") as sha:
+            with self.assertRaises(EvidenceError):
+                self.fp()
+        sha.assert_not_called()
+
+    def test_touched_directory_instead_of_a_file_fails_closed(self) -> None:
+        (self.repo_root / "allowed.txt").unlink()
+        (self.repo_root / "allowed.txt").mkdir()
+        (self.repo_root / "allowed.txt" / "inner.txt").write_text("I", encoding="utf-8")
+        with self.assertRaises(EvidenceError):
+            capture_working_tree_fingerprint(self.before, BROAD_ALLOWED + ["allowed.txt/inner.txt"])
+
+    def test_working_tree_changing_during_capture_fails_closed(self) -> None:
+        first = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+        drifted = dataclasses.replace(first, status_entries=first.status_entries + ("?? ghost.txt",))
+        with mock.patch(
+            "orchestrator.evidence.capture_snapshot", side_effect=[first, drifted]
+        ):
+            with self.assertRaises(EvidenceError):
+                self.fp()
+
+    def test_unsafe_touched_path_from_git_is_rejected(self) -> None:
+        with mock.patch(
+            "orchestrator.evidence.capture_change_evidence",
+            return_value=dataclasses.replace(
+                capture_change_evidence(self.before, BROAD_ALLOWED),
+                untracked_paths=("../outside.txt",),
+            ),
+        ):
+            with self.assertRaises(EvidenceError):
+                self.fp()
+
+    # ---- solo lectura / sin contenido ----
+
+    def test_capture_never_modifies_the_repository(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        (self.repo_root / "new.txt").write_text("NEW", encoding="utf-8")
+        (self.repo_root / "untouched.txt").unlink()
+        listing_before = self.repo_listing()
+        status_before = _git("status", "--porcelain=v1", "-z", cwd=self.repo_root).stdout
+        head_before = self.real_head()
+        for _ in range(3):
+            self.fp()
+        self.assertEqual(self.repo_listing(), listing_before)
+        self.assertEqual(_git("status", "--porcelain=v1", "-z", cwd=self.repo_root).stdout, status_before)
+        self.assertEqual(self.real_head(), head_before)
+
+    def test_result_carries_no_file_content(self) -> None:
+        (self.repo_root / "allowed.txt").write_text("SUPER_SECRET_FILE_CONTENT", encoding="utf-8")
+        result = self.fp()
+        self.assertEqual(
+            {f.name for f in dataclasses.fields(result)},
+            {"fingerprint", "touched_paths", "head_sha", "branch"},
+        )
+        self.assertNotIn("SUPER_SECRET_FILE_CONTENT", repr(result))
+
+    def test_capture_uses_only_the_already_authorized_read_only_git_commands(self) -> None:
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(args, **kwargs):
+            calls.append(list(args))
+            return real_run(args, **kwargs)
+
+        with mock.patch("orchestrator.evidence.subprocess.run", side_effect=spy):
+            self.fp()
+        subcommands = {call[1] for call in calls}
+        self.assertLessEqual(subcommands, {"rev-parse", "branch", "status", "diff"})
 
 
 if __name__ == "__main__":

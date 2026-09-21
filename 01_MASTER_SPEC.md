@@ -90,7 +90,7 @@ Dashboard avanzado · SaaS · multiusuario · marketplace de agentes · multiage
 
 ### 5.1 Estados
 
-`BACKLOG` · `SPECIFICATION` · `DEVELOPING` · `AUTOMATED_TEST` · `TECHNICAL_REVIEW` · `SECURITY_REVIEW` · `CHANGES_REQUESTED` · `TECH_APPROVED` · `HUMAN_GATE` · `HUMAN_APPROVED` · `READY_FOR_COMMIT` · `COMPLETED` · `BLOCKED`
+`BACKLOG` · `SPECIFICATION` · `DEVELOPING` · `WAITING_FOR_CLAUDE_CAPACITY` · `AUTOMATED_TEST` · `TECHNICAL_REVIEW` · `SECURITY_REVIEW` · `CHANGES_REQUESTED` · `TECH_APPROVED` · `HUMAN_GATE` · `HUMAN_APPROVED` · `READY_FOR_COMMIT` · `COMPLETED` · `BLOCKED`
 
 ### 5.2 Transiciones permitidas
 
@@ -98,7 +98,8 @@ Dashboard avanzado · SaaS · multiusuario · marketplace de agentes · multiage
 |---|---|---|
 | `BACKLOG` | PO registra necesidad | `SPECIFICATION` (el Director toma la tarea) |
 | `SPECIFICATION` | Director genera Task Packet; motor lo valida contra PERMISSIONS/POLICIES | `DEVELOPING` (packet válido) · `BLOCKED` (decisión material / contradicción / alcance indefinido) |
-| `DEVELOPING` | Claude Code implementa el packet | `AUTOMATED_TEST` (ejecución finalizada) · `BLOCKED` (condición de parada §18/§ reglas) |
+| `DEVELOPING` | Claude Code implementa el packet | `AUTOMATED_TEST` (ejecución finalizada) · `WAITING_FOR_CLAUDE_CAPACITY` (señal estructurada de capacidad de Claude) · `BLOCKED` (condición de parada §18/§ reglas) |
+| `WAITING_FOR_CLAUDE_CAPACITY` | Espera automática temporal después de una señal estructurada de capacidad de Claude; el motor no cuenta la espera como intento funcional | `DEVELOPING` (se reanuda la misma tarea) · `BLOCKED` (límite de espera o de reintentos superado, o continuidad no demostrable) |
 | `AUTOMATED_TEST` | Motor: tests, lint, TypeScript, build | `TECHNICAL_REVIEW` (todo verde) · `CHANGES_REQUESTED` (algún fallo) |
 | `TECHNICAL_REVIEW` | Director revisa evidencia (diff, resultados, archivos modificados) y aprueba AMARILLO **contemplado** por autoridad programada (§8) | `SECURITY_REVIEW` (ok) · `CHANGES_REQUESTED` (hallazgos) · `BLOCKED` (decisión material no contemplada) |
 | `SECURITY_REVIEW` | Motor (checks deterministas, autoritativos) + Director (revisión) | `TECH_APPROVED` (ok, incluida aprobación de AMARILLO contemplado) · `CHANGES_REQUESTED` (hallazgos) · `BLOCKED` (decisión material no contemplada) · `HUMAN_GATE` (acción ROJO no prohibida) |
@@ -276,6 +277,7 @@ Entidades (campos clave; todas con timestamps `created_at`/`updated_at` según c
 - `specification` (id, task_id, task_packet_json, author, version)
 - `agent_run` (id, task_id, agent, role, phase, input_ref, output_ref, exit_status, started_at, ended_at)
 - `status_event` (id, task_id, from_status, to_status, reason, actor)
+- `task_suspension` (task_id, task_packet_path, task_packet_sha256, project_rules_sha256, permissions_sha256, baseline_head_sha, baseline_branch, working_tree_fingerprint, touched_paths_json, capacity_wait_count, capacity_wait_started_at, next_retry_at) — suspensión temporal de una tarea en `WAITING_FOR_CLAUDE_CAPACITY` (§5.2) por una señal estructurada de capacidad de Claude. Una fila activa por tarea; guarda solo identidad del Task Packet y de la configuración relevante mediante hashes, baseline Git original, huella del working tree, contador y tiempos de espera; nunca datos de Claude (stdout, stderr, resultado, sesión, uso, prompt) ni contenido de archivos
 - `modified_file` (id, agent_run_id, path, change_type)
 - `test_result` (id, agent_run_id, kind[`test`|`lint`|`tsc`|`build`], passed, summary_ref)
 - `review_result` (id, task_id, phase[`technical`], verdict, findings_ref)

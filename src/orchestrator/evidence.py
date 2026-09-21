@@ -56,11 +56,15 @@ la misma filosofía de detección de enlaces sin duplicar esa lógica.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Sequence
+from typing import Any, Sequence
 
 from .sandbox import _is_link_like
 
@@ -633,4 +637,137 @@ def evaluate(
         out_of_scope_paths=evidence.out_of_scope_paths,
         head_changed=evidence.head_changed,
         reason=reason,
+    )
+
+
+# ============================================================
+# CAPACITY-RESUME-FOUNDATION-001: huella de continuidad del working tree.
+#
+# Prueba, de forma determinista y SOLO LECTURA, que el estado de un
+# repositorio no cambió entre una suspensión y su reanudación. No hace nada
+# más: no suspende, no reanuda, no invoca a Claude, no escribe en el repo.
+# ============================================================
+
+_FINGERPRINT_FORMAT_VERSION = 1
+_HASH_CHUNK_BYTES = 1024 * 1024
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+@dataclass(frozen=True)
+class WorkingTreeFingerprint:
+    """`fingerprint` es el SHA-256 hex de una representación JSON canónica
+    (ver capture_working_tree_fingerprint); `touched_paths` son los NOMBRES
+    de path tocados, ordenados (nunca contenido). `head_sha`/`branch` son los
+    valores observados en la captura."""
+
+    fingerprint: str
+    touched_paths: tuple[str, ...]
+    head_sha: str
+    branch: str
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """True si `path` es un reparse point de Windows (cubre junctions, y
+    también otros reparse points que is_symlink()/is_junction() no ven).
+    Sin seguirlo: os.lstat. En plataformas sin st_file_attributes -> False."""
+    try:
+        attributes = os.lstat(path).st_file_attributes  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return False
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _fingerprint_entry(root: Path, relative_path: str) -> dict[str, Any]:
+    """Estado de un path tocado para la huella: {"kind": "missing"} o
+    {"kind": "file", "size", "sha256"}. Falla cerrado (EvidenceError) ante
+    cualquier symlink/junction/reparse point -- en el propio path o en
+    CUALQUIER componente intermedio, incluidos enlaces rotos -- y ante
+    cualquier entrada que no sea un archivo regular. NUNCA sigue un enlace ni
+    hashea su destino: un target externo podría cambiar sin alterar la
+    huella local."""
+    posix = PurePosixPath(relative_path)
+    if posix.is_absolute() or not posix.parts or ".." in posix.parts:
+        raise EvidenceError(f"touched path is not a safe relative path: {relative_path!r}")
+
+    current = root
+    for part in posix.parts:
+        current = current / part
+        if not os.path.lexists(current):
+            return {"kind": "missing"}
+        if _is_link_like(current) or _is_reparse_point(current):
+            raise EvidenceError(
+                "touched path is (or passes through) a symlink/junction/reparse point; "
+                "refusing to fingerprint it"
+            )
+
+    if not current.is_file():
+        raise EvidenceError("touched path is not a regular file; refusing to fingerprint it")
+
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with current.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError as exc:
+        raise EvidenceError(
+            f"could not read a touched file to fingerprint it: {type(exc).__name__}"
+        ) from exc
+    return {"kind": "file", "size": size, "sha256": digest.hexdigest()}
+
+
+def capture_working_tree_fingerprint(
+    before: GitEvidenceSnapshot,
+    allowed_paths: Sequence[str],
+) -> WorkingTreeFingerprint:
+    """Huella de continuidad, SOLO LECTURA, del working tree respecto al
+    BEFORE original. Reutiliza capture_snapshot y capture_change_evidence (y,
+    con ellos, TODAS las validaciones de repo/paths y los mismos subcomandos
+    git de solo lectura); no ejecuta ningún git nuevo.
+
+    Material hasheado (JSON canónico: claves ordenadas, sin espacios):
+      - HEAD y branch ACTUALES;
+      - status_entries ACTUALES (incluyen el staging XY y los renames),
+        ordenados;
+      - touched_paths completos (changed/created/deleted/untracked y AMBOS
+        extremos de cada rename), ordenados;
+      - por cada touched path: {"kind": "file", size, sha256 del CONTENIDO}
+        o {"kind": "missing"}.
+    No guarda contenido de archivos. Los archivos ignorados por Git no
+    forman parte de la evidencia (ni node_modules/dist se recorren).
+
+    Falla cerrado (EvidenceError) si algún touched path es symlink/
+    junction/reparse point (o pasa por uno) o no es un archivo regular, y si
+    el working tree cambia mientras se captura."""
+    change = capture_change_evidence(before, allowed_paths, include_diff_stat=False)
+    first = capture_snapshot(before.repo_root, authorized_root=before.authorized_root)
+    if first.head_sha != change.current_head_sha:
+        raise EvidenceError("HEAD changed while capturing the working tree fingerprint")
+
+    root = _validate_repo_root(before.repo_root, before.authorized_root)
+    touched = tuple(sorted(change.touched_paths))
+    files = {path: _fingerprint_entry(root, path) for path in touched}
+
+    # Consistencia: el estado debe ser el mismo tras hashear el contenido.
+    second = capture_snapshot(before.repo_root, authorized_root=before.authorized_root)
+    if second.head_sha != first.head_sha or sorted(second.status_entries) != sorted(
+        first.status_entries
+    ):
+        raise EvidenceError("working tree changed while capturing its fingerprint")
+
+    material = {
+        "version": _FINGERPRINT_FORMAT_VERSION,
+        "head_sha": first.head_sha,
+        "branch": first.branch,
+        "status_entries": sorted(first.status_entries),
+        "touched_paths": list(touched),
+        "files": files,
+    }
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return WorkingTreeFingerprint(
+        fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        touched_paths=touched,
+        head_sha=first.head_sha,
+        branch=first.branch,
     )

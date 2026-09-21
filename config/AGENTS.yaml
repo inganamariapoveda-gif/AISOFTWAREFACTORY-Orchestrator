@@ -75,3 +75,16 @@ agents:
       restricted: true
       max_turns: 8
       timeout_seconds: 90
+
+    # CAPACITY-RESUME-FOUNDATION-001: espera automática ante una señal
+    # ESTRUCTURADA de capacidad de Claude (CLAUDE_TEMPORARY_LIMIT). Solo
+    # configuración: el motor todavía no suspende ni reanuda (incremento
+    # posterior). Si este bloque falta, equivale a auto_wait desactivado.
+    # Unidades: segundos. Límites validados por config_loader (fail-closed):
+    # retry_interval_seconds 60..86400, max_attempts 1..100,
+    # max_wait_seconds >= retry_interval_seconds y <= 604800.
+    capacity_wait:
+      auto_wait: true
+      retry_interval_seconds: 1800   # 30 minutos entre reintentos de capacidad
+      max_attempts: 12               # suspensiones/reintentos de capacidad
+      max_wait_seconds: 28800        # 8 horas máximas desde la primera suspensión

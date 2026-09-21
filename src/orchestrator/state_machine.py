@@ -13,6 +13,7 @@ STATES: frozenset[str] = frozenset(
         "BACKLOG",
         "SPECIFICATION",
         "DEVELOPING",
+        "WAITING_FOR_CLAUDE_CAPACITY",
         "AUTOMATED_TEST",
         "TECHNICAL_REVIEW",
         "SECURITY_REVIEW",
@@ -34,7 +35,10 @@ TERMINAL_STATES: frozenset[str] = frozenset({"COMPLETED"})
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "BACKLOG": frozenset({"SPECIFICATION"}),
     "SPECIFICATION": frozenset({"DEVELOPING", "BLOCKED"}),
-    "DEVELOPING": frozenset({"AUTOMATED_TEST", "BLOCKED"}),
+    # CAPACITY-RESUME-FOUNDATION-001: espera automática temporal tras una
+    # señal ESTRUCTURADA de capacidad de Claude (ver 01_MASTER_SPEC.md §5).
+    "DEVELOPING": frozenset({"AUTOMATED_TEST", "BLOCKED", "WAITING_FOR_CLAUDE_CAPACITY"}),
+    "WAITING_FOR_CLAUDE_CAPACITY": frozenset({"DEVELOPING", "BLOCKED"}),
     "AUTOMATED_TEST": frozenset({"TECHNICAL_REVIEW", "CHANGES_REQUESTED"}),
     "TECHNICAL_REVIEW": frozenset({"SECURITY_REVIEW", "CHANGES_REQUESTED", "BLOCKED"}),
     "SECURITY_REVIEW": frozenset(
