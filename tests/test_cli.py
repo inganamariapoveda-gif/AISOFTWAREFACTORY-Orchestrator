@@ -36,7 +36,11 @@ from orchestrator.adapters.claude_code import (  # noqa: E402
     WRITE_PROBE_AFTER_CONTENT,
     WRITE_PROBE_TARGET_FILENAME,
 )
-from orchestrator.evidence import EvidenceError, GIT_EVIDENCE_PROBE_PREFIX  # noqa: E402
+from orchestrator.evidence import (  # noqa: E402
+    EvidenceError,
+    GIT_EVIDENCE_PROBE_PREFIX,
+    GitChangeEvidence,
+)
 from orchestrator.sandbox import SANDBOX_PREFIX  # noqa: E402
 from orchestrator.store import Store  # noqa: E402
 from orchestrator import task_packet as task_packet_mod  # noqa: E402
@@ -817,7 +821,12 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         self.enable_write_probe()  # developer + write_probe válidos
         self._set_allowed_commands(["unit"])
 
-    def _write_taskexec_packet(self, *, mandatory_tests: list[str]) -> None:
+    def _write_taskexec_packet(
+        self,
+        *,
+        mandatory_tests: list[str],
+        authorized_files: list[str] | None = None,
+    ) -> None:
         _write_yaml(
             self.taskexec_packet_path,
             {
@@ -826,7 +835,9 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
                 "objective": "Change the content of allowed.txt",
                 "scope": ["Modify allowed.txt"],
                 "out_of_scope": ["Modify any other file"],
-                "authorized_files": ["allowed.txt"],
+                "authorized_files": (
+                    list(authorized_files) if authorized_files is not None else ["allowed.txt"]
+                ),
                 "forbidden_files": ["untouched.txt"],
                 "constraints": ["No new dependencies"],
                 "acceptance_criteria": ["allowed.txt contains AFTER"],
@@ -841,6 +852,54 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         data = yaml.safe_load((self.config_dir / "PERMISSIONS.yaml").read_text(encoding="utf-8"))
         data["allowed_commands"] = allowed
         _write_yaml(self.config_dir / "PERMISSIONS.yaml", data)
+
+    def _configure_test_commands(self, test_ids: list[str]) -> None:
+        """REPORTING-001: varios mandatory tests (p. ej. unit/lint/build) para
+        cubrir el acumulado de resultados. Cada ID resuelve a un argv propio
+        (["python", "-c", "pass", "<id>"]) para que un test simulado pueda
+        distinguirlos por args[-1]."""
+        _write_yaml(
+            self.projects_dir / "TASKEXEC" / "PROJECT_RULES.yaml",
+            {
+                "version": 1,
+                "project_id": "TASKEXEC",
+                "name": "Task execution test project",
+                "repo_path": "./taskexec_repo",
+                "commands": {tid: ["python", "-c", "pass", tid] for tid in test_ids},
+                "protected_paths": [],
+            },
+        )
+        self._set_allowed_commands(list(test_ids))
+
+    # Marcadores centinela: si alguno aparece en la salida pública del probe,
+    # se estaría filtrando stdout/stderr/mensaje de excepción de un test.
+    _STDOUT_MARKER = "SECRET_STDOUT_MARKER_7f3a"
+    _STDERR_MARKER = "SECRET_STDERR_MARKER_9c1d"
+    _EXC_MARKER = "SECRET_EXCEPTION_MARKER_2b8e"
+
+    def _tests_returning(self, exit_codes: dict[str, int]):
+        """Mandatory test simulado: exit code por ID (args[-1]); siempre
+        emite marcadores en stdout/stderr para probar que NUNCA se exponen."""
+
+        def fake_test_run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=exit_codes[args[-1]],
+                stdout=self._STDOUT_MARKER,
+                stderr=self._STDERR_MARKER,
+            )
+
+        return mock.MagicMock(side_effect=fake_test_run)
+
+    def _assert_no_test_output_leak(self, raw_stdout: str) -> None:
+        for marker in (self._STDOUT_MARKER, self._STDERR_MARKER, self._EXC_MARKER):
+            self.assertNotIn(marker, raw_stdout)
+
+    def _assert_test_result_shape(self, output: dict) -> None:
+        """Estructura EXACTA por resultado: test_id/result/exit_code, nada más
+        (sin stdout, stderr, argv, entorno, paths, duración)."""
+        for item in output["mandatory_test_results"]:
+            self.assertEqual(set(item), {"test_id", "result", "exit_code"})
 
     def _developer_success_payload(self) -> str:
         return json.dumps(
@@ -934,6 +993,17 @@ class TaskExecutionProbeSuccessTests(TaskExecutionProbeTestCase):
         self.assertTrue(output["pre_test_evidence_passed"])
         self.assertTrue(output["post_test_evidence_passed"])
         self.assertFalse(output["commit_performed"])
+        # REPORTING-001: categorías explícitas + touched_paths, y resultado
+        # estructurado del único mandatory test ejecutado.
+        self.assertEqual(output["created_paths"], [])
+        self.assertEqual(output["untracked_paths"], [])
+        self.assertEqual(output["deleted_paths"], [])
+        self.assertEqual(output["renamed_paths"], [])
+        self.assertEqual(output["touched_paths"], ["allowed.txt"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
+        )
 
         developer_mock.assert_called_once()
         test_mock.assert_called_once()
@@ -945,6 +1015,65 @@ class TaskExecutionProbeSuccessTests(TaskExecutionProbeTestCase):
         self.assertEqual(head_before, head_after)
         status_after = _git("status", "--porcelain", cwd=self.taskexec_repo).stdout
         self.assertIn("allowed.txt", status_after)
+
+    def test_success_reports_modified_and_untracked_authorized_paths(self) -> None:
+        # REPORTING-001: reproduce el escenario real de AIP-ISO-001: el
+        # Developer modifica un archivo tracked autorizado Y crea un archivo
+        # autorizado NUEVO (untracked; sin `git add`, así que NO aparece como
+        # created). Antes de este incremento solo sobrevivía changed_paths.
+        self._write_taskexec_packet(
+            mandatory_tests=["unit", "lint", "build"],
+            authorized_files=["allowed.txt", "new_authorized.txt"],
+        )
+        self._configure_test_commands(["unit", "lint", "build"])
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            (cwd / "new_authorized.txt").write_text("brand new", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        test_mock = self._tests_returning({"unit": 0, "lint": 0, "build": 0})
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        self.assertEqual(rc, 0)
+        output = json.loads(stdout)
+        self.assertEqual(output["state"], "HUMAN_GATE")
+        self.assertEqual(output["human_gate"], "HUMAN_FUNCTIONAL_TEST")
+        # changed_paths conserva su semántica histórica (solo tracked M).
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["created_paths"], [])
+        self.assertEqual(output["untracked_paths"], ["new_authorized.txt"])
+        self.assertEqual(output["deleted_paths"], [])
+        self.assertEqual(output["renamed_paths"], [])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "new_authorized.txt"])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertTrue(output["tests_passed"])
+        self.assertEqual(output["mandatory_tests"], ["unit", "lint", "build"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [
+                {"test_id": "unit", "result": "PASS", "exit_code": 0},
+                {"test_id": "lint", "result": "PASS", "exit_code": 0},
+                {"test_id": "build", "result": "PASS", "exit_code": 0},
+            ],
+        )
+        self._assert_test_result_shape(output)
+        self._assert_no_test_output_leak(stdout)
+        # Cada test se ejecutó exactamente UNA vez: el reporting no reejecuta.
+        self.assertEqual(test_mock.call_count, 3)
+        # Sin staging: el archivo nuevo sigue untracked en el repo real.
+        self.assertIn(
+            "?? new_authorized.txt",
+            _git("status", "--porcelain", cwd=self.taskexec_repo).stdout,
+        )
+        self._assert_head_unchanged_on_disk(head_before)
 
 
 class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
@@ -1080,6 +1209,53 @@ class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
         self.assertNotEqual(output["state"], "HUMAN_GATE")
         self.assertFalse(output["commit_performed"])
         test_mock.assert_not_called()
+        # REPORTING-001: el error estructural del runner (ID no autorizado)
+        # queda registrado como ERROR/exit_code null, sin convertirse en FAIL.
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "nonexistent", "result": "ERROR", "exit_code": None}],
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_test_runner_error_after_passing_test_is_accumulated_as_error(self) -> None:
+        # REPORTING-001: unit PASS, lint lanza TestRunnerError (ejecutable
+        # no lanzable) -> [unit PASS, lint ERROR]; build nunca se ejecuta.
+        self._write_taskexec_packet(mandatory_tests=["unit", "lint", "build"])
+        self._configure_test_commands(["unit", "lint", "build"])
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            if args[-1] == "lint":
+                raise FileNotFoundError(self._EXC_MARKER)
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._STDOUT_MARKER, stderr=self._STDERR_MARKER
+            )
+
+        test_mock = mock.MagicMock(side_effect=fake_test_run)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=test_mock,
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["tests_passed"])
+        self.assertIn("mandatory test resolution/execution failed", output["reason"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [
+                {"test_id": "unit", "result": "PASS", "exit_code": 0},
+                {"test_id": "lint", "result": "ERROR", "exit_code": None},
+            ],
+        )
+        self._assert_test_result_shape(output)
+        self._assert_no_test_output_leak(stdout)
+        self.assertEqual(test_mock.call_count, 2)  # build nunca se ejecutó
+        # El bloqueo conserva la evidencia Git PRE-TEST ya capturada.
+        self.assertEqual(output["touched_paths"], ["allowed.txt"])
+        self.assertTrue(output["pre_test_evidence_passed"])
         self._assert_head_unchanged_on_disk(head_before)
 
     def test_mandatory_test_failure_blocks(self) -> None:
@@ -1099,6 +1275,44 @@ class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
         self.assertNotEqual(output["state"], "HUMAN_GATE")
         self.assertFalse(output["tests_passed"])
         self.assertFalse(output["commit_performed"])
+        # REPORTING-001: el FAIL conserva el exit code REAL del test.
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "FAIL", "exit_code": 1}],
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_failing_mandatory_test_accumulates_prior_results_and_stops(self) -> None:
+        # REPORTING-001: unit PASS, lint FAIL (exit 2), build NO ejecutado.
+        self._write_taskexec_packet(mandatory_tests=["unit", "lint", "build"])
+        self._configure_test_commands(["unit", "lint", "build"])
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        test_mock = self._tests_returning({"unit": 0, "lint": 2, "build": 0})
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=test_mock,
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["tests_passed"])
+        self.assertEqual(output["reason"], "mandatory test 'lint' failed")
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [
+                {"test_id": "unit", "result": "PASS", "exit_code": 0},
+                {"test_id": "lint", "result": "FAIL", "exit_code": 2},
+            ],
+        )
+        self._assert_test_result_shape(output)
+        self._assert_no_test_output_leak(stdout)
+        self.assertEqual(test_mock.call_count, 2)  # build nunca se ejecutó
+        # mandatory_tests sigue siendo la lista DECLARADA (no los resultados).
+        self.assertEqual(output["mandatory_tests"], ["unit", "lint", "build"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt"])
         self._assert_head_unchanged_on_disk(head_before)
 
     def test_developer_malformed_result_blocks(self) -> None:
@@ -1174,6 +1388,15 @@ class TaskExecutionProbePostTestMutationTests(TaskExecutionProbeTestCase):
         self.assertIn("untouched.txt", output["out_of_scope_paths"])
         self.assertFalse(output["security_review"])
         self.assertFalse(output["commit_performed"])
+        # REPORTING-001: el bloqueo expone las categorías del POST-TEST
+        # evidence (no las del PRE-TEST ya obsoleto) y el resultado del test.
+        self.assertEqual(output["changed_paths"], ["allowed.txt", "untouched.txt"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "untouched.txt"])
+        self.assertEqual(output["out_of_scope_paths"], ["untouched.txt"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
+        )
         # Estado real del repo temporal: untouched.txt SÍ quedó mutado (el
         # orquestador no revierte nada); solo se detecta y se bloquea.
         self.assertEqual(
@@ -1204,6 +1427,18 @@ class TaskExecutionProbePostTestMutationTests(TaskExecutionProbeTestCase):
         self.assertIn("unexpected_from_test.txt", output["out_of_scope_paths"])
         self.assertFalse(output["security_review"])
         self.assertFalse(output["commit_performed"])
+        # REPORTING-001: un untracked creado por el test aparece en
+        # untracked_paths y touched_paths (no en changed_paths).
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["untracked_paths"], ["unexpected_from_test.txt"])
+        self.assertEqual(
+            output["touched_paths"], ["allowed.txt", "unexpected_from_test.txt"]
+        )
+        self.assertEqual(output["out_of_scope_paths"], ["unexpected_from_test.txt"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
+        )
         self.assertTrue((self.taskexec_repo / "unexpected_from_test.txt").exists())
         self._assert_head_unchanged_on_disk(head_before)
 
@@ -1230,10 +1465,70 @@ class TaskExecutionProbePostTestMutationTests(TaskExecutionProbeTestCase):
         self.assertFalse(output["post_test_evidence_passed"])
         self.assertFalse(output["security_review"])
         self.assertFalse(output["commit_performed"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
+        )
         # Este HEAD SÍ cambió -- por el mandatory test simulado, nunca por
         # el orquestador -- y NO se revierte: solo se detecta y se bloquea.
         head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
         self.assertNotEqual(head_before, head_after)
+
+    def test_case_d_rename_after_test_exposes_both_endpoints(self) -> None:
+        # REPORTING-001: un rename confirmado por Git durante el test expone
+        # el par [old, new] y AMBOS extremos en touched_paths/out_of_scope.
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _git("mv", "untouched.txt", "moved_by_test.txt", cwd=cwd)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertTrue(output["pre_test_evidence_passed"])
+        self.assertFalse(output["post_test_evidence_passed"])
+        self.assertEqual(output["renamed_paths"], [["untouched.txt", "moved_by_test.txt"]])
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(
+            output["touched_paths"],
+            ["allowed.txt", "moved_by_test.txt", "untouched.txt"],
+        )
+        self.assertEqual(output["out_of_scope_paths"], ["moved_by_test.txt", "untouched.txt"])
+        self.assertEqual(
+            output["mandatory_test_results"],
+            [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_case_e_delete_after_test_exposes_deleted_paths(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_test_run(args, **kwargs):
+            (Path(kwargs["cwd"]) / "untouched.txt").unlink()
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            test=mock.MagicMock(side_effect=fake_test_run),
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["post_test_evidence_passed"])
+        self.assertEqual(output["deleted_paths"], ["untouched.txt"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "untouched.txt"])
+        self.assertEqual(output["out_of_scope_paths"], ["untouched.txt"])
+        self._assert_head_unchanged_on_disk(head_before)
 
 
 # ============================================================
@@ -1269,6 +1564,11 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertFalse(output["developer_completed"])
         self.assertEqual(output["changed_paths"], [])
         self.assertEqual(output["out_of_scope_paths"], [])
+        # REPORTING-001: evidencia post-failure sin cambios -> categorías
+        # vacías y ningún mandatory test ejecutado.
+        self.assertEqual(output["untracked_paths"], [])
+        self.assertEqual(output["touched_paths"], [])
+        self.assertEqual(output["mandatory_test_results"], [])
         self.assertTrue(output["head_unchanged"])
         self.assertIn("developer execution failed:", output["reason"])
         self.assertIn("exit_code=1", output["reason"])
@@ -1300,6 +1600,8 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertFalse(output["developer_completed"])
         self.assertIn("allowed.txt", output["changed_paths"])
         self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertEqual(output["touched_paths"], ["allowed.txt"])
+        self.assertEqual(output["mandatory_test_results"], [])
         self.assertTrue(output["head_unchanged"])
         # Mandatory tests NUNCA se ejecutan tras un fallo del developer.
         test_mock.assert_not_called()
@@ -1309,6 +1611,46 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertEqual(
             (self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL"
         )
+
+    def test_h_developer_modifies_and_creates_untracked_authorized_then_fails(self) -> None:
+        # REPORTING-001: el Developer falla DESPUÉS de modificar un archivo
+        # tracked autorizado y crear uno nuevo autorizado (untracked). La
+        # evidencia post-failure debe reflejar ambos; sigue sin ejecutarse
+        # ningún mandatory test.
+        self._write_taskexec_packet(
+            mandatory_tests=["unit"],
+            authorized_files=["allowed.txt", "new_authorized.txt"],
+        )
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def fake_developer_run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            (cwd / "new_authorized.txt").write_text("new", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="crashed after two edits"
+            )
+
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(
+            developer=mock.MagicMock(side_effect=fake_developer_run), test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["developer_completed"])
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["created_paths"], [])
+        self.assertEqual(output["untracked_paths"], ["new_authorized.txt"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "new_authorized.txt"])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertTrue(output["head_unchanged"])
+        self.assertIn("post-failure Git evidence captured", output["reason"])
+        self.assertEqual(output["mandatory_test_results"], [])
+        test_mock.assert_not_called()
+        self._assert_head_unchanged_on_disk(head_before)
 
     def test_c_developer_touches_out_of_scope_file_then_fails(self) -> None:
         head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
@@ -1332,6 +1674,8 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertEqual(output["state"], "BLOCKED")
         self.assertIn("allowed.txt", output["changed_paths"])
         self.assertIn("untouched.txt", output["out_of_scope_paths"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "untouched.txt"])
+        self.assertEqual(output["mandatory_test_results"], [])
         # Evidencia SÍ pudo determinarse aquí: head_unchanged refleja el
         # estado Git real (True), no la señal fail-closed "not verified".
         self.assertTrue(output["head_unchanged"])
@@ -1392,6 +1736,7 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         # que nunca se afirma implícitamente que HEAD no cambió.
         self.assertEqual(output["changed_paths"], [])
         self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertEqual(output["mandatory_test_results"], [])
         self.assertFalse(output["head_unchanged"])
         self.assertIn("developer execution failed:", output["reason"])
         self.assertIn(
@@ -1442,6 +1787,59 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         test_mock.assert_called_once()
         head_after = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
         self.assertEqual(head_before, head_after)
+
+
+class ForbiddenFilesUseTouchedPathsTests(unittest.TestCase):
+    """REPORTING-001: la evaluación de forbidden_files usa la MISMA unión
+    (GitChangeEvidence.touched_paths) que el alcance y el reporting. Se
+    construye la evidencia a mano con out_of_scope_paths vacío para aislar la
+    regla de forbidden_files de la de alcance: cada categoría, incluido
+    CUALQUIER extremo de un rename, debe disparar el bloqueo."""
+
+    def _evidence(self, **paths) -> GitChangeEvidence:
+        fields = {
+            "changed_paths": (),
+            "created_paths": (),
+            "deleted_paths": (),
+            "renamed_paths": (),
+            "untracked_paths": (),
+        }
+        fields.update(paths)
+        return GitChangeEvidence(
+            base_sha="a" * 40,
+            current_head_sha="a" * 40,
+            head_changed=False,
+            out_of_scope_paths=(),
+            has_out_of_scope_changes=False,
+            working_tree_clean=False,
+            diff_available=True,
+            **fields,
+        )
+
+    def test_forbidden_file_in_each_category_is_detected(self) -> None:
+        cases = {
+            "changed": {"changed_paths": ("secret.txt",)},
+            "created": {"created_paths": ("secret.txt",)},
+            "deleted": {"deleted_paths": ("secret.txt",)},
+            "untracked": {"untracked_paths": ("secret.txt",)},
+            "rename_source": {"renamed_paths": (("secret.txt", "other.txt"),)},
+            "rename_destination": {"renamed_paths": (("other.txt", "secret.txt"),)},
+        }
+        for name, paths in cases.items():
+            with self.subTest(category=name):
+                ok, reason = app._evaluate_scope_security(
+                    self._evidence(**paths), forbidden_files=("secret.txt",)
+                )
+                self.assertFalse(ok)
+                self.assertEqual(reason, "forbidden file(s) modified: ['secret.txt']")
+
+    def test_untouched_forbidden_file_passes(self) -> None:
+        ok, reason = app._evaluate_scope_security(
+            self._evidence(changed_paths=("allowed.txt",), untracked_paths=("new.txt",)),
+            forbidden_files=("secret.txt",),
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "all checks passed")
 
 
 # ============================================================

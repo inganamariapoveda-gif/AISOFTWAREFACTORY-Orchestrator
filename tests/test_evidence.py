@@ -27,11 +27,13 @@ if str(SRC_DIR) not in sys.path:
 
 from orchestrator.evidence import (  # noqa: E402
     EvidenceError,
+    GitChangeEvidence,
     _iter_status_records_z,
     _normalize_allowed_paths,
     _parse_diff_name_status_z,
     _run_git,
     _split_nul_terminated,
+    _union_touched_paths,
     capture_change_evidence,
     capture_snapshot,
     evaluate,
@@ -92,6 +94,23 @@ class EvidenceTestCase(unittest.TestCase):
 
     def real_branch(self) -> str:
         return _git("branch", "--show-current", cwd=self.repo_root).stdout.strip()
+
+    def make_mixed_changes(self):
+        """REPORTING-001: un working tree con las cuatro categorías a la vez
+        -- modified (tracked), untracked (nunca 'git add'eado), deleted y un
+        rename confirmado por Git (git mv) -- y devuelve el snapshot BEFORE
+        capturado justo antes. Los contenidos de old.txt y before.txt son
+        deliberadamente disímiles para que Git no empareje old.txt (delete)
+        con after.txt (destino del rename) por similitud."""
+        _add_and_commit(self.repo_root, "old.txt", "zzz\n" * 40, "add old")
+        _add_and_commit(self.repo_root, "before.txt", "alpha bravo charlie\n" * 40, "add before")
+        before = capture_snapshot(self.repo_root, authorized_root=self.authorized_root)
+
+        (self.repo_root / "allowed.txt").write_text("AFTER", encoding="utf-8")  # modified
+        (self.repo_root / "new.txt").write_text("brand new", encoding="utf-8")  # untracked
+        (self.repo_root / "old.txt").unlink()  # deleted
+        _git("mv", "before.txt", "after.txt", cwd=self.repo_root)  # renamed
+        return before
 
 
 # ================================================================
@@ -304,9 +323,75 @@ class ChangeDetectionTests(EvidenceTestCase):
         self.assertEqual(evidence.deleted_paths, ())
         self.assertEqual(evidence.renamed_paths, ())
         self.assertEqual(evidence.untracked_paths, ())
+        self.assertEqual(evidence.touched_paths, ())
         self.assertFalse(evidence.has_out_of_scope_changes)
         self.assertFalse(evidence.head_changed)
         self.assertTrue(evidence.working_tree_clean)
+
+    # ---- REPORTING-001: touched_paths (única fuente de verdad) ----
+
+    def test_touched_paths_unions_modified_untracked_deleted_and_rename(self) -> None:
+        before = self.make_mixed_changes()
+        evidence = capture_change_evidence(
+            before, ["allowed.txt", "new.txt", "old.txt", "before.txt", "after.txt"]
+        )
+        # changed_paths conserva su semántica histórica: SOLO tracked
+        # clasificados como modificados; no es exhaustivo.
+        self.assertEqual(evidence.changed_paths, ("allowed.txt",))
+        self.assertEqual(evidence.untracked_paths, ("new.txt",))
+        self.assertEqual(evidence.deleted_paths, ("old.txt",))
+        self.assertEqual(evidence.renamed_paths, (("before.txt", "after.txt"),))
+        self.assertEqual(
+            evidence.touched_paths,
+            ("after.txt", "allowed.txt", "before.txt", "new.txt", "old.txt"),
+        )
+
+    def test_touched_paths_includes_both_rename_endpoints(self) -> None:
+        _git("mv", "untouched.txt", "moved.txt", cwd=self.repo_root)
+        evidence = capture_change_evidence(self.before, ["untouched.txt", "moved.txt"])
+        self.assertEqual(evidence.renamed_paths, (("untouched.txt", "moved.txt"),))
+        self.assertEqual(evidence.changed_paths, ())
+        self.assertEqual(evidence.touched_paths, ("moved.txt", "untouched.txt"))
+
+    def test_touched_paths_deterministic_across_captures(self) -> None:
+        before = self.make_mixed_changes()
+        allowed = ["allowed.txt", "new.txt", "old.txt", "before.txt", "after.txt"]
+        first = capture_change_evidence(before, allowed)
+        second = capture_change_evidence(before, allowed)
+        self.assertEqual(first.touched_paths, second.touched_paths)
+        self.assertEqual(list(first.touched_paths), sorted(first.touched_paths))
+
+    def test_touched_paths_has_no_duplicates(self) -> None:
+        # Un mismo path presente en varias colecciones (y ambos extremos de
+        # un rename que además aparecen en otra colección) se reporta una
+        # sola vez, ordenado.
+        evidence = GitChangeEvidence(
+            base_sha="a" * 40,
+            current_head_sha="a" * 40,
+            head_changed=False,
+            changed_paths=("b.txt", "a.txt"),
+            created_paths=("a.txt",),
+            deleted_paths=("c.txt", "b.txt"),
+            renamed_paths=(("c.txt", "d.txt"), ("d.txt", "e.txt")),
+            untracked_paths=("e.txt", "a.txt"),
+            out_of_scope_paths=(),
+            has_out_of_scope_changes=False,
+            working_tree_clean=False,
+            diff_available=True,
+        )
+        self.assertEqual(
+            evidence.touched_paths, ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt")
+        )
+        self.assertEqual(
+            evidence.touched_paths,
+            _union_touched_paths(
+                evidence.changed_paths,
+                evidence.created_paths,
+                evidence.deleted_paths,
+                evidence.untracked_paths,
+                evidence.renamed_paths,
+            ),
+        )
 
 
 # ================================================================
@@ -570,6 +655,8 @@ class RenamePolicyTests(EvidenceTestCase):
         self.assertEqual(evidence.renamed_paths, ())
         self.assertEqual(evidence.deleted_paths, ("allowed.txt",))
         self.assertIn("renamed.txt", evidence.untracked_paths)
+        # REPORTING-001: ambos extremos siguen entrando en touched_paths.
+        self.assertEqual(evidence.touched_paths, ("allowed.txt", "renamed.txt"))
         # La evaluación de alcance sigue cubriendo ambos paths por
         # separado: si alguno no estuviera autorizado, seguiría fallando.
         evidence_missing_scope = capture_change_evidence(self.before, ["allowed.txt"])
@@ -763,6 +850,36 @@ class ScopeTests(EvidenceTestCase):
         result = evaluate(evidence, expected_head_unchanged=True)
         self.assertFalse(result.success)
         self.assertIn("renamed.txt", result.out_of_scope_paths)
+
+    def test_out_of_scope_is_exactly_touched_paths_minus_allowed(self) -> None:
+        # REPORTING-001: el alcance usa EXACTAMENTE la misma unión que
+        # touched_paths (modified + untracked + deleted + ambos extremos de
+        # un rename), para cualquier conjunto autorizado.
+        before = self.make_mixed_changes()
+        everything = ("after.txt", "allowed.txt", "before.txt", "new.txt", "old.txt")
+        allowed_sets = [
+            ["allowed.txt"],
+            ["allowed.txt", "new.txt"],
+            ["allowed.txt", "before.txt"],  # solo el origen del rename
+            ["allowed.txt", "after.txt"],  # solo el destino del rename
+            list(everything),
+        ]
+        for allowed in allowed_sets:
+            with self.subTest(allowed=allowed):
+                evidence = capture_change_evidence(before, allowed)
+                self.assertEqual(evidence.touched_paths, everything)
+                expected = tuple(p for p in evidence.touched_paths if p not in set(allowed))
+                self.assertEqual(evidence.out_of_scope_paths, expected)
+                self.assertEqual(evidence.has_out_of_scope_changes, bool(expected))
+
+    def test_all_touched_authorized_yields_no_out_of_scope(self) -> None:
+        before = self.make_mixed_changes()
+        evidence = capture_change_evidence(
+            before, ["allowed.txt", "new.txt", "old.txt", "before.txt", "after.txt"]
+        )
+        self.assertEqual(evidence.out_of_scope_paths, ())
+        self.assertFalse(evidence.has_out_of_scope_changes)
+        self.assertTrue(evaluate(evidence, expected_head_unchanged=True).success)
 
     def test_absolute_allowed_path_rejected(self) -> None:
         with self.assertRaises(EvidenceError):

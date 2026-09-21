@@ -390,19 +390,33 @@ def _evaluate_scope_security(
     PASS Y POST_TEST_EVIDENCE == PASS). Devuelve (security_review, reason);
     reason es "all checks passed" cuando security_review es True."""
     evidence_result = evidence_mod.evaluate(change_evidence, expected_head_unchanged=True)
-    touched_paths = sorted(
-        set(change_evidence.changed_paths)
-        | set(change_evidence.created_paths)
-        | set(change_evidence.deleted_paths)
-        | set(change_evidence.untracked_paths)
-        | {p for pair in change_evidence.renamed_paths for p in pair}
-    )
-    forbidden_violations = [p for p in touched_paths if p in set(forbidden_files)]
+    # REPORTING-001: misma fuente única (GitChangeEvidence.touched_paths)
+    # que usa el cálculo de alcance y el reporting público.
+    forbidden_set = set(forbidden_files)
+    forbidden_violations = [p for p in change_evidence.touched_paths if p in forbidden_set]
     if not evidence_result.success:
         return False, evidence_result.reason
     if forbidden_violations:
         return False, f"forbidden file(s) modified: {forbidden_violations}"
     return True, "all checks passed"
+
+
+def _git_path_report(change_evidence: evidence_mod.GitChangeEvidence) -> dict[str, Any]:
+    """REPORTING-001: campos públicos de paths a partir de una
+    GitChangeEvidence válida. `changed_paths` conserva su semántica
+    histórica (solo tracked clasificados como modificados por git diff) y
+    NO es exhaustivo; la lista completa de paths afectados es
+    `touched_paths`. `renamed_paths` se serializa como pares JSON
+    [old, new]."""
+    return {
+        "changed_paths": list(change_evidence.changed_paths),
+        "created_paths": list(change_evidence.created_paths),
+        "untracked_paths": list(change_evidence.untracked_paths),
+        "deleted_paths": list(change_evidence.deleted_paths),
+        "renamed_paths": [list(pair) for pair in change_evidence.renamed_paths],
+        "touched_paths": list(change_evidence.touched_paths),
+        "out_of_scope_paths": list(change_evidence.out_of_scope_paths),
+    }
 
 
 def execute_task_packet(
@@ -448,6 +462,7 @@ def execute_task_packet(
             "changed_paths": [],
             "out_of_scope_paths": [],
             "mandatory_tests": list(packet.mandatory_tests),
+            "mandatory_test_results": [],
             "tests_passed": False,
             "technical_review": False,
             "security_review": False,
@@ -531,8 +546,7 @@ def execute_task_packet(
         return _blocked(
             f"developer execution failed: {exc}; post-failure Git evidence captured",
             head_unchanged=not post_failure_change_evidence.head_changed,
-            changed_paths=list(post_failure_change_evidence.changed_paths),
-            out_of_scope_paths=list(post_failure_change_evidence.out_of_scope_paths),
+            **_git_path_report(post_failure_change_evidence),
         )
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
@@ -552,8 +566,7 @@ def execute_task_packet(
     common_fields = {
         "developer_completed": True,
         "head_unchanged": not pre_test_change_evidence.head_changed,
-        "changed_paths": list(pre_test_change_evidence.changed_paths),
-        "out_of_scope_paths": list(pre_test_change_evidence.out_of_scope_paths),
+        **_git_path_report(pre_test_change_evidence),
     }
 
     if not pre_test_security_review:
@@ -567,6 +580,10 @@ def execute_task_packet(
     # 12-14. mandatory tests: resolver/ejecutar cada uno; cualquier fallo ->
     # STOP. La evidencia PRE-TEST ya pasó en este punto (pre_test_evidence_
     # passed=True), pero POST-TEST todavía no se ha comprobado.
+    # REPORTING-001: resultados ACUMULADOS, en el orden de ejecución efectiva
+    # (nunca sobrescritos por iteración; un test no ejecutado no aparece).
+    # Solo test_id/result/exit_code: nunca stdout, stderr, argv ni entorno.
+    mandatory_test_results: list[dict[str, Any]] = []
     for test_id in packet.mandatory_tests:
         try:
             test_result = test_runner_mod.run_mandatory_test(
@@ -577,17 +594,29 @@ def execute_task_packet(
                 timeout=mandatory_test_timeout,
             )
         except test_runner_mod.TestRunnerError as exc:
+            mandatory_test_results.append(
+                {"test_id": test_id, "result": "ERROR", "exit_code": None}
+            )
             return _blocked(
                 f"mandatory test resolution/execution failed: {exc}",
                 security_review=pre_test_security_review,
                 pre_test_evidence_passed=True,
+                mandatory_test_results=mandatory_test_results,
                 **common_fields,
             )
+        mandatory_test_results.append(
+            {
+                "test_id": test_result.test_id,
+                "result": "PASS" if test_result.success else "FAIL",
+                "exit_code": test_result.exit_code,
+            }
+        )
         if not test_result.success:
             return _blocked(
                 f"mandatory test {test_id!r} failed",
                 security_review=pre_test_security_review,
                 pre_test_evidence_passed=True,
+                mandatory_test_results=mandatory_test_results,
                 **common_fields,
             )
 
@@ -609,6 +638,7 @@ def execute_task_packet(
             f"git POST-TEST evidence failed: {exc}",
             developer_completed=True,
             pre_test_evidence_passed=True,
+            mandatory_test_results=mandatory_test_results,
         )
 
     post_test_security_review, post_test_reason = _evaluate_scope_security(
@@ -622,8 +652,7 @@ def execute_task_packet(
     common_fields = {
         "developer_completed": True,
         "head_unchanged": not post_test_change_evidence.head_changed,
-        "changed_paths": list(post_test_change_evidence.changed_paths),
-        "out_of_scope_paths": list(post_test_change_evidence.out_of_scope_paths),
+        **_git_path_report(post_test_change_evidence),
     }
 
     if not post_test_security_review:
@@ -632,6 +661,7 @@ def execute_task_packet(
             security_review=False,
             pre_test_evidence_passed=True,
             post_test_evidence_passed=False,
+            mandatory_test_results=mandatory_test_results,
             **common_fields,
         )
 
@@ -644,6 +674,7 @@ def execute_task_packet(
         "state": STATE_HUMAN_GATE,
         "human_gate": HUMAN_GATE_FUNCTIONAL_TEST,
         "mandatory_tests": list(packet.mandatory_tests),
+        "mandatory_test_results": mandatory_test_results,
         "tests_passed": True,
         "technical_review": True,
         "security_review": True,

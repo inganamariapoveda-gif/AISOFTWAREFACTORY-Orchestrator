@@ -96,6 +96,28 @@ class GitEvidenceSnapshot:
     status_entries: tuple[str, ...]
 
 
+def _union_touched_paths(
+    changed: Sequence[str],
+    created: Sequence[str],
+    deleted: Sequence[str],
+    untracked: Sequence[str],
+    renamed: Sequence[tuple[str, str]],
+) -> tuple[str, ...]:
+    """REPORTING-001: ÚNICA fuente de verdad de "todo path materialmente
+    tocado": unión de changed/created/deleted/untracked y AMBOS extremos
+    (old y new) de cada renombre/copia reportado por Git, sin duplicados y
+    ordenada de forma determinista. La consumen tanto el cálculo de
+    alcance (`out_of_scope_paths`) como `GitChangeEvidence.touched_paths`
+    (evaluación de forbidden_files y reporting público), para que ninguna
+    de las tres pueda divergir. No clasifica nada: solo une lo ya
+    clasificado por los parsers de Git."""
+    touched: set[str] = set(changed) | set(created) | set(deleted) | set(untracked)
+    for old_path, new_path in renamed:
+        touched.add(old_path)
+        touched.add(new_path)
+    return tuple(sorted(touched))
+
+
 @dataclass(frozen=True)
 class GitChangeEvidence:
     base_sha: str
@@ -111,6 +133,19 @@ class GitChangeEvidence:
     working_tree_clean: bool
     diff_available: bool
     diff_stat: str | None = None
+
+    @property
+    def touched_paths(self) -> tuple[str, ...]:
+        """Unión ordenada y sin duplicados de todos los paths tocados
+        (ver `_union_touched_paths`). Derivada; nunca almacenada, así no
+        puede quedar desincronizada de las colecciones que la componen."""
+        return _union_touched_paths(
+            self.changed_paths,
+            self.created_paths,
+            self.deleted_paths,
+            self.untracked_paths,
+            self.renamed_paths,
+        )
 
 
 @dataclass(frozen=True)
@@ -540,12 +575,11 @@ def capture_change_evidence(
     # 8 original): un archivo nunca "git add"eado sigue siendo una
     # modificación real del árbol de trabajo y excluirlo del cómputo de
     # alcance abriría un hueco de seguridad evidente.
-    scope_candidates: set[str] = set(changed) | set(created) | set(deleted) | set(untracked)
-    for old_path, new_path in renamed:
-        scope_candidates.add(old_path)
-        scope_candidates.add(new_path)
+    # REPORTING-001: la unión vive en UN solo lugar (_union_touched_paths),
+    # compartida con GitChangeEvidence.touched_paths.
+    scope_candidates = _union_touched_paths(changed, created, deleted, untracked, renamed)
 
-    out_of_scope = tuple(sorted(p for p in scope_candidates if p not in normalized_allowed))
+    out_of_scope = tuple(p for p in scope_candidates if p not in normalized_allowed)
 
     return GitChangeEvidence(
         base_sha=before.head_sha,
