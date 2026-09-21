@@ -27,6 +27,7 @@ Reglas de seguridad aplicadas aquí (Master Spec §10, §11):
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import json
 import re
@@ -34,7 +35,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .. import sandbox as sandbox_mod
 
@@ -88,6 +89,11 @@ WRITE_PROBE_AFTER_CONTENT = "AFTER"
 WRITE_PROBE_DO_NOT_TOUCH_CONTENT = "DO_NOT_TOUCH"
 EXPECTED_WRITE_RESULT = "CLAUDE_WRITE_OK"
 
+# CAPACITY-DETECTION-001 / CORRECTION-001: diagnóstico CONSTANTE cuando
+# `is_error` existe (o falta) pero NO es booleano. Nunca deriva del valor
+# recibido, que podría ser un texto arbitrario.
+_INVALID_IS_ERROR_MESSAGE = "developer returned invalid is_error field"
+
 _EXPECTED_TARGET_AFTER_BYTES = WRITE_PROBE_AFTER_CONTENT.encode("utf-8")
 _EXPECTED_TARGET_AFTER_SHA256 = hashlib.sha256(_EXPECTED_TARGET_AFTER_BYTES).hexdigest()
 _EXPECTED_TARGET_AFTER_SIZE = len(_EXPECTED_TARGET_AFTER_BYTES)
@@ -109,8 +115,56 @@ WRITE_PROBE_PROMPT = (
 )
 
 
+class ClaudeFailureCategory(str, enum.Enum):
+    """CAPACITY-DETECTION-001: categoría ESTRUCTURADA de un fallo del
+    Developer Claude Code. Se decide exclusivamente a partir de señales
+    estructuradas (tipo de excepción, exit code, campos JSON allowlisted);
+    nunca por coincidencia textual de stdout/stderr/result.
+
+    CLAUDE_TEMPORARY_LIMIT significa ÚNICAMENTE que el CLI entregó una señal
+    estructurada compatible con un límite temporal (api_error_status ==
+    429). NO afirma que se haya agotado la cuota de suscripción ni
+    distingue rate limit / usage limit / capacidad del proveedor: esa
+    diferenciación solo se hará con evidencia real segura futura.
+
+    Precedencia (ver _classify_structured_failure): permission denial >
+    error_max_turns > api_error_status == 429 > error general. Timeout y
+    ejecutable ausente se clasifican en sus propias excepciones. Ninguna
+    categoría autoriza retry en este incremento."""
+
+    CLAUDE_TEMPORARY_LIMIT = "CLAUDE_TEMPORARY_LIMIT"
+    CLAUDE_MAX_TURNS = "CLAUDE_MAX_TURNS"
+    CLAUDE_TIMEOUT = "CLAUDE_TIMEOUT"
+    CLAUDE_PERMISSION_DENIED = "CLAUDE_PERMISSION_DENIED"
+    CLAUDE_EXECUTABLE_MISSING = "CLAUDE_EXECUTABLE_MISSING"
+    CLAUDE_EXECUTION_ERROR = "CLAUDE_EXECUTION_ERROR"
+
+
 class DeveloperExecutionError(Exception):
-    """Fallo controlado del adaptador Developer. Nunca se traduce en éxito."""
+    """Fallo controlado del adaptador Developer. Nunca se traduce en éxito.
+
+    Sigue siendo capturable como `except DeveloperExecutionError` y
+    `str(exc)` conserva el mensaje seguro. CAPACITY-DETECTION-001 añade dos
+    atributos opcionales:
+
+    - `category`: ClaudeFailureCategory (por defecto CLAUDE_EXECUTION_ERROR,
+      fail-closed: nada se considera "temporal" salvo señal estructural).
+    - `details`: SOLO campos estructurales seguros, únicamente los que
+      existan: exit_code, type, subtype, is_error, api_error_status,
+      stop_reason, permission_denial_count, json_top_level_keys (nombres,
+      ordenados, sin valores). Nunca stdout, stderr, result, session_id,
+      usage, modelUsage, prompt, transcript, entorno ni credenciales."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        category: ClaudeFailureCategory | str = ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = ClaudeFailureCategory(category)
+        self.details: dict[str, Any] = dict(details) if details else {}
 
 
 @dataclass(frozen=True)
@@ -178,7 +232,8 @@ def _resolve_executable(executable_name: str) -> str:
     resolved = shutil.which(executable_name)
     if resolved is None:
         raise DeveloperExecutionError(
-            f"executable {executable_name!r} not found on PATH"
+            f"executable {executable_name!r} not found on PATH",
+            category=ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING,
         )
     return resolved
 
@@ -250,8 +305,12 @@ def _parse_completed_process(
         raise DeveloperExecutionError("developer JSON 'subtype' is missing or is not 'success'")
 
     is_error = data.get("is_error")
-    if not isinstance(is_error, bool) or is_error:
-        raise DeveloperExecutionError(f"developer reported is_error={is_error!r}")
+    if not isinstance(is_error, bool):
+        # CORRECTION-001: un is_error no booleano NUNCA se reproduce (ni
+        # repr ni str ni su tipo): mensaje fijo, independiente del valor.
+        raise DeveloperExecutionError(_INVALID_IS_ERROR_MESSAGE)
+    if is_error:
+        raise DeveloperExecutionError("developer reported is_error=True")
 
     result_text = data.get("result")
     if not isinstance(result_text, str):
@@ -331,11 +390,13 @@ def run_handshake(
         )
     except FileNotFoundError as exc:
         raise DeveloperExecutionError(
-            f"executable could not be launched: {type(exc).__name__}"
+            f"executable could not be launched: {type(exc).__name__}",
+            category=ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING,
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise DeveloperExecutionError(
-            f"developer execution timed out after {timeout_seconds}s"
+            f"developer execution timed out after {timeout_seconds}s",
+            category=ClaudeFailureCategory.CLAUDE_TIMEOUT,
         ) from exc
 
     return _parse_completed_process(completed)
@@ -457,11 +518,13 @@ def run_write_probe(
         )
     except FileNotFoundError as exc:
         raise DeveloperExecutionError(
-            f"executable could not be launched: {type(exc).__name__}"
+            f"executable could not be launched: {type(exc).__name__}",
+            category=ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING,
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise DeveloperExecutionError(
-            f"developer execution timed out after {timeout_seconds}s"
+            f"developer execution timed out after {timeout_seconds}s",
+            category=ClaudeFailureCategory.CLAUDE_TIMEOUT,
         ) from exc
 
     # Snapshot POST: independiente de si Claude "dice" haber terminado
@@ -497,8 +560,12 @@ def _evaluate_write_probe(
         raise DeveloperExecutionError("developer JSON 'subtype' is missing or is not 'success'")
 
     is_error = data.get("is_error")
-    if not isinstance(is_error, bool) or is_error:
-        raise DeveloperExecutionError(f"developer reported is_error={is_error!r}")
+    if not isinstance(is_error, bool):
+        # CORRECTION-001: un is_error no booleano NUNCA se reproduce (ni
+        # repr ni str ni su tipo): mensaje fijo, independiente del valor.
+        raise DeveloperExecutionError(_INVALID_IS_ERROR_MESSAGE)
+    if is_error:
+        raise DeveloperExecutionError("developer reported is_error=True")
 
     result_text = data.get("result")
     if not isinstance(result_text, str):
@@ -688,11 +755,13 @@ def run_developer_task(
         )
     except FileNotFoundError as exc:
         raise DeveloperExecutionError(
-            f"executable could not be launched: {type(exc).__name__}"
+            f"executable could not be launched: {type(exc).__name__}",
+            category=ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING,
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise DeveloperExecutionError(
-            f"developer execution timed out after {timeout_seconds}s"
+            f"developer execution timed out after {timeout_seconds}s",
+            category=ClaudeFailureCategory.CLAUDE_TIMEOUT,
         ) from exc
 
     return _parse_generic_task_result(completed)
@@ -704,18 +773,35 @@ def run_developer_task(
 # nunca expone el campo JSON `result` (puede contener contenido arbitrario
 # del modelo). Solo campos ESTRUCTURALES allowlisted de un stdout JSON, y un
 # fragmento acotado/saneado de stderr.
+#
+# CAPACITY-DETECTION-001: los mismos campos allowlisted alimentan ahora el
+# diagnóstico textual Y DeveloperExecutionError.category/details, desde UN
+# solo parseo (_structured_failure_details). `permission_denials` se reduce
+# a su CONTEO (permission_denial_count): su contenido (p. ej. tool_input)
+# puede incluir comandos/rutas/contenido y nunca se propaga.
 _FAILURE_DIAGNOSTIC_ALLOWED_STDOUT_FIELDS: tuple[str, ...] = (
     "type",
     "subtype",
     "is_error",
     "api_error_status",
     "stop_reason",
-    "permission_denials",
+    "permission_denial_count",
 )
 
 _FAILURE_DIAGNOSTIC_MAX_STDERR_CHARS = 500
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]")
+
+# Tokens estructurales seguros: identificadores cortos (p. ej. "result",
+# "error_max_turns", "max_turns"). Un valor de type/subtype/stop_reason o un
+# nombre de clave que no cumpla este patrón NO se transporta.
+_SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+_MAX_JSON_TOP_LEVEL_KEYS = 64
+
+# Códigos de subtype/api_error_status con significado para la clasificación.
+_SUBTYPE_MAX_TURNS = "error_max_turns"
+_API_ERROR_STATUS_TEMPORARY_LIMIT = 429
 
 
 def _sanitize_stderr_diagnostic(stderr: str) -> str:
@@ -732,37 +818,132 @@ def _sanitize_stderr_diagnostic(stderr: str) -> str:
     return collapsed[:_FAILURE_DIAGNOSTIC_MAX_STDERR_CHARS]
 
 
-def _build_failure_diagnostic(completed: "subprocess.CompletedProcess[str]") -> str:
-    """Construye el diagnóstico saneado y acotado para exit_code != 0.
-    Conserva SIEMPRE exit_code. Si stdout es JSON válido (objeto), extrae
-    ÚNICAMENTE los campos allowlisted presentes (nunca `result`, nunca
-    session/usage/transcript). Si stdout no es JSON válido y stderr está
-    vacío, reporta solamente `stdout_present=true` sin reproducir su
-    contenido. stderr, si no está vacío, se añade saneado y acotado."""
-    parts = [f"exit_code={completed.returncode}"]
+def _load_json_object(stdout: str | None) -> dict[str, Any] | None:
+    """Devuelve el objeto JSON de stdout, o None si stdout está vacío, no es
+    JSON válido o no es un objeto. Fail-closed: nunca interpreta parcial."""
+    if not stdout:
+        return None
+    try:
+        candidate = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        return None
+    return candidate if isinstance(candidate, dict) else None
 
-    stdout = completed.stdout or ""
-    parsed: dict[str, Any] | None = None
-    if stdout:
-        try:
-            candidate = json.loads(stdout)
-        except (json.JSONDecodeError, TypeError):
-            candidate = None
-        if isinstance(candidate, dict):
-            parsed = candidate
 
-    if parsed is not None:
-        for field in _FAILURE_DIAGNOSTIC_ALLOWED_STDOUT_FIELDS:
-            if field in parsed:
-                parts.append(f"{field}={parsed[field]!r}")
+def _safe_token(value: Any) -> str | None:
+    if isinstance(value, str) and _SAFE_TOKEN_RE.fullmatch(value):
+        return value
+    return None
 
-    sanitized_stderr = _sanitize_stderr_diagnostic(completed.stderr or "")
+
+def _structured_failure_details(
+    exit_code: Any, parsed: dict[str, Any] | None
+) -> dict[str, Any]:
+    """ÚNICO lugar donde se extraen los campos estructurales de un fallo.
+    Devuelve SOLO los que existen y superan validación estricta de tipo/
+    forma (nunca un valor null de relleno):
+
+      exit_code (int), type/subtype/stop_reason (token corto), is_error
+      (bool), api_error_status (int), permission_denial_count (len de una
+      lista `permission_denials`; nunca su contenido), json_top_level_keys
+      (nombres de clave seguros, ordenados, acotados; jamás valores).
+
+    Nunca lee ni transporta result, session_id, usage, modelUsage, prompt,
+    transcript, entorno ni credenciales."""
+    details: dict[str, Any] = {}
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        details["exit_code"] = exit_code
+    if parsed is None:
+        return details
+
+    for field in ("type", "subtype"):
+        token = _safe_token(parsed.get(field))
+        if token is not None:
+            details[field] = token
+
+    is_error = parsed.get("is_error")
+    if isinstance(is_error, bool):
+        details["is_error"] = is_error
+
+    api_error_status = parsed.get("api_error_status")
+    if isinstance(api_error_status, int) and not isinstance(api_error_status, bool):
+        details["api_error_status"] = api_error_status
+
+    stop_reason = _safe_token(parsed.get("stop_reason"))
+    if stop_reason is not None:
+        details["stop_reason"] = stop_reason
+
+    permission_denials = parsed.get("permission_denials")
+    if isinstance(permission_denials, list):
+        details["permission_denial_count"] = len(permission_denials)
+
+    details["json_top_level_keys"] = sorted(
+        key for key in parsed if _safe_token(key) is not None
+    )[:_MAX_JSON_TOP_LEVEL_KEYS]
+    return details
+
+
+def _classify_structured_failure(details: Mapping[str, Any]) -> ClaudeFailureCategory:
+    """Clasificación determinista SOLO por señales estructurales ya
+    validadas en `details`. Precedencia: 1) permission denial (conteo > 0),
+    2) subtype == "error_max_turns", 3) api_error_status == 429, 4) error
+    general. Sin matching textual de stderr/stdout/result. Timeout y
+    ejecutable ausente no pasan por aquí (excepciones propias)."""
+    denial_count = details.get("permission_denial_count")
+    if isinstance(denial_count, int) and denial_count > 0:
+        return ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED
+    if details.get("subtype") == _SUBTYPE_MAX_TURNS:
+        return ClaudeFailureCategory.CLAUDE_MAX_TURNS
+    if details.get("api_error_status") == _API_ERROR_STATUS_TEMPORARY_LIMIT:
+        return ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT
+    return ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR
+
+
+def _render_failure_diagnostic(
+    details: Mapping[str, Any], *, parsed_present: bool, stdout: str, stderr: str
+) -> str:
+    """Diagnóstico textual saneado y acotado para exit_code != 0, construido
+    a partir de los MISMOS `details` estructurales (sin reparsear). Conserva
+    exit_code; añade únicamente los campos allowlisted presentes. Si stdout
+    no es un objeto JSON y stderr está vacío, reporta solamente
+    `stdout_present=true` sin reproducir su contenido. stderr, si no está
+    vacío, se añade saneado y acotado."""
+    parts = [f"exit_code={details.get('exit_code')}"]
+    for field in _FAILURE_DIAGNOSTIC_ALLOWED_STDOUT_FIELDS:
+        if field in details:
+            parts.append(f"{field}={details[field]!r}")
+
+    sanitized_stderr = _sanitize_stderr_diagnostic(stderr)
     if sanitized_stderr:
         parts.append(f"stderr={sanitized_stderr!r}")
-    elif parsed is None and stdout:
+    elif not parsed_present and stdout:
         parts.append("stdout_present=true")
 
     return "; ".join(parts)
+
+
+def _build_failure_error(
+    completed: "subprocess.CompletedProcess[str]",
+    *,
+    parsed: dict[str, Any] | None,
+    message: str | None = None,
+) -> DeveloperExecutionError:
+    """Construye el DeveloperExecutionError de un fallo del CLI con
+    category/details estructurados. `parsed` es el objeto JSON de stdout ya
+    parseado por el llamador (o None): no se vuelve a parsear. Sin `message`
+    (camino exit_code != 0) se usa el diagnóstico saneado; con `message`
+    (camino exit 0 con error) se conserva el mensaje existente."""
+    details = _structured_failure_details(completed.returncode, parsed)
+    category = _classify_structured_failure(details)
+    if message is None:
+        diagnostic = _render_failure_diagnostic(
+            details,
+            parsed_present=parsed is not None,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        )
+        message = f"developer execution failed: {diagnostic}"
+    return DeveloperExecutionError(message, category=category, details=details)
 
 
 def _parse_generic_task_result(
@@ -775,42 +956,56 @@ def _parse_generic_task_result(
     deliberada es que aquí NO se compara result_text contra ningún valor
     fijo (a diferencia del handshake/write-probe, deterministas)."""
     if completed.returncode != 0:
-        raise DeveloperExecutionError(
-            f"developer execution failed: {_build_failure_diagnostic(completed)}"
-        )
+        raise _build_failure_error(completed, parsed=_load_json_object(completed.stdout))
 
+    # CAPACITY-DETECTION-001: exit 0 NO es éxito por sí solo. Cada fallo de
+    # forma/estado por debajo (subtype != success, is_error verdadero, etc.)
+    # conserva su mensaje existente y, además, category/details estructurales
+    # extraídos con la MISMA lógica segura del camino exit_code != 0.
     try:
         data = json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise DeveloperExecutionError("developer output is not valid JSON") from exc
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        raise _build_failure_error(
+            completed, parsed=None, message="developer output is not valid JSON"
+        ) from exc
 
     if not isinstance(data, dict):
-        raise DeveloperExecutionError("developer JSON output is not a JSON object")
+        raise _build_failure_error(
+            completed, parsed=None, message="developer JSON output is not a JSON object"
+        )
+
+    def _fail(message: str) -> DeveloperExecutionError:
+        return _build_failure_error(completed, parsed=data, message=message)
 
     if data.get("type") != "result":
-        raise DeveloperExecutionError("developer JSON 'type' is missing or is not 'result'")
+        raise _fail("developer JSON 'type' is missing or is not 'result'")
     if data.get("subtype") != "success":
-        raise DeveloperExecutionError("developer JSON 'subtype' is missing or is not 'success'")
+        raise _fail("developer JSON 'subtype' is missing or is not 'success'")
 
     is_error = data.get("is_error")
-    if not isinstance(is_error, bool) or is_error:
-        raise DeveloperExecutionError(f"developer reported is_error={is_error!r}")
+    if not isinstance(is_error, bool):
+        # CORRECTION-001: un is_error no booleano NUNCA se reproduce (ni
+        # repr ni str ni su tipo): mensaje fijo, independiente del valor.
+        # Tampoco entra en details (solo se transporta is_error bool).
+        raise _fail(_INVALID_IS_ERROR_MESSAGE)
+    if is_error:
+        raise _fail("developer reported is_error=True")
 
     result_text = data.get("result")
     if not isinstance(result_text, str):
-        raise DeveloperExecutionError("developer JSON missing string 'result' field")
+        raise _fail("developer JSON missing string 'result' field")
 
     session_id = data.get("session_id")
     if session_id is not None and not isinstance(session_id, str):
-        raise DeveloperExecutionError("developer JSON 'session_id' has unexpected type")
+        raise _fail("developer JSON 'session_id' has unexpected type")
     num_turns = data.get("num_turns")
     if num_turns is not None and (not isinstance(num_turns, int) or isinstance(num_turns, bool)):
-        raise DeveloperExecutionError("developer JSON 'num_turns' has unexpected type")
+        raise _fail("developer JSON 'num_turns' has unexpected type")
     duration_ms = data.get("duration_ms")
     if duration_ms is not None and (
         not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
     ):
-        raise DeveloperExecutionError("developer JSON 'duration_ms' has unexpected type")
+        raise _fail("developer JSON 'duration_ms' has unexpected type")
 
     return DeveloperResult(
         success=True,

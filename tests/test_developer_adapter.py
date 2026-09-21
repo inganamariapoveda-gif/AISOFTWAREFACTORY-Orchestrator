@@ -24,6 +24,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator.adapters.claude_code import (  # noqa: E402
+    ClaudeFailureCategory,
     EXPECTED_HANDSHAKE_RESULT,
     EXPECTED_WRITE_RESULT,
     HANDSHAKE_PROMPT,
@@ -1244,7 +1245,11 @@ class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("error", message)
         self.assertIn("429", message)
         self.assertIn("max_turns", message)
-        self.assertIn("Bash", message)
+        # CAPACITY-DETECTION-001: permission_denials se reduce a su CONTEO;
+        # su contenido (p. ej. tool_input de la herramienta denegada) nunca
+        # aparece en el mensaje (que llega al resultado público).
+        self.assertIn("permission_denial_count=1", message)
+        self.assertNotIn("Bash", message)
         self.assertNotIn("SECRET_CONTENT_SHOULD_NOT_APPEAR", message)
         self.assertNotIn("sess-should-not-appear-either", message)
         self.assertNotIn("input_tokens", message)
@@ -1306,6 +1311,525 @@ class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(
             result.result_text, "whatever Claude says, never checked verbatim"
+        )
+
+
+# ============================================================
+# CAPACITY-DETECTION-001: clasificación ESTRUCTURADA y segura de fallos del
+# Developer. Solo señales estructurales (tipo de excepción, exit code, campos
+# JSON allowlisted); nunca texto de stdout/stderr/result. Ninguna categoría
+# autoriza retry: esto solo etiqueta el fallo.
+# ============================================================
+
+
+class ClaudeFailureClassificationTests(unittest.TestCase):
+    ALLOWED_DETAIL_KEYS = frozenset(
+        {
+            "exit_code",
+            "type",
+            "subtype",
+            "is_error",
+            "api_error_status",
+            "stop_reason",
+            "permission_denial_count",
+            "json_top_level_keys",
+        }
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _payload(**fields) -> str:
+        base = {"type": "result", "subtype": "error_during_execution", "is_error": True}
+        base.update(fields)
+        return json.dumps(base)
+
+    def _error(
+        self,
+        *,
+        returncode: int = 1,
+        stdout: str = "",
+        stderr: str = "",
+        which_return: str | None = "/resolved/claude",
+        run_side_effect=None,
+    ) -> DeveloperExecutionError:
+        completed = _completed(returncode=returncode, stdout=stdout, stderr=stderr)
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value=which_return
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            return_value=completed,
+            side_effect=run_side_effect,
+        ):
+            with self.assertRaises(DeveloperExecutionError) as cm:
+                run_developer_task(
+                    developer_config=_valid_task_execution_developer_config(),
+                    prompt="x",
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+        return cm.exception
+
+    # ---- A. api_error_status == 429 -> CLAUDE_TEMPORARY_LIMIT ----
+
+    def test_429_with_nonzero_exit_is_temporary_limit(self) -> None:
+        exc = self._error(returncode=1, stdout=self._payload(api_error_status=429))
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT)
+        self.assertEqual(exc.category, "CLAUDE_TEMPORARY_LIMIT")
+        self.assertEqual(exc.details["api_error_status"], 429)
+        self.assertEqual(exc.details["exit_code"], 1)
+        self.assertEqual(exc.details["type"], "result")
+        self.assertIs(exc.details["is_error"], True)
+
+    # ---- B. subtype == error_max_turns -> CLAUDE_MAX_TURNS ----
+
+    def test_error_max_turns_subtype_is_max_turns(self) -> None:
+        exc = self._error(returncode=1, stdout=self._payload(subtype="error_max_turns"))
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_MAX_TURNS)
+        self.assertEqual(exc.details["subtype"], "error_max_turns")
+
+    def test_max_turns_is_never_inferred_from_text_or_stop_reason(self) -> None:
+        # Solo `subtype == "error_max_turns"` clasifica: ni stderr textual ni
+        # stop_reason por sí solo.
+        exc = self._error(
+            returncode=1,
+            stdout=self._payload(subtype="error", stop_reason="max_turns"),
+            stderr="Reached max turns (8)",
+        )
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(exc.details["stop_reason"], "max_turns")
+
+    # ---- C. permission_denials no vacío -> CLAUDE_PERMISSION_DENIED ----
+
+    def test_non_empty_permission_denials_is_permission_denied(self) -> None:
+        denials = [{"tool_name": "Bash", "tool_input": {"command": "SECRET_DENIAL_CMD"}}]
+        exc = self._error(returncode=1, stdout=self._payload(permission_denials=denials))
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED)
+        self.assertEqual(exc.details["permission_denial_count"], 1)
+        # Solo el conteo: nunca el contenido de las denegaciones.
+        self.assertNotIn("SECRET_DENIAL_CMD", json.dumps(exc.details))
+        self.assertNotIn("SECRET_DENIAL_CMD", str(exc))
+        self.assertNotIn("Bash", json.dumps(exc.details))
+
+    def test_empty_or_non_list_permission_denials_do_not_classify(self) -> None:
+        empty = self._error(stdout=self._payload(permission_denials=[]))
+        self.assertIs(empty.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(empty.details["permission_denial_count"], 0)
+
+        not_a_list = self._error(stdout=self._payload(permission_denials="Bash"))
+        self.assertIs(not_a_list.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertNotIn("permission_denial_count", not_a_list.details)
+
+    # ---- D. timeout -> CLAUDE_TIMEOUT ----
+
+    def test_timeout_is_claude_timeout(self) -> None:
+        exc = self._error(
+            run_side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=90)
+        )
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_TIMEOUT)
+        self.assertEqual(exc.details, {})
+        self.assertIn("timed out", str(exc))
+
+    def test_handshake_and_write_probe_timeouts_are_classified_too(self) -> None:
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=60),
+        ):
+            with self.assertRaises(DeveloperExecutionError) as handshake:
+                run_handshake(
+                    developer_config=_valid_developer_config(),
+                    prompt=HANDSHAKE_PROMPT,
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+            prepare_sandbox_files(self.cwd)
+            with self.assertRaises(DeveloperExecutionError) as write_probe:
+                run_write_probe(
+                    developer_config=_valid_write_probe_developer_config(),
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                )
+        self.assertIs(handshake.exception.category, ClaudeFailureCategory.CLAUDE_TIMEOUT)
+        self.assertIs(write_probe.exception.category, ClaudeFailureCategory.CLAUDE_TIMEOUT)
+
+    # ---- E. ejecutable ausente -> CLAUDE_EXECUTABLE_MISSING ----
+
+    def test_executable_not_on_path_is_executable_missing(self) -> None:
+        exc = self._error(which_return=None)
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING)
+        self.assertEqual(exc.details, {})
+
+    def test_file_not_found_at_launch_is_executable_missing(self) -> None:
+        exc = self._error(run_side_effect=FileNotFoundError("SECRET_PATH_MARKER"))
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTABLE_MISSING)
+        self.assertNotIn("SECRET_PATH_MARKER", str(exc))
+
+    # ---- F. error desconocido -> CLAUDE_EXECUTION_ERROR (fail closed) ----
+
+    def test_unknown_nonzero_error_is_general_execution_error(self) -> None:
+        exc = self._error(returncode=2, stdout="", stderr="boom")
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(exc.details, {"exit_code": 2})
+
+    def test_non_json_stdout_only_carries_exit_code(self) -> None:
+        exc = self._error(returncode=1, stdout="raw text SECRET_STDOUT_MARKER not json")
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(exc.details, {"exit_code": 1})
+
+    def test_limit_wording_in_text_never_classifies(self) -> None:
+        # Sin matching textual: ni stderr ni stdout no JSON ni el campo
+        # `result` con lenguaje de "límite"/"cuota" producen categoría alguna.
+        by_stderr = self._error(
+            returncode=1, stderr="429 rate limit exceeded: usage limit reached, quota"
+        )
+        by_stdout = self._error(returncode=1, stdout="HTTP 429 Too Many Requests")
+        by_result = self._error(
+            returncode=1,
+            stdout=self._payload(result="You have hit your usage limit (429)"),
+        )
+        for exc in (by_stderr, by_stdout, by_result):
+            self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+
+    # ---- G/H. exit 0 con error NO es éxito y se clasifica igual ----
+
+    def test_exit_zero_with_is_error_true_is_classified(self) -> None:
+        plain = self._error(
+            returncode=0,
+            stdout=json.dumps({"type": "result", "subtype": "success", "is_error": True}),
+        )
+        self.assertIs(plain.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(plain.details["exit_code"], 0)
+        self.assertIs(plain.details["is_error"], True)
+        # Mensaje existente conservado.
+        self.assertIn("developer reported is_error=True", str(plain))
+
+        limited = self._error(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "api_error_status": 429,
+                }
+            ),
+        )
+        self.assertIs(limited.category, ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT)
+        self.assertEqual(limited.details["exit_code"], 0)
+
+    def test_exit_zero_with_non_success_subtype_is_classified(self) -> None:
+        max_turns = self._error(
+            returncode=0,
+            stdout=self._payload(subtype="error_max_turns", is_error=False),
+        )
+        self.assertIs(max_turns.category, ClaudeFailureCategory.CLAUDE_MAX_TURNS)
+        self.assertEqual(max_turns.details["exit_code"], 0)
+        self.assertEqual(max_turns.details["subtype"], "error_max_turns")
+        self.assertIn("'subtype' is missing or is not 'success'", str(max_turns))
+
+        denied = self._error(
+            returncode=0,
+            stdout=self._payload(
+                subtype="failure", is_error=False, permission_denials=[{"tool_name": "Edit"}]
+            ),
+        )
+        self.assertIs(denied.category, ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED)
+        self.assertEqual(denied.details["permission_denial_count"], 1)
+
+        generic = self._error(
+            returncode=0,
+            stdout=json.dumps(_valid_generic_result_payload(subtype="failure")),
+        )
+        self.assertIs(generic.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(generic.details["subtype"], "failure")
+
+    def test_exit_zero_invalid_or_non_object_json_keeps_message_and_is_general(self) -> None:
+        invalid = self._error(returncode=0, stdout="not json at all")
+        self.assertEqual(str(invalid), "developer output is not valid JSON")
+        self.assertIs(invalid.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(invalid.details, {"exit_code": 0})
+
+        non_object = self._error(returncode=0, stdout="[1, 2, 3]")
+        self.assertEqual(str(non_object), "developer JSON output is not a JSON object")
+        self.assertEqual(non_object.details, {"exit_code": 0})
+
+    # ---- CORRECTION-001: un is_error NO booleano nunca se reproduce ----
+
+    _INVALID_IS_ERROR_MESSAGE = "developer returned invalid is_error field"
+
+    def test_non_boolean_is_error_value_is_never_exposed(self) -> None:
+        sentinel = "SENSITIVE_ARBITRARY_SENTINEL"
+        for bogus in (sentinel, [sentinel], {"k": sentinel}, 1, 0.5, None):
+            for returncode in (0, 1):
+                with self.subTest(is_error=type(bogus).__name__, returncode=returncode):
+                    payload = json.dumps(
+                        {"type": "result", "subtype": "success", "is_error": bogus}
+                    )
+                    exc = self._error(returncode=returncode, stdout=payload)
+                    self.assertNotIn(sentinel, str(exc))
+                    self.assertNotIn(sentinel, repr(exc))
+                    self.assertNotIn(sentinel, json.dumps(exc.details))
+                    self.assertNotIn("is_error", exc.details)
+                    self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+                    if returncode == 0:
+                        # Diagnóstico CONSTANTE, no derivado del valor.
+                        self.assertEqual(str(exc), self._INVALID_IS_ERROR_MESSAGE)
+                    # is_error solo aparece en details si es booleano.
+                    self.assertEqual(
+                        exc.details["json_top_level_keys"], ["is_error", "subtype", "type"]
+                    )
+
+    def test_missing_is_error_uses_the_same_constant_message(self) -> None:
+        exc = self._error(
+            returncode=0, stdout=json.dumps({"type": "result", "subtype": "success"})
+        )
+        self.assertEqual(str(exc), self._INVALID_IS_ERROR_MESSAGE)
+        self.assertNotIn("is_error", exc.details)
+
+    def test_boolean_is_error_true_keeps_its_fixed_message_and_detail(self) -> None:
+        exc = self._error(
+            returncode=0,
+            stdout=json.dumps({"type": "result", "subtype": "success", "is_error": True}),
+        )
+        self.assertEqual(str(exc), "developer reported is_error=True")
+        self.assertIs(exc.details["is_error"], True)
+
+    def test_non_boolean_is_error_is_not_exposed_by_handshake_or_write_probe(self) -> None:
+        sentinel = "SENSITIVE_ARBITRARY_SENTINEL"
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ):
+            handshake_payload = _valid_result_payload(is_error=sentinel)
+            with mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run",
+                return_value=_completed(returncode=0, stdout=json.dumps(handshake_payload)),
+            ):
+                with self.assertRaises(DeveloperExecutionError) as handshake:
+                    run_handshake(
+                        developer_config=_valid_developer_config(),
+                        prompt=HANDSHAKE_PROMPT,
+                        cwd=self.cwd,
+                        authorized_root=self.cwd,
+                    )
+
+            prepare_sandbox_files(self.cwd)
+            probe_payload = _valid_write_result_payload(is_error=sentinel)
+            with mock.patch(
+                "orchestrator.adapters.claude_code.subprocess.run",
+                return_value=_completed(returncode=0, stdout=json.dumps(probe_payload)),
+            ):
+                with self.assertRaises(DeveloperExecutionError) as write_probe:
+                    run_write_probe(
+                        developer_config=_valid_write_probe_developer_config(),
+                        cwd=self.cwd,
+                        authorized_root=self.cwd,
+                    )
+        for caught in (handshake, write_probe):
+            self.assertEqual(str(caught.exception), self._INVALID_IS_ERROR_MESSAGE)
+            self.assertNotIn(sentinel, str(caught.exception))
+
+    # ---- CORRECTION-001: success + permission_denials NO es fallo ----
+
+    def test_success_with_permission_denials_stays_success_and_exposes_nothing(self) -> None:
+        # subtype "success" + is_error false + permission_denials no vacío: una
+        # acción intermedia denegada no invalida por sí sola un resultado final
+        # estructurado como éxito. CLAUDE_PERMISSION_DENIED solo clasifica una
+        # ejecución que ya está en camino de fallo.
+        payload = _valid_generic_result_payload(
+            permission_denials=[
+                {"tool_name": "Bash", "tool_input": {"command": "FICTITIOUS_DENIED_CMD"}}
+            ]
+        )
+        completed = _completed(returncode=0, stdout=json.dumps(payload))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            result = run_developer_task(
+                developer_config=_valid_task_execution_developer_config(),
+                prompt="x",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        self.assertTrue(result.success)
+        self.assertFalse(result.is_error)
+        # Ningún campo del resultado transporta las denegaciones.
+        self.assertNotIn("FICTITIOUS_DENIED_CMD", repr(result))
+        self.assertFalse(any("denial" in name for name in vars(result)))
+
+    def test_permission_denials_still_classify_a_failing_run(self) -> None:
+        # Contraste: la MISMA lista en una ejecución que ya falla sí clasifica.
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "permission_denials": [{"tool_input": "FICTITIOUS_DENIED_CMD"}],
+            }
+        )
+        exc = self._error(returncode=0, stdout=payload)
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED)
+        self.assertEqual(exc.details["permission_denial_count"], 1)
+        self.assertNotIn("FICTITIOUS_DENIED_CMD", str(exc))
+        self.assertNotIn("FICTITIOUS_DENIED_CMD", json.dumps(exc.details))
+
+    def test_exit_zero_success_still_returns_success(self) -> None:
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ):
+            result = run_developer_task(
+                developer_config=_valid_task_execution_developer_config(),
+                prompt="x",
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+            )
+        self.assertTrue(result.success)
+
+    # ---- I. precedencia: permission > max_turns > 429 > general ----
+
+    def test_precedence_permission_over_max_turns_over_429_over_general(self) -> None:
+        denials = [{"tool_name": "Bash"}]
+        cases = [
+            (
+                {
+                    "permission_denials": denials,
+                    "subtype": "error_max_turns",
+                    "api_error_status": 429,
+                },
+                ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED,
+            ),
+            (
+                {"permission_denials": denials, "api_error_status": 429},
+                ClaudeFailureCategory.CLAUDE_PERMISSION_DENIED,
+            ),
+            (
+                {"subtype": "error_max_turns", "api_error_status": 429},
+                ClaudeFailureCategory.CLAUDE_MAX_TURNS,
+            ),
+            ({"api_error_status": 429}, ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT),
+            ({}, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR),
+        ]
+        for fields, expected in cases:
+            for returncode in (1, 0):
+                with self.subTest(fields=sorted(fields), returncode=returncode):
+                    exc = self._error(returncode=returncode, stdout=self._payload(**fields))
+                    self.assertIs(exc.category, expected)
+
+    # ---- validación estricta de forma: nada raro se transporta ----
+
+    def test_only_strictly_valid_field_shapes_are_carried(self) -> None:
+        # "429" (str), 429.0 (float) y True (bool) NO son api_error_status == 429.
+        for bogus in ("429", 429.0, True):
+            with self.subTest(api_error_status=bogus):
+                exc = self._error(stdout=self._payload(api_error_status=bogus))
+                self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+                self.assertNotIn("api_error_status", exc.details)
+
+        # Un subtype con caracteres fuera del patrón seguro (p. ej. salto de
+        # línea final) no clasifica ni se transporta.
+        exc = self._error(stdout=self._payload(subtype="error_max_turns\n"))
+        self.assertIs(exc.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertNotIn("subtype", exc.details)
+
+        exc = self._error(
+            stdout=self._payload(stop_reason="free text with spaces", is_error="yes")
+        )
+        self.assertNotIn("stop_reason", exc.details)
+        self.assertNotIn("is_error", exc.details)
+
+    def test_json_top_level_keys_are_sorted_names_only_and_bounded(self) -> None:
+        exc = self._error(stdout=self._payload(zeta=1, alpha=2, **{"bad key!": 3}))
+        keys = exc.details["json_top_level_keys"]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(
+            keys, ["alpha", "is_error", "subtype", "type", "zeta"]
+        )  # "bad key!" descartada
+
+        many = {f"k{i:03d}": i for i in range(200)}
+        exc = self._error(stdout=json.dumps(many))
+        self.assertEqual(len(exc.details["json_top_level_keys"]), 64)
+
+    # ---- fuga de datos: solo nombres de clave, jamás valores ----
+
+    def test_details_never_contain_sensitive_values(self) -> None:
+        payload = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "api_error_status": 429,
+            "stop_reason": "end_turn",
+            "permission_denials": [{"tool_input": "SENTINEL_DENIAL"}],
+            "result": "SENTINEL_RESULT",
+            "session_id": "SENTINEL_SESSION",
+            "usage": {"input_tokens": "SENTINEL_USAGE"},
+            "modelUsage": {"model": "SENTINEL_MODELUSAGE"},
+        }
+        exc = self._error(
+            returncode=1, stdout=json.dumps(payload), stderr="SENTINEL_STDERR"
+        )
+        serialized = json.dumps(exc.details) + exc.category.value
+        for sentinel in (
+            "SENTINEL_DENIAL",
+            "SENTINEL_RESULT",
+            "SENTINEL_SESSION",
+            "SENTINEL_USAGE",
+            "SENTINEL_MODELUSAGE",
+            "SENTINEL_STDERR",
+        ):
+            self.assertNotIn(sentinel, serialized)
+        # El mensaje textual (que llega al resultado público) tampoco filtra
+        # stdout, denegaciones, session_id, usage ni modelUsage.
+        for sentinel in (
+            "SENTINEL_DENIAL",
+            "SENTINEL_RESULT",
+            "SENTINEL_SESSION",
+            "SENTINEL_USAGE",
+            "SENTINEL_MODELUSAGE",
+        ):
+            self.assertNotIn(sentinel, str(exc))
+        # Los NOMBRES de clave sí se conservan; sus valores nunca.
+        self.assertEqual(
+            exc.details["json_top_level_keys"],
+            sorted(payload),
+        )
+        self.assertLessEqual(set(exc.details), self.ALLOWED_DETAIL_KEYS)
+
+    # ---- compatibilidad de la excepción ----
+
+    def test_error_stays_catchable_with_safe_defaults(self) -> None:
+        plain = DeveloperExecutionError("some message")
+        self.assertEqual(str(plain), "some message")
+        self.assertIs(plain.category, ClaudeFailureCategory.CLAUDE_EXECUTION_ERROR)
+        self.assertEqual(plain.details, {})
+        self.assertIsInstance(plain, Exception)
+
+        by_name = DeveloperExecutionError("m", category="CLAUDE_TIMEOUT")
+        self.assertIs(by_name.category, ClaudeFailureCategory.CLAUDE_TIMEOUT)
+        with self.assertRaises(ValueError):
+            DeveloperExecutionError("m", category="CLAUDE_AUTH_ERROR")  # no existe (aún)
+
+    def test_category_set_is_exactly_the_authorized_one(self) -> None:
+        self.assertEqual(
+            {c.value for c in ClaudeFailureCategory},
+            {
+                "CLAUDE_TEMPORARY_LIMIT",
+                "CLAUDE_MAX_TURNS",
+                "CLAUDE_TIMEOUT",
+                "CLAUDE_PERMISSION_DENIED",
+                "CLAUDE_EXECUTABLE_MISSING",
+                "CLAUDE_EXECUTION_ERROR",
+            },
         )
 
 

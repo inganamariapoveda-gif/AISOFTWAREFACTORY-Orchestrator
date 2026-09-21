@@ -523,6 +523,17 @@ def execute_task_packet(
         # forma segura, fail closed con los valores conservadores por
         # defecto de _blocked() -- nunca se inventan changed_paths/
         # out_of_scope_paths/head_unchanged.
+        #
+        # CAPACITY-DETECTION-001: la categoría y los detalles estructurales
+        # seguros del fallo (exc.category/exc.details: solo nombres/valores
+        # allowlisted, nunca stdout/stderr/result/session_id/usage) se
+        # publican en AMBOS retornos, con o sin evidencia Git. TODA
+        # categoría -- incluido CLAUDE_TEMPORARY_LIMIT -- sigue terminando
+        # en BLOCKED: sin retry, sin espera, sin persistencia.
+        failure_fields: dict[str, Any] = {
+            "developer_failure_category": exc.category.value,
+            "developer_failure_details": dict(exc.details),
+        }
         try:
             post_failure_change_evidence = evidence_mod.capture_change_evidence(
                 before, packet.authorized_files
@@ -542,10 +553,12 @@ def execute_task_packet(
                 "post-failure Git evidence could not be determined safely; "
                 "HEAD unchanged not verified",
                 head_unchanged=False,
+                **failure_fields,
             )
         return _blocked(
             f"developer execution failed: {exc}; post-failure Git evidence captured",
             head_unchanged=not post_failure_change_evidence.head_changed,
+            **failure_fields,
             **_git_path_report(post_failure_change_evidence),
         )
 

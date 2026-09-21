@@ -1004,6 +1004,9 @@ class TaskExecutionProbeSuccessTests(TaskExecutionProbeTestCase):
             output["mandatory_test_results"],
             [{"test_id": "unit", "result": "PASS", "exit_code": 0}],
         )
+        # CAPACITY-DETECTION-001: un éxito nunca lleva campos de fallo.
+        self.assertNotIn("developer_failure_category", output)
+        self.assertNotIn("developer_failure_details", output)
 
         developer_mock.assert_called_once()
         test_mock.assert_called_once()
@@ -1569,6 +1572,10 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertEqual(output["untracked_paths"], [])
         self.assertEqual(output["touched_paths"], [])
         self.assertEqual(output["mandatory_test_results"], [])
+        # CAPACITY-DETECTION-001: un fallo sin señal estructural es error
+        # general, con solo el exit code como detalle.
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_EXECUTION_ERROR")
+        self.assertEqual(output["developer_failure_details"], {"exit_code": 1})
         self.assertTrue(output["head_unchanged"])
         self.assertIn("developer execution failed:", output["reason"])
         self.assertIn("exit_code=1", output["reason"])
@@ -1651,6 +1658,265 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertEqual(output["mandatory_test_results"], [])
         test_mock.assert_not_called()
         self._assert_head_unchanged_on_disk(head_before)
+
+    # ---- CAPACITY-DETECTION-001: categoría estructurada del fallo ----
+    #
+    # Toda categoría -- incluido CLAUDE_TEMPORARY_LIMIT -- termina en BLOCKED:
+    # el Developer se invoca EXACTAMENTE una vez, ningún mandatory test se
+    # ejecuta después, no hay retry/espera/persistencia (Store no se toca), y
+    # las ediciones parciales quedan preservadas y reportadas.
+
+    _STDOUT_SENTINELS = (
+        "SENTINEL_RESULT_7a1",
+        "SENTINEL_SESSION_7a1",
+        "SENTINEL_USAGE_7a1",
+        "SENTINEL_MODELUSAGE_7a1",
+        "SENTINEL_DENIAL_7a1",
+    )
+
+    def _failure_payload(self, **overrides) -> dict:
+        payload = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "api_error_status": 429,
+            "stop_reason": "end_turn",
+            "permission_denials": [],
+            "result": "SENTINEL_RESULT_7a1",
+            "session_id": "SENTINEL_SESSION_7a1",
+            "usage": {"note": "SENTINEL_USAGE_7a1"},
+            "modelUsage": {"m": "SENTINEL_MODELUSAGE_7a1"},
+        }
+        payload.update(overrides)
+        return payload
+
+    def _authorize_new_file(self) -> None:
+        self._write_taskexec_packet(
+            mandatory_tests=["unit"],
+            authorized_files=["allowed.txt", "new_authorized.txt"],
+        )
+
+    def _developer_partial_then(
+        self, *, returncode: int = 1, stdout: str = "", stderr: str = "", raises=None
+    ):
+        """Developer simulado: deja una edición parcial (archivo tracked
+        modificado + archivo autorizado nuevo/untracked) y luego falla."""
+
+        def run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            (cwd / "new_authorized.txt").write_text("partial new", encoding="utf-8")
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(
+                args=args, returncode=returncode, stdout=stdout, stderr=stderr
+            )
+
+        return mock.MagicMock(side_effect=run)
+
+    def _run_blocked_case(self, developer_mock):
+        test_mock = mock.MagicMock(side_effect=self._test_passes)
+        with mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=developer_mock, test=test_mock
+        ):
+            rc, stdout = self.run_task_execution_probe()
+        output = json.loads(stdout)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertFalse(output["developer_completed"])
+        self.assertFalse(output["commit_performed"])
+        # Sin retry: el Developer se invoca UNA sola vez y ningún mandatory
+        # test se ejecuta tras el fallo. Sin persistencia: Store no se toca.
+        developer_mock.assert_called_once()
+        test_mock.assert_not_called()
+        store_mock.assert_not_called()
+        return output, stdout
+
+    def _assert_partial_edit_preserved(self, output: dict, head_before: str) -> None:
+        self.assertEqual(output["changed_paths"], ["allowed.txt"])
+        self.assertEqual(output["untracked_paths"], ["new_authorized.txt"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "new_authorized.txt"])
+        self.assertEqual(output["out_of_scope_paths"], [])
+        self.assertTrue(output["head_unchanged"])
+        self.assertEqual(output["mandatory_test_results"], [])
+        # Sin rollback: las ediciones parciales siguen en disco, sin staging.
+        self.assertEqual(
+            (self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL"
+        )
+        self.assertTrue((self.taskexec_repo / "new_authorized.txt").exists())
+        self.assertIn(
+            "?? new_authorized.txt",
+            _git("status", "--porcelain", cwd=self.taskexec_repo).stdout,
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_i_temporary_limit_is_blocked_without_retry_and_reports_details(self) -> None:
+        self._authorize_new_file()
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        payload = self._failure_payload()
+        developer_mock = self._developer_partial_then(stdout=json.dumps(payload))
+
+        output, raw = self._run_blocked_case(developer_mock)
+
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertEqual(
+            output["developer_failure_details"],
+            {
+                "exit_code": 1,
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "api_error_status": 429,
+                "stop_reason": "end_turn",
+                "permission_denial_count": 0,
+                "json_top_level_keys": sorted(payload),
+            },
+        )
+        self.assertIn("post-failure Git evidence captured", output["reason"])
+        # Nada de stdout/result/session_id/usage/modelUsage en el resultado.
+        for sentinel in self._STDOUT_SENTINELS:
+            self.assertNotIn(sentinel, raw)
+        self._assert_partial_edit_preserved(output, head_before)
+
+    def test_j_stderr_never_leaks_into_failure_details(self) -> None:
+        self._authorize_new_file()
+        developer_mock = self._developer_partial_then(
+            stdout=json.dumps(self._failure_payload()), stderr="SENTINEL_STDERR_7a1"
+        )
+
+        output, _raw = self._run_blocked_case(developer_mock)
+
+        self.assertNotIn("SENTINEL_STDERR_7a1", json.dumps(output["developer_failure_details"]))
+        self.assertNotIn("SENTINEL_STDERR_7a1", output["developer_failure_category"])
+
+    def test_k_permission_denied_reports_count_only(self) -> None:
+        self._authorize_new_file()
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        payload = self._failure_payload(
+            api_error_status=None,
+            permission_denials=[
+                {"tool_name": "Bash", "tool_input": {"command": "SENTINEL_DENIAL_7a1"}},
+                {"tool_name": "Write"},
+            ],
+        )
+        output, raw = self._run_blocked_case(
+            self._developer_partial_then(stdout=json.dumps(payload))
+        )
+
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_PERMISSION_DENIED")
+        self.assertEqual(output["developer_failure_details"]["permission_denial_count"], 2)
+        for sentinel in self._STDOUT_SENTINELS:
+            self.assertNotIn(sentinel, raw)
+        self.assertNotIn("Bash", raw)
+        self._assert_partial_edit_preserved(output, head_before)
+
+    def test_l_error_max_turns_is_max_turns_not_temporary_limit(self) -> None:
+        self._authorize_new_file()
+        payload = self._failure_payload(subtype="error_max_turns", api_error_status=None)
+        output, _raw = self._run_blocked_case(
+            self._developer_partial_then(stdout=json.dumps(payload))
+        )
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_MAX_TURNS")
+        self.assertEqual(output["developer_failure_details"]["subtype"], "error_max_turns")
+
+    def test_m_exit_zero_with_error_subtype_is_classified_and_blocked(self) -> None:
+        # exit 0 NO es éxito por sí solo: subtype != success clasifica igual
+        # (aquí max_turns con exit 0) y termina en BLOCKED.
+        self._authorize_new_file()
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        payload = self._failure_payload(
+            subtype="error_max_turns", is_error=False, api_error_status=None
+        )
+        output, _raw = self._run_blocked_case(
+            self._developer_partial_then(returncode=0, stdout=json.dumps(payload))
+        )
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_MAX_TURNS")
+        self.assertEqual(output["developer_failure_details"]["exit_code"], 0)
+        self.assertIn("'subtype' is missing or is not 'success'", output["reason"])
+        self._assert_partial_edit_preserved(output, head_before)
+
+    def test_n_exit_zero_is_error_true_with_429_is_temporary_limit(self) -> None:
+        self._authorize_new_file()
+        payload = self._failure_payload(subtype="success")  # is_error True, 429
+        output, _raw = self._run_blocked_case(
+            self._developer_partial_then(returncode=0, stdout=json.dumps(payload))
+        )
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertEqual(output["developer_failure_details"]["exit_code"], 0)
+        self.assertIs(output["developer_failure_details"]["is_error"], True)
+
+    def test_o_timeout_after_partial_edit_is_timeout_category(self) -> None:
+        self._authorize_new_file()
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        developer_mock = self._developer_partial_then(
+            raises=subprocess.TimeoutExpired(cmd=["claude"], timeout=90)
+        )
+        output, _raw = self._run_blocked_case(developer_mock)
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_TIMEOUT")
+        self.assertEqual(output["developer_failure_details"], {})
+        self._assert_partial_edit_preserved(output, head_before)
+
+    def test_p_executable_missing_is_classified(self) -> None:
+        developer_mock = mock.MagicMock(side_effect=FileNotFoundError("SENTINEL_PATH_7a1"))
+        output, raw = self._run_blocked_case(developer_mock)
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_EXECUTABLE_MISSING")
+        self.assertNotIn("SENTINEL_PATH_7a1", raw)
+
+    def test_q_unstructured_limit_wording_is_general_error(self) -> None:
+        # Sin señal estructurada, ni el lenguaje de "límite"/"cuota" en
+        # stderr/stdout clasifica como límite temporal (sin matching textual).
+        output, _raw = self._run_blocked_case(
+            mock.MagicMock(
+                side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="HTTP 429 usage limit reached",
+                    stderr="rate limit exceeded, quota exhausted (429)",
+                )
+            )
+        )
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_EXECUTION_ERROR")
+        self.assertEqual(output["developer_failure_details"], {"exit_code": 1})
+
+    def test_r_out_of_scope_partial_edit_with_429_is_blocked_and_reported(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            (cwd / "untouched.txt").write_text("MODIFIED", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=json.dumps(self._failure_payload()), stderr=""
+            )
+
+        output, _raw = self._run_blocked_case(mock.MagicMock(side_effect=run))
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertEqual(output["out_of_scope_paths"], ["untouched.txt"])
+        self.assertEqual(output["touched_paths"], ["allowed.txt", "untouched.txt"])
+        self.assertEqual(
+            (self.taskexec_repo / "untouched.txt").read_text(encoding="utf-8"), "MODIFIED"
+        )
+        self._assert_head_unchanged_on_disk(head_before)
+
+    def test_s_head_change_with_429_is_reported_not_hidden(self) -> None:
+        head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+        def run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            _git("add", "allowed.txt", cwd=cwd)
+            _git("commit", "-m", "unauthorized commit by developer", cwd=cwd)
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=json.dumps(self._failure_payload()), stderr=""
+            )
+
+        output, _raw = self._run_blocked_case(mock.MagicMock(side_effect=run))
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertFalse(output["head_unchanged"])
+        # HEAD SÍ cambió por el developer simulado; no se revierte.
+        self.assertNotEqual(
+            head_before, _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+        )
 
     def test_c_developer_touches_out_of_scope_file_then_fails(self) -> None:
         head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
@@ -1737,6 +2003,10 @@ class TaskExecutionProbeDeveloperFailureEvidenceTests(TaskExecutionProbeTestCase
         self.assertEqual(output["changed_paths"], [])
         self.assertEqual(output["out_of_scope_paths"], [])
         self.assertEqual(output["mandatory_test_results"], [])
+        # CAPACITY-DETECTION-001: la categoría se publica aunque la evidencia
+        # Git post-fallo no haya podido determinarse.
+        self.assertEqual(output["developer_failure_category"], "CLAUDE_EXECUTION_ERROR")
+        self.assertEqual(output["developer_failure_details"], {"exit_code": 1})
         self.assertFalse(output["head_unchanged"])
         self.assertIn("developer execution failed:", output["reason"])
         self.assertIn(
