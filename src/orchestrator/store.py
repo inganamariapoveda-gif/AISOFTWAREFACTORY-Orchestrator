@@ -75,8 +75,19 @@ CREATE TABLE IF NOT EXISTS task_suspension (
 # (stdout, stderr, result, session_id, usage, prompt, credenciales, reason
 # heredado): solo identidad de la tarea, hashes, baseline Git, huella del
 # working tree, nombres de paths, contadores y timestamps.
+STATE_SPECIFICATION = "SPECIFICATION"
 STATE_DEVELOPING = "DEVELOPING"
 STATE_WAITING_FOR_CLAUDE_CAPACITY = "WAITING_FOR_CLAUDE_CAPACITY"
+STATE_BLOCKED = "BLOCKED"
+
+# CAPACITY-RESUME-EXECUTION-002: cadena válida (Master Spec §5.2) que se
+# persiste de forma atómica cuando el pipeline completo termina en HUMAN_GATE.
+_HUMAN_GATE_CHAIN: tuple[str, ...] = (
+    "AUTOMATED_TEST",
+    "TECHNICAL_REVIEW",
+    "SECURITY_REVIEW",
+    "HUMAN_GATE",
+)
 
 TASK_SUSPENSION_COLUMNS: tuple[str, ...] = (
     "task_id",
@@ -139,6 +150,21 @@ _UPDATE_SUSPENSION_SQL = (
     "UPDATE task_suspension SET working_tree_fingerprint = ?, touched_paths_json = ?, "
     "capacity_wait_count = ?, next_retry_at = ?, updated_at = ? WHERE task_id = ?"
 )
+# CAPACITY-RESUME-EXECUTION-002 CORRECTION-002: mismas sentencias y convención
+# que create_task (evento inicial NULL -> BACKLOG, "task created", "system").
+_INSERT_TASK_SQL = (
+    "INSERT INTO task "
+    "(id, project_id, title, need_text, status, attempt_count, created_at, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, 0, ?, ?)"
+)
+_INSERT_INITIAL_EVENT_SQL = (
+    "INSERT INTO status_event "
+    "(task_id, from_status, to_status, reason, actor, created_at) "
+    "VALUES (?, NULL, ?, ?, ?, ?)"
+)
+_TASK_CREATED_REASON = "task created"
+_TASK_CREATED_ACTOR = "system"
+
 _INSERT_STATUS_EVENT_SQL = (
     "INSERT INTO status_event (task_id, from_status, to_status, reason, actor, created_at) "
     "VALUES (?, ?, ?, ?, ?, ?)"
@@ -317,10 +343,17 @@ class Store:
 
         now = _utcnow()
         with closing(self._conn.cursor()) as cur:
-            cur.execute(
-                "UPDATE task SET status = ?, updated_at = ? WHERE id = ?",
-                (to_status, now, task_id),
-            )
+            # CAPACITY-RESUME-EXECUTION-002 CORRECTION-001: el UPDATE es
+            # CONDICIONAL al estado origen que se validó. Si otro proceso ya
+            # cambió el estado entre la lectura y este UPDATE, NO se fuerza la
+            # transición (0 filas afectadas -> StoreError, sin status_event).
+            cur.execute(_UPDATE_TASK_STATUS_SQL, (to_status, now, task_id, from_status))
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                raise StoreError(
+                    f"task {task_id!r} is no longer in status {from_status!r}; "
+                    "transition not applied"
+                )
             cur.execute(
                 "INSERT INTO status_event "
                 "(task_id, from_status, to_status, reason, actor, created_at) "
@@ -700,6 +733,194 @@ class Store:
                 reason_text,
                 actor_text,
             )
+        result = self.get_task(task_id)
+        assert result is not None
+        return result
+
+    # ------------------------------------------------------------------
+    # CAPACITY-RESUME-EXECUTION-002: finalización y bloqueo ATÓMICOS.
+    #
+    # Cada primitiva es UNA transacción (BEGIN IMMEDIATE): transiciones +
+    # status_event + limpieza de task_suspension, o nada. Los `reason` los
+    # decide el motor (textos fijos); Store nunca recibe datos de Claude.
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # CAPACITY-RESUME-EXECUTION-002 CORRECTION-002: inicio ATÓMICO de tarea.
+    # ------------------------------------------------------------------
+
+    def _insert_task_locked(
+        self, task_id: str, project_id: str, title: str, need_text: str, now: str
+    ) -> None:
+        """Proyecto existente y task_id nuevo (o StoreError) + INSERT en
+        BACKLOG. DENTRO de _write_transaction()."""
+        with closing(self._conn.cursor()) as cur:
+            cur.execute("SELECT 1 FROM project WHERE id = ?", (project_id,))
+            if cur.fetchone() is None:
+                raise StoreError(f"cannot create task: project {project_id!r} does not exist")
+            try:
+                cur.execute(
+                    _INSERT_TASK_SQL,
+                    (task_id, project_id, title, need_text, INITIAL_STATE, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(f"task {task_id!r} already exists") from exc
+
+    def _insert_initial_event_locked(self, task_id: str, now: str) -> None:
+        """Evento inicial NULL -> BACKLOG (misma convención que create_task).
+        DENTRO de _write_transaction()."""
+        with closing(self._conn.cursor()) as cur:
+            cur.execute(
+                _INSERT_INITIAL_EVENT_SQL,
+                (task_id, INITIAL_STATE, _TASK_CREATED_REASON, _TASK_CREATED_ACTOR, now),
+            )
+
+    def create_and_start_task(
+        self,
+        task_id: str,
+        project_id: str,
+        title: str,
+        need_text: str,
+        *,
+        specification_reason: str,
+        developing_reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """ATÓMICO (una transacción BEGIN IMMEDIATE): crea una tarea NUEVA y la
+        avanza hasta DEVELOPING:
+
+            (nada) -> BACKLOG -> SPECIFICATION -> DEVELOPING
+
+        con los tres status_event (NULL->BACKLOG "task created"/"system", y las
+        dos transiciones con los motivos y el actor recibidos, validadas por la
+        máquina de estados). Exige proyecto existente y task_id inexistente
+        (dos intentos concurrentes: solo uno gana). Ante CUALQUIER fallo en
+        cualquier punto se hace rollback de TODA la tarea: no queda ni task ni
+        status_event, así que el mismo task_id puede reutilizarse. El proyecto
+        es una entidad independiente y nunca se toca. `create_task` conserva su
+        semántica pública (solo BACKLOG). No recibe ni persiste nada de Claude
+        ni del Task Packet más allá de title/need_text que decide el llamador."""
+        validate_id(task_id, "task_id")
+        validate_id(project_id, "project_id")
+        title_text = _require_text(title, "title")
+        need = _require_text(need_text, "need_text")
+        specification_text, actor_text = _validate_reason_actor(specification_reason, actor)
+        developing_text, _actor = _validate_reason_actor(developing_reason, actor)
+        now = _utcnow()
+        with self._write_transaction():
+            self._insert_task_locked(task_id, project_id, title_text, need, now)
+            self._insert_initial_event_locked(task_id, now)
+            validate_transition(INITIAL_STATE, STATE_SPECIFICATION)
+            self._transition_locked(
+                task_id, INITIAL_STATE, STATE_SPECIFICATION, specification_text, actor_text
+            )
+            validate_transition(STATE_SPECIFICATION, STATE_DEVELOPING)
+            self._transition_locked(
+                task_id, STATE_SPECIFICATION, STATE_DEVELOPING, developing_text, actor_text
+            )
+        result = self.get_task(task_id)
+        assert result is not None
+        return result
+
+    def _require_task_status_locked(self, task_id: str, expected_status: str) -> None:
+        task = self.get_task(task_id)
+        if task is None:
+            raise StoreError(f"task {task_id!r} does not exist")
+        if task["status"] != expected_status:
+            raise StoreError(
+                f"task {task_id!r} must be in status {expected_status!r} "
+                f"(found {task['status']!r})"
+            )
+
+    def _advance_to_human_gate_locked(self, task_id: str, reason: str, actor: str) -> None:
+        """DEVELOPING -> AUTOMATED_TEST -> TECHNICAL_REVIEW -> SECURITY_REVIEW
+        -> HUMAN_GATE, validando cada paso con la máquina de estados y
+        escribiendo un status_event por transición. DENTRO de una transacción."""
+        current = STATE_DEVELOPING
+        for target in _HUMAN_GATE_CHAIN:
+            validate_transition(current, target)
+            self._transition_locked(task_id, current, target, reason, actor)
+            current = target
+
+    def _delete_suspension_locked(self, task_id: str) -> None:
+        with closing(self._conn.cursor()) as cur:
+            cur.execute("DELETE FROM task_suspension WHERE task_id = ?", (task_id,))
+            if cur.rowcount != 1:
+                raise StoreError(f"suspension for task {task_id!r} was not deleted")
+
+    def complete_fresh_task(self, task_id: str, *, reason: str, actor: str) -> dict[str, Any]:
+        """ATÓMICO: DEVELOPING -> ... -> HUMAN_GATE de una tarea FRESCA (sin
+        suspensión: si existiera alguna, StoreError; no hay nada que
+        borrar). Cualquier fallo a mitad -> rollback completo."""
+        validate_id(task_id, "task_id")
+        reason_text, actor_text = _validate_reason_actor(reason, actor)
+        with self._write_transaction():
+            self._require_task_status_locked(task_id, STATE_DEVELOPING)
+            if self._fetch_suspension(task_id) is not None:
+                raise StoreError(
+                    f"task {task_id!r} has a suspension: use complete_resumed_task"
+                )
+            self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
+        result = self.get_task(task_id)
+        assert result is not None
+        return result
+
+    def complete_resumed_task(self, task_id: str, *, reason: str, actor: str) -> dict[str, Any]:
+        """ATÓMICO: DEVELOPING -> ... -> HUMAN_GATE de una tarea REANUDADA
+        (exige suspensión existente) + eliminación de task_suspension."""
+        validate_id(task_id, "task_id")
+        reason_text, actor_text = _validate_reason_actor(reason, actor)
+        with self._write_transaction():
+            self._require_task_status_locked(task_id, STATE_DEVELOPING)
+            if self._fetch_suspension(task_id) is None:
+                raise StoreError(f"task {task_id!r} has no active suspension")
+            self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
+            self._delete_suspension_locked(task_id)
+        result = self.get_task(task_id)
+        assert result is not None
+        return result
+
+    def block_claimed_resume(self, task_id: str, *, reason: str, actor: str) -> dict[str, Any]:
+        """ATÓMICO: una reanudación YA reclamada (DEVELOPING, con suspensión)
+        termina en BLOCKED + status_event con reason FIJO + eliminación de
+        task_suspension. No toca el repositorio ni las ediciones parciales."""
+        validate_id(task_id, "task_id")
+        reason_text, actor_text = _validate_reason_actor(reason, actor)
+        with self._write_transaction():
+            self._require_task_status_locked(task_id, STATE_DEVELOPING)
+            if self._fetch_suspension(task_id) is None:
+                raise StoreError(f"task {task_id!r} has no active suspension")
+            validate_transition(STATE_DEVELOPING, STATE_BLOCKED)
+            self._transition_locked(
+                task_id, STATE_DEVELOPING, STATE_BLOCKED, reason_text, actor_text
+            )
+            self._delete_suspension_locked(task_id)
+        result = self.get_task(task_id)
+        assert result is not None
+        return result
+
+    def block_waiting_capacity(
+        self, task_id: str, *, reason: str, actor: str
+    ) -> dict[str, Any]:
+        """ATÓMICO: una tarea que TODAVÍA espera capacidad
+        (WAITING_FOR_CLAUDE_CAPACITY, con suspensión) pasa a BLOCKED +
+        status_event + eliminación de task_suspension (p. ej. max_wait
+        agotado antes de reclamar)."""
+        validate_id(task_id, "task_id")
+        reason_text, actor_text = _validate_reason_actor(reason, actor)
+        with self._write_transaction():
+            self._require_task_status_locked(task_id, STATE_WAITING_FOR_CLAUDE_CAPACITY)
+            if self._fetch_suspension(task_id) is None:
+                raise StoreError(f"task {task_id!r} has no active suspension")
+            validate_transition(STATE_WAITING_FOR_CLAUDE_CAPACITY, STATE_BLOCKED)
+            self._transition_locked(
+                task_id,
+                STATE_WAITING_FOR_CLAUDE_CAPACITY,
+                STATE_BLOCKED,
+                reason_text,
+                actor_text,
+            )
+            self._delete_suspension_locked(task_id)
         result = self.get_task(task_id)
         assert result is not None
         return result

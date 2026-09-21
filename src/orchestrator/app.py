@@ -8,12 +8,15 @@ transición de estado y consultar su historial.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable
 
 from . import evidence as evidence_mod
 from . import sandbox as sandbox_mod
@@ -21,6 +24,7 @@ from . import task_packet as task_packet_mod
 from . import test_runner as test_runner_mod
 from .adapters.claude_code import (
     HANDSHAKE_PROMPT,
+    ClaudeFailureCategory,
     DeveloperExecutionError,
     prepare_sandbox_files,
     run_developer_task,
@@ -59,6 +63,62 @@ MANDATORY_TEST_TIMEOUT_SECONDS = 300
 STATE_HUMAN_GATE = "HUMAN_GATE"
 STATE_BLOCKED = "BLOCKED"
 HUMAN_GATE_FUNCTIONAL_TEST = "HUMAN_FUNCTIONAL_TEST"
+
+# CAPACITY-RESUME-EXECUTION-002: flujo PERSISTIDO (run-task/resume-capacity).
+# Códigos de salida de los comandos nuevos (task-execution-probe conserva
+# exactamente los suyos: 0 solo en HUMAN_GATE, 1 en cualquier otro caso).
+STATE_WAITING_FOR_CLAUDE_CAPACITY = "WAITING_FOR_CLAUDE_CAPACITY"
+EXIT_HUMAN_GATE = 0
+EXIT_BLOCKED_OR_ERROR = 1
+EXIT_WAITING_FOR_CAPACITY = 10
+
+# Actor y motivos de status_event: textos FIJOS del motor. Jamás se persiste
+# el mensaje de DeveloperExecutionError, stdout, stderr, result, session_id,
+# usage, modelUsage ni el prompt.
+PERSISTED_ACTOR = "orchestrator"
+_REASON_SPECIFICATION = "run-task: task specification accepted"
+_REASON_DEVELOPING = "run-task: development started"
+_REASON_COMPLETED = "pipeline completed: technical and security checks passed"
+_REASON_RESUME_COMPLETED = "resumed pipeline completed: technical and security checks passed"
+_REASON_PIPELINE_BLOCKED = "blocked: developer execution or pipeline check failed"
+_REASON_SUSPENDED = "waiting for Claude capacity: CLAUDE_TEMPORARY_LIMIT"
+_REASON_CLAIMED = "capacity resume claimed"
+_REASON_LIMIT_REACHED = "blocked: capacity wait limit reached"
+_REASON_AUTO_WAIT_DISABLED = "blocked: capacity auto wait is disabled"
+_REASON_INVALID_RECORD = "blocked: invalid capacity suspension record"
+_REASON_SUSPENSION_MISSING = "blocked: capacity suspension record missing"
+_REASON_IDENTITY_CHANGED = "blocked: task or policy identity changed during the wait"
+_REASON_CONTINUITY_BROKEN = "blocked: working tree continuity could not be proven"
+_REASON_SCOPE_INVALID = "blocked: scope or security check failed before resume"
+_REASON_VERIFICATION_FAILED = "blocked: resume verification failed"
+_REASON_UNEXPECTED_ERROR = "blocked: unexpected error during resume"
+_PUBLIC_REASON_SUSPENDED = (
+    "waiting for Claude capacity after a temporary limit signal; "
+    "resume with resume-capacity"
+)
+_PUBLIC_REASON_NOT_DUE = "retry not due"
+
+
+def _now_utc() -> datetime:
+    """Reloj UTC del motor, timezone-aware. Único punto de lectura de la hora
+    en el flujo persistido: los tests lo parchean para no esperar de verdad."""
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    """ISO-8601 UTC con microsegundos SIEMPRE presentes (ordenable sin
+    ambigüedad)."""
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _parse_utc(value: Any) -> datetime:
+    """Parsea un timestamp persistido; exige zona horaria. ValueError si no."""
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a string")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone offset")
+    return parsed
 
 # TASK-EXECUTION-003: frontera de responsabilidad Developer/Orchestrator.
 # Reglas FIJAS del motor de ejecución (nunca derivadas del contenido del
@@ -145,17 +205,25 @@ def cmd_init_storage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_registration_fields(project_id: str, rules: dict) -> dict[str, Any]:
+    """ÚNICA representación de un proyecto para Store.register_project:
+    la usan `register-project` y el flujo persistido (`run-task`), para no
+    crear una segunda convención."""
+    return {
+        "name": rules.get("name", project_id),
+        "repo_path": rules["repo_path"],
+        "rules_ref": str(_resolve_project_rules_path(project_id)),
+    }
+
+
 def cmd_register_project(args: argparse.Namespace) -> int:
     _require_core_config()
     rules = _require_project_rules(args.project_id)
     db_path = _ensure_within_repo(Path(args.db_path))
-    rules_path = _resolve_project_rules_path(args.project_id)
     with Store(db_path) as store:
         store.register_project(
             project_id=args.project_id,
-            name=rules.get("name", args.project_id),
-            repo_path=rules["repo_path"],
-            rules_ref=str(rules_path),
+            **_project_registration_fields(args.project_id, rules),
         )
     print(f"project {args.project_id} registered")
     return 0
@@ -419,6 +487,20 @@ def _git_path_report(change_evidence: evidence_mod.GitChangeEvidence) -> dict[st
     }
 
 
+@dataclass(frozen=True)
+class CapacityFailure:
+    """CAPACITY-RESUME-EXECUTION-002: contexto que execute_task_packet
+    entrega al `capacity_hook` cuando el Developer falla con
+    CLAUDE_TEMPORARY_LIMIT y la evidencia Git post-fallo es válida.
+    `scope_ok` resume HEAD sin cambios + sin out-of-scope + sin forbidden
+    (mismas reglas que la evidencia PRE/POST-TEST). No lleva NADA de Claude."""
+
+    packet: TaskPacket
+    before: evidence_mod.GitEvidenceSnapshot
+    evidence: evidence_mod.GitChangeEvidence
+    scope_ok: bool
+
+
 def execute_task_packet(
     packet: TaskPacket,
     *,
@@ -427,6 +509,9 @@ def execute_task_packet(
     permissions: dict[str, Any],
     orchestrator_repo_root: Path,
     mandatory_test_timeout: int,
+    before: evidence_mod.GitEvidenceSnapshot | None = None,
+    resume: bool = False,
+    capacity_hook: Callable[[CapacityFailure], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """TASK-EXECUTION-002: compone el flujo mínimo seguro --
 
@@ -449,7 +534,20 @@ def execute_task_packet(
     estructurado con state=BLOCKED -- nunca en una excepción sin controlar
     ni en un éxito silencioso. Solo si TODAS las capas pasan se alcanza
     state=HUMAN_GATE/human_gate=HUMAN_FUNCTIONAL_TEST, siempre con
-    commit_performed=False."""
+    commit_performed=False.
+
+    CAPACITY-RESUME-EXECUTION-002 (parámetros keyword-only OPCIONALES; sin
+    ellos el comportamiento es EXACTAMENTE el de siempre y no hay Store):
+    - `before`: el Git BEFORE ORIGINAL ya capturado (fresco) o reconstruido
+      (resume). Es el ÚNICO baseline de toda la tarea: nunca se captura otro.
+    - `resume`: True reanuda sobre ediciones parciales autorizadas -- no se
+      exige árbol limpio y el Developer recibe la nota fija de reanudación.
+    - `capacity_hook`: si el Developer falla con CLAUDE_TEMPORARY_LIMIT y la
+      evidencia post-fallo es válida, el hook decide si la tarea queda en
+      espera (devuelve los campos del resultado) o si sigue el BLOQUEO
+      normal (devuelve None). execute_task_packet no conoce Store."""
+    if resume and before is None:
+        raise ValueError("resume requires the original BEFORE snapshot")
 
     def _blocked(reason: str, **overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
@@ -491,12 +589,17 @@ def execute_task_packet(
     # snapshot `before` -- nunca uno nuevo capturado después de Claude o
     # después de los mandatory tests -- es la base de AMBAS evaluaciones
     # de evidencia (PRE-TEST y POST-TEST) más abajo.
-    try:
-        before = evidence_mod.capture_snapshot(project_root, authorized_root=project_root)
-    except EvidenceError as exc:
-        return _blocked(f"git BEFORE snapshot failed: {exc}")
+    if before is None:
+        try:
+            before = evidence_mod.capture_snapshot(project_root, authorized_root=project_root)
+        except EvidenceError as exc:
+            return _blocked(f"git BEFORE snapshot failed: {exc}")
 
-    if not before.is_clean:
+    # Ejecución FRESCA (con o sin BEFORE precapturado): árbol limpio, o STOP.
+    # En resume el BEFORE original YA representa el estado limpio original y
+    # el working tree contiene, a propósito, las ediciones parciales
+    # autorizadas: su continuidad la demostró la huella ANTES de llegar aquí.
+    if not resume and not before.is_clean:
         return _blocked("working tree is not clean before developer execution")
 
     # 7-8. developer instruction determinista (13 campos + gobernanza fija +
@@ -508,6 +611,7 @@ def execute_task_packet(
             prompt=instruction,
             cwd=project_root,
             authorized_root=project_root,
+            resume=resume,
         )
     except DeveloperExecutionError as exc:
         # TASK-EXECUTION-004: Claude fue REALMENTE invocado y falló
@@ -555,12 +659,37 @@ def execute_task_packet(
                 head_unchanged=False,
                 **failure_fields,
             )
-        return _blocked(
-            f"developer execution failed: {exc}; post-failure Git evidence captured",
-            head_unchanged=not post_failure_change_evidence.head_changed,
+        blocked_fields: dict[str, Any] = {
+            "head_unchanged": not post_failure_change_evidence.head_changed,
             **failure_fields,
             **_git_path_report(post_failure_change_evidence),
-        )
+        }
+        reason = f"developer execution failed: {exc}; post-failure Git evidence captured"
+
+        # CAPACITY-RESUME-EXECUTION-002: SOLO CLAUDE_TEMPORARY_LIMIT, con
+        # evidencia Git válida, puede pasar por el hook (que decide con el
+        # scope/security ya evaluado). Cualquier otra categoría, o un hook
+        # que devuelve None, sigue el BLOQUEO normal de siempre.
+        if (
+            capacity_hook is not None
+            and exc.category is ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT
+        ):
+            scope_ok, _scope_reason = _evaluate_scope_security(
+                post_failure_change_evidence, forbidden_files=packet.forbidden_files
+            )
+            waiting_fields = capacity_hook(
+                CapacityFailure(
+                    packet=packet,
+                    before=before,
+                    evidence=post_failure_change_evidence,
+                    scope_ok=scope_ok,
+                )
+            )
+            if waiting_fields is not None:
+                waiting_fields = dict(waiting_fields)
+                reason = waiting_fields.pop("reason")
+                blocked_fields.update(waiting_fields)
+        return _blocked(reason, **blocked_fields)
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
     # (HEAD unchanged, scope, forbidden_files). Debe pasar ANTES de
@@ -726,6 +855,581 @@ def cmd_task_execution_probe(args: argparse.Namespace) -> int:
     return 0 if result["state"] == STATE_HUMAN_GATE else 1
 
 
+# ============================================================
+# CAPACITY-RESUME-EXECUTION-002: flujo PERSISTIDO.
+#
+# `run-task` y `resume-capacity` reutilizan execute_task_packet (sin duplicar
+# el pipeline) y persisten en Store. `task-execution-probe` NO cambia: sigue
+# siendo STATELESS (sin Store ni DB). No hay sleep, worker, scheduler ni
+# reintento periódico: `resume-capacity` solo actúa cuando alguien lo invoca.
+# ============================================================
+
+
+class IdentityError(Exception):
+    """Un archivo de identidad (PROJECT_RULES/PERMISSIONS) cambió mientras se
+    cargaba: la identidad no puede demostrarse. Falla cerrado."""
+
+
+class _ResumeBlocked(Exception):
+    """Una verificación de reanudación falló: la tarea reclamada termina en
+    BLOCKED con un motivo FIJO del motor (nunca texto de Claude)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    """SHA-256 de los BYTES CRUDOS de un archivo."""
+    try:
+        return _sha256_hex(path.read_bytes())
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path.name}: {type(exc).__name__}") from exc
+
+
+def _load_packet_with_identity(packet_path: Path) -> tuple[TaskPacket, str]:
+    """Lee los bytes del Task Packet UNA sola vez, calcula su SHA-256 y
+    parsea EXACTAMENTE esos mismos bytes (sin segunda lectura)."""
+    try:
+        data = packet_path.read_bytes()
+    except OSError as exc:
+        raise TaskPacketError(f"cannot read task packet file: {type(exc).__name__}") from exc
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TaskPacketError("task packet file is not valid UTF-8") from exc
+    return task_packet_mod.load_task_packet_from_yaml_text(text), _sha256_hex(data)
+
+
+def _load_project_rules_with_identity(project_id: str) -> tuple[dict, str]:
+    """Su loader lee por path: hash ANTES, carga, hash DESPUÉS; deben ser
+    iguales (si el archivo cambió durante la carga -> IdentityError)."""
+    rules_path = _resolve_project_rules_path(project_id)
+    hash_before = _file_sha256(rules_path)
+    rules = _require_project_rules(project_id)
+    hash_after = _file_sha256(rules_path)
+    if hash_before != hash_after:
+        raise IdentityError("PROJECT_RULES.yaml changed while it was being loaded")
+    return rules, hash_after
+
+
+def _load_core_config_with_identity() -> tuple[OrchestratorConfig, str]:
+    """Igual para PERMISSIONS.yaml. AGENTS.yaml y POLICIES.yaml NO se hashean
+    deliberadamente: la política de espera puede ajustarse legítimamente."""
+    permissions_path = CONFIG_DIR / "PERMISSIONS.yaml"
+    hash_before = _file_sha256(permissions_path)
+    config = _require_core_config()
+    hash_after = _file_sha256(permissions_path)
+    if hash_before != hash_after:
+        raise IdentityError("PERMISSIONS.yaml changed while it was being loaded")
+    return config, hash_after
+
+
+def _validate_relative_packet_path(value: Any) -> str:
+    """Ruta RELATIVA, POSIX, sin '..', sin absolutas ni unidades de Windows."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise CliError("invalid task packet path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if posix.is_absolute() or ".." in posix.parts or windows.drive or windows.root:
+        raise CliError("invalid task packet path")
+    return posix.as_posix()
+
+
+def _relative_packet_path(resolved: Path) -> str:
+    """Ruta del packet relativa al repo del orquestador (formato POSIX), a
+    partir de una ruta YA confinada por _ensure_within_repo."""
+    try:
+        relative = resolved.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise CliError("task packet must be inside the orchestrator repository") from exc
+    return _validate_relative_packet_path(relative.as_posix())
+
+
+def _resolve_persisted_packet_path(relative: str) -> Path:
+    """Vuelve a resolver la ruta persistida BAJO el repo del orquestador,
+    con el mismo confinamiento que el resto de la CLI."""
+    valid = _validate_relative_packet_path(relative)
+    return _ensure_within_repo(REPO_ROOT.joinpath(*PurePosixPath(valid).parts))
+
+
+def _capacity_wait_config(config: OrchestratorConfig) -> dict[str, Any] | None:
+    """Bloque developer.capacity_wait de la config ACTUAL (None = ausente =
+    espera automática desactivada)."""
+    developer = config.agents.get("agents", {}).get("developer", {})
+    block = developer.get("capacity_wait")
+    return block if isinstance(block, dict) else None
+
+
+def _persisted_blocked_result(
+    task_id: str, project_id: str, reason: str, **extra: Any
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "task_id": task_id,
+        "project_id": project_id,
+        "state": STATE_BLOCKED,
+        "human_gate": None,
+        "developer_completed": False,
+        "commit_performed": False,
+        "reason": reason,
+    }
+    result.update(extra)
+    return result
+
+
+def _capacity_public_fields(
+    capacity_wait: dict[str, Any], count: int, started_at: str, next_retry_at: str
+) -> dict[str, Any]:
+    return {
+        "capacity_wait_count": count,
+        "capacity_wait_started_at": started_at,
+        "next_retry_at": next_retry_at,
+        "capacity_wait_max_attempts": capacity_wait["max_attempts"],
+        "capacity_wait_max_seconds": capacity_wait["max_wait_seconds"],
+    }
+
+
+_SUSPENSION_IDENTITY_KEYS = (
+    "task_packet_path",
+    "task_packet_sha256",
+    "project_rules_sha256",
+    "permissions_sha256",
+    "baseline_head_sha",
+    "baseline_branch",
+)
+
+
+def _make_capacity_hook(
+    *,
+    store: Store,
+    task_id: str,
+    capacity_wait: dict[str, Any] | None,
+    identity: dict[str, str],
+    existing: dict[str, Any] | None,
+) -> Callable[[CapacityFailure], dict[str, Any] | None]:
+    """Hook que execute_task_packet invoca ante CLAUDE_TEMPORARY_LIMIT con
+    evidencia Git válida. Devuelve los campos del resultado WAITING tras
+    persistir la suspensión de forma ATÓMICA (suspend_for_capacity), o None
+    (el bloqueo normal) si CUALQUIER condición falla: auto_wait desactivado,
+    scope/security/HEAD inválidos, huella no capturable, branch cambiada,
+    límite de suspensiones o de espera superado, o Store no disponible.
+
+    `existing` es la suspensión previa (reanudación) o None (primera). En una
+    suspensión posterior, la identidad y capacity_wait_started_at ORIGINALES
+    se conservan tal cual: la espera nunca se reinicia."""
+
+    def hook(failure: CapacityFailure) -> dict[str, Any] | None:
+        if capacity_wait is None or capacity_wait.get("auto_wait") is not True:
+            return None
+        if not failure.scope_ok:
+            return None
+        try:
+            fingerprint = evidence_mod.capture_working_tree_fingerprint(
+                failure.before, failure.packet.authorized_files
+            )
+        except EvidenceError:
+            return None
+        if fingerprint.head_sha != failure.before.head_sha:
+            return None
+        if fingerprint.branch != failure.before.branch:
+            return None
+
+        try:
+            now = _now_utc()
+            if existing is None:
+                next_count = 1
+                started_iso = _iso_utc(now)
+                started_at = now
+            else:
+                next_count = existing["capacity_wait_count"] + 1
+                started_iso = existing["capacity_wait_started_at"]
+                started_at = _parse_utc(started_iso)
+            # max_attempts = N significa N SUSPENSIONES permitidas: la
+            # suspensión N+1 termina en BLOCKED.
+            if next_count > capacity_wait["max_attempts"]:
+                return None
+            if (now - started_at).total_seconds() >= capacity_wait["max_wait_seconds"]:
+                return None
+            next_retry_iso = _iso_utc(
+                now + timedelta(seconds=capacity_wait["retry_interval_seconds"])
+            )
+            store.suspend_for_capacity(
+                task_id,
+                reason=_REASON_SUSPENDED,
+                actor=PERSISTED_ACTOR,
+                working_tree_fingerprint=fingerprint.fingerprint,
+                touched_paths=list(fingerprint.touched_paths),
+                capacity_wait_count=next_count,
+                capacity_wait_started_at=started_iso,
+                next_retry_at=next_retry_iso,
+                **identity,
+            )
+        except (StoreError, StateMachineError, ValueError, KeyError, TypeError):
+            return None
+
+        return {
+            "state": STATE_WAITING_FOR_CLAUDE_CAPACITY,
+            "reason": _PUBLIC_REASON_SUSPENDED,
+            **_capacity_public_fields(capacity_wait, next_count, started_iso, next_retry_iso),
+        }
+
+    return hook
+
+
+def _register_persisted_task(store: Store, packet: TaskPacket, project_rules: dict) -> None:
+    """Registra proyecto y tarea y lleva la tarea a DEVELOPING, ANTES de
+    invocar a Claude. Task existente -> FAIL CLOSED (no se reutiliza, ni se
+    resetea, ni se borra). Proyecto existente incompatible -> FAIL CLOSED sin
+    modificarlo."""
+    if store.get_task(packet.task_id) is not None:
+        raise CliError(
+            f"task {packet.task_id!r} already exists; "
+            "a new independent execution requires a new task_id"
+        )
+    fields = _project_registration_fields(packet.project_id, project_rules)
+    project = store.get_project(packet.project_id)
+    if project is None:
+        store.register_project(project_id=packet.project_id, **fields)
+    else:
+        for key, value in fields.items():
+            if project[key] != value:
+                raise CliError(
+                    f"persisted project {packet.project_id!r} is incompatible with the "
+                    f"current PROJECT_RULES ({key} differs); refusing to modify it"
+                )
+    # Creación + BACKLOG -> SPECIFICATION -> DEVELOPING en UNA transacción: si
+    # algo falla no queda ni task ni status_event (el task_id sigue libre).
+    # title/need_text FIJOS: el contenido del Task Packet (que viaja en el
+    # prompt) nunca se copia a la DB. El proyecto ya registrado permanece.
+    store.create_and_start_task(
+        packet.task_id,
+        packet.project_id,
+        packet.task_id,
+        f"persisted execution of Task Packet {packet.task_id}",
+        specification_reason=_REASON_SPECIFICATION,
+        developing_reason=_REASON_DEVELOPING,
+        actor=PERSISTED_ACTOR,
+    )
+
+
+def _emit(result: dict[str, Any]) -> None:
+    print(json.dumps(result, indent=2))
+
+
+def cmd_run_task(args: argparse.Namespace) -> int:
+    """Ejecución PERSISTIDA de un Task Packet. Toda validación ocurre ANTES
+    de invocar a Claude; el Git BEFORE original se captura una sola vez y es
+    el baseline de TODA la tarea. Salida: HUMAN_GATE 0, BLOCKED/error 1,
+    WAITING_FOR_CLAUDE_CAPACITY 10."""
+    config, permissions_sha = _load_core_config_with_identity()
+    packet_path = _ensure_within_repo(Path(args.task_packet_path))
+    packet, packet_sha = _load_packet_with_identity(packet_path)
+    relative_path = _relative_packet_path(packet_path)
+    project_rules, rules_sha = _load_project_rules_with_identity(packet.project_id)
+    developer_config = config.agents.get("agents", {}).get("developer", {})
+    db_path = _ensure_within_repo(Path(args.db_path))
+
+    project_root = resolve_project_root(
+        project_rules,
+        project_id=packet.project_id,
+        orchestrator_repo_root=REPO_ROOT,
+    )
+    before = evidence_mod.capture_snapshot(project_root, authorized_root=project_root)
+    if not before.is_clean:
+        # Sin escrituras en la DB: nada se registró y Claude no se invoca.
+        _emit(
+            _persisted_blocked_result(
+                packet.task_id,
+                packet.project_id,
+                "working tree is not clean before developer execution",
+            )
+        )
+        return EXIT_BLOCKED_OR_ERROR
+
+    identity = {
+        "task_packet_path": relative_path,
+        "task_packet_sha256": packet_sha,
+        "project_rules_sha256": rules_sha,
+        "permissions_sha256": permissions_sha,
+        "baseline_head_sha": before.head_sha,
+        "baseline_branch": before.branch,
+    }
+    with Store(db_path) as store:
+        _register_persisted_task(store, packet, project_rules)
+        hook = _make_capacity_hook(
+            store=store,
+            task_id=packet.task_id,
+            capacity_wait=_capacity_wait_config(config),
+            identity=identity,
+            existing=None,
+        )
+        try:
+            result = execute_task_packet(
+                packet,
+                project_rules=project_rules,
+                developer_config=developer_config,
+                permissions=config.permissions,
+                orchestrator_repo_root=REPO_ROOT,
+                mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
+                before=before,
+                capacity_hook=hook,
+            )
+        except Exception:
+            _block_developing_best_effort(store, packet.task_id)
+            raise
+        exit_code = _finish_fresh_task(store, packet.task_id, result)
+    _emit(result)
+    return exit_code
+
+
+def _block_developing_best_effort(store: Store, task_id: str) -> None:
+    try:
+        store.transition_task(task_id, STATE_BLOCKED, _REASON_UNEXPECTED_ERROR, PERSISTED_ACTOR)
+    except Exception:  # noqa: BLE001 - la excepción original es la que importa
+        pass
+
+
+def _finish_fresh_task(store: Store, task_id: str, result: dict[str, Any]) -> int:
+    """Sincroniza el estado persistido con el resultado de una ejecución
+    FRESCA (la tarea sigue en DEVELOPING mientras el pipeline trabaja)."""
+    state = result["state"]
+    if state == STATE_HUMAN_GATE:
+        store.complete_fresh_task(task_id, reason=_REASON_COMPLETED, actor=PERSISTED_ACTOR)
+        return EXIT_HUMAN_GATE
+    if state == STATE_WAITING_FOR_CLAUDE_CAPACITY:
+        return EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la suspensión
+    store.transition_task(task_id, STATE_BLOCKED, _REASON_PIPELINE_BLOCKED, PERSISTED_ACTOR)
+    return EXIT_BLOCKED_OR_ERROR
+
+
+def _block_waiting_and_emit(store: Store, task: dict[str, Any], reason: str) -> int:
+    store.block_waiting_capacity(task["id"], reason=reason, actor=PERSISTED_ACTOR)
+    _emit(_persisted_blocked_result(task["id"], task["project_id"], reason))
+    return EXIT_BLOCKED_OR_ERROR
+
+
+def cmd_resume_capacity(args: argparse.Namespace) -> int:
+    """Reanuda UNA tarea en WAITING_FOR_CLAUDE_CAPACITY. Solo actúa cuando se
+    invoca (sin sleep ni worker). Todo se recupera de SQLite + archivos
+    actuales + Git: no se pide de nuevo ni el packet ni el repo ni hashes."""
+    task_id = validate_id(args.task_id, "task_id")
+    config = _require_core_config()
+    capacity_wait = _capacity_wait_config(config)
+    db_path = _ensure_within_repo(Path(args.db_path))
+
+    with Store(db_path) as store:
+        task = store.get_task(task_id)
+        if task is None:
+            raise CliError(f"task {task_id!r} not found")
+        if task["status"] != STATE_WAITING_FOR_CLAUDE_CAPACITY:
+            raise CliError(
+                f"task {task_id!r} is not waiting for Claude capacity (status {task['status']!r})"
+            )
+        suspension = store.get_suspension(task_id)
+        if suspension is None:
+            # Inconsistencia persistente del orquestador (WAITING sin
+            # suspensión): nunca se deja la tarea atrapada en WAITING, no se
+            # invoca a Claude y NO se reconstruye ni se infiere ninguna
+            # identidad. Se cierra con la transición existente
+            # WAITING -> BLOCKED (state machine + status_event, motivo FIJO);
+            # no hay fila que borrar. Si otro proceso cambió el estado entre
+            # la lectura y la transición, esta falla cerrado (StoreError).
+            store.transition_task(
+                task_id, STATE_BLOCKED, _REASON_SUSPENSION_MISSING, PERSISTED_ACTOR
+            )
+            _emit(
+                _persisted_blocked_result(
+                    task_id, task["project_id"], _REASON_SUSPENSION_MISSING
+                )
+            )
+            return EXIT_BLOCKED_OR_ERROR
+
+        # --- PRE-CLAIM: nada de Claude ni de reclamar hasta pasar todo ---
+        try:
+            started_at = _parse_utc(suspension["capacity_wait_started_at"])
+            next_retry_at = _parse_utc(suspension["next_retry_at"])
+            count = suspension["capacity_wait_count"]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                raise ValueError("invalid capacity_wait_count")
+        except (ValueError, KeyError, TypeError):
+            return _block_waiting_and_emit(store, task, _REASON_INVALID_RECORD)
+
+        now = _now_utc()
+        if capacity_wait is None or capacity_wait.get("auto_wait") is not True:
+            return _block_waiting_and_emit(store, task, _REASON_AUTO_WAIT_DISABLED)
+        # max_attempts = N permite N suspensiones: count == N todavía se
+        # reanuda; count > N es una política excedida (inconsistencia).
+        if count > capacity_wait["max_attempts"]:
+            return _block_waiting_and_emit(store, task, _REASON_LIMIT_REACHED)
+        if (now - started_at).total_seconds() >= capacity_wait["max_wait_seconds"]:
+            return _block_waiting_and_emit(store, task, _REASON_LIMIT_REACHED)
+        if now < next_retry_at:
+            # No se reclama, no se invoca a Claude, no se modifica la DB.
+            _emit(
+                {
+                    "task_id": task_id,
+                    "project_id": task["project_id"],
+                    "state": STATE_WAITING_FOR_CLAUDE_CAPACITY,
+                    "human_gate": None,
+                    "developer_completed": False,
+                    "commit_performed": False,
+                    "reason": _PUBLIC_REASON_NOT_DUE,
+                    **_capacity_public_fields(
+                        capacity_wait,
+                        count,
+                        suspension["capacity_wait_started_at"],
+                        suspension["next_retry_at"],
+                    ),
+                }
+            )
+            return EXIT_WAITING_FOR_CAPACITY
+
+        # --- CLAIM ATÓMICO: solo un proceso puede ganar (el perdedor recibe
+        # StoreError y NUNCA llega a Claude) ---
+        store.claim_capacity_resume(task_id, reason=_REASON_CLAIMED, actor=PERSISTED_ACTOR)
+        return _run_claimed_resume(store, task, suspension)
+
+
+def _execute_claimed_resume(
+    store: Store, task: dict[str, Any], suspension: dict[str, Any]
+) -> dict[str, Any]:
+    """Tras el claim y ANTES de Claude: revalida identidad, continuidad y
+    scope. Cualquier fallo -> _ResumeBlocked (motivo fijo). Solo si TODO pasa
+    se invoca execute_task_packet en modo resume con el BEFORE ORIGINAL."""
+    task_id = task["id"]
+
+    # Identidad: raw hash de permisos, packet y reglas == los persistidos.
+    config, permissions_sha = _load_core_config_with_identity()
+    if permissions_sha != suspension["permissions_sha256"]:
+        raise _ResumeBlocked(_REASON_IDENTITY_CHANGED)
+    packet_path = _resolve_persisted_packet_path(suspension["task_packet_path"])
+    packet, packet_sha = _load_packet_with_identity(packet_path)
+    if (
+        packet_sha != suspension["task_packet_sha256"]
+        or packet.task_id != task_id
+        or packet.project_id != task["project_id"]
+    ):
+        raise _ResumeBlocked(_REASON_IDENTITY_CHANGED)
+    project_rules, rules_sha = _load_project_rules_with_identity(packet.project_id)
+    if rules_sha != suspension["project_rules_sha256"]:
+        raise _ResumeBlocked(_REASON_IDENTITY_CHANGED)
+
+    # Continuidad: HEAD y branch == baseline; BEFORE ORIGINAL reconstruido
+    # (estado LIMPIO original, no el working tree parcial actual).
+    project_root = resolve_project_root(
+        project_rules, project_id=packet.project_id, orchestrator_repo_root=REPO_ROOT
+    )
+    current = evidence_mod.capture_snapshot(project_root, authorized_root=project_root)
+    if (
+        current.head_sha != suspension["baseline_head_sha"]
+        or current.branch != suspension["baseline_branch"]
+    ):
+        raise _ResumeBlocked(_REASON_CONTINUITY_BROKEN)
+    before = evidence_mod.GitEvidenceSnapshot(
+        repo_root=current.repo_root,
+        authorized_root=current.authorized_root,
+        head_sha=suspension["baseline_head_sha"],
+        branch=suspension["baseline_branch"],
+        is_clean=True,
+        status_entries=(),
+    )
+    fingerprint = evidence_mod.capture_working_tree_fingerprint(before, packet.authorized_files)
+    if fingerprint.fingerprint != suspension["working_tree_fingerprint"]:
+        raise _ResumeBlocked(_REASON_CONTINUITY_BROKEN)
+    try:
+        persisted_paths = json.loads(suspension["touched_paths_json"])
+    except (ValueError, TypeError):
+        raise _ResumeBlocked(_REASON_CONTINUITY_BROKEN) from None
+    if not (
+        isinstance(persisted_paths, list)
+        and all(isinstance(path, str) for path in persisted_paths)
+        and persisted_paths == list(fingerprint.touched_paths)
+    ):
+        raise _ResumeBlocked(_REASON_CONTINUITY_BROKEN)
+
+    # Scope/security desde el baseline ORIGINAL (acumulado sobre la tarea).
+    change = evidence_mod.capture_change_evidence(before, packet.authorized_files)
+    scope_ok, _scope_reason = _evaluate_scope_security(
+        change, forbidden_files=packet.forbidden_files
+    )
+    if not scope_ok:
+        raise _ResumeBlocked(_REASON_SCOPE_INVALID)
+
+    hook = _make_capacity_hook(
+        store=store,
+        task_id=task_id,
+        capacity_wait=_capacity_wait_config(config),
+        identity={key: suspension[key] for key in _SUSPENSION_IDENTITY_KEYS},
+        existing=suspension,
+    )
+    return execute_task_packet(
+        packet,
+        project_rules=project_rules,
+        developer_config=config.agents.get("agents", {}).get("developer", {}),
+        permissions=config.permissions,
+        orchestrator_repo_root=REPO_ROOT,
+        mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
+        before=before,
+        resume=True,
+        capacity_hook=hook,
+    )
+
+
+def _run_claimed_resume(store: Store, task: dict[str, Any], suspension: dict[str, Any]) -> int:
+    task_id = task["id"]
+    block_reason: str | None = None
+    result: dict[str, Any] | None = None
+    try:
+        result = _execute_claimed_resume(store, task, suspension)
+    except _ResumeBlocked as blocked:
+        block_reason = blocked.reason
+    except (
+        ConfigError,
+        TaskPacketError,
+        EvidenceError,
+        IdentityError,
+        CliError,
+        ValueError,
+        OSError,
+    ):
+        block_reason = _REASON_VERIFICATION_FAILED
+    except Exception:
+        # Error inesperado tras el claim: nunca se deja la tarea en DEVELOPING.
+        try:
+            store.block_claimed_resume(
+                task_id, reason=_REASON_UNEXPECTED_ERROR, actor=PERSISTED_ACTOR
+            )
+        except Exception:  # noqa: BLE001 - la excepción original es la que importa
+            pass
+        raise
+
+    if block_reason is not None:
+        store.block_claimed_resume(task_id, reason=block_reason, actor=PERSISTED_ACTOR)
+        _emit(_persisted_blocked_result(task_id, task["project_id"], block_reason))
+        return EXIT_BLOCKED_OR_ERROR
+
+    assert result is not None
+    state = result["state"]
+    if state == STATE_HUMAN_GATE:
+        store.complete_resumed_task(
+            task_id, reason=_REASON_RESUME_COMPLETED, actor=PERSISTED_ACTOR
+        )
+        exit_code = EXIT_HUMAN_GATE
+    elif state == STATE_WAITING_FOR_CLAUDE_CAPACITY:
+        exit_code = EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la nueva suspensión
+    else:
+        store.block_claimed_resume(
+            task_id, reason=_REASON_PIPELINE_BLOCKED, actor=PERSISTED_ACTOR
+        )
+        exit_code = EXIT_BLOCKED_OR_ERROR
+    _emit(result)
+    return exit_code
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     _require_core_config()
     db_path = _ensure_within_repo(Path(args.db_path))
@@ -813,6 +1517,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_packet_path")
     p.set_defaults(func=cmd_task_execution_probe)
 
+    p = sub.add_parser(
+        "run-task",
+        help=(
+            "Ejecución PERSISTIDA de un Task Packet (Store): HUMAN_GATE exit 0, "
+            "BLOCKED/error exit 1, WAITING_FOR_CLAUDE_CAPACITY exit 10"
+        ),
+    )
+    p.add_argument("task_packet_path")
+    p.set_defaults(func=cmd_run_task)
+
+    p = sub.add_parser(
+        "resume-capacity",
+        help="Reanuda una tarea en WAITING_FOR_CLAUDE_CAPACITY (solo cuando se invoca; sin sleep)",
+    )
+    p.add_argument("task_id")
+    p.set_defaults(func=cmd_resume_capacity)
+
     return parser
 
 
@@ -831,6 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
         SandboxError,
         EvidenceError,
         TaskPacketError,
+        IdentityError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

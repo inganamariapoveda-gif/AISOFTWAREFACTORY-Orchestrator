@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -794,6 +795,601 @@ class AtomicClaimTests(SuspensionTestCase):
         self.assertEqual(len(claims), 1)
         self.assertEqual(self.task_status(), "DEVELOPING")
         self.assertIsNotNone(self.store.get_suspension("T-1"))
+
+
+HUMAN_GATE_CHAIN = [
+    ("DEVELOPING", "AUTOMATED_TEST"),
+    ("AUTOMATED_TEST", "TECHNICAL_REVIEW"),
+    ("TECHNICAL_REVIEW", "SECURITY_REVIEW"),
+    ("SECURITY_REVIEW", "HUMAN_GATE"),
+]
+
+
+class AtomicFinalizationTests(SuspensionTestCase):
+    """CAPACITY-RESUME-EXECUTION-002: finalización y bloqueo ATÓMICOS.
+    Cada primitiva es una sola transacción: transiciones + status_event +
+    limpieza de suspensión, o NADA (sin estado sin evento, sin evento sin
+    estado, sin suspensión huérfana)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.make_task()
+
+    def snapshot(self) -> tuple:
+        return (
+            self.store.get_task("T-1"),
+            self.store.get_suspension("T-1"),
+            self.store.get_history("T-1"),
+        )
+
+    def waiting_task(self) -> None:
+        self.store.suspend_for_capacity("T-1", **_suspend_fields())
+
+    def resumed_task(self) -> None:
+        self.waiting_task()
+        self.store.claim_capacity_resume("T-1", reason="resume", actor="orchestrator")
+
+    def fail_on_nth_transition(self, n: int):
+        calls = {"count": 0}
+        real = self.store._transition_locked
+
+        def flaky(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == n:
+                raise StoreError("simulated failure midway")
+            return real(*args, **kwargs)
+
+        self.store._transition_locked = flaky  # type: ignore[method-assign]
+
+    def restore_transition(self) -> None:
+        del self.store._transition_locked
+
+    # ---- tarea FRESCA ----
+
+    def test_complete_fresh_task_writes_the_whole_chain(self) -> None:
+        before_events = len(self.store.get_history("T-1"))
+        task = self.store.complete_fresh_task("T-1", reason="pipeline completed", actor="orchestrator")
+        self.assertEqual(task["status"], "HUMAN_GATE")
+        events = self.store.get_history("T-1")[before_events:]
+        self.assertEqual([(e["from_status"], e["to_status"]) for e in events], HUMAN_GATE_CHAIN)
+        for event in events:
+            self.assertEqual((event["reason"], event["actor"]), ("pipeline completed", "orchestrator"))
+        self.assertIsNone(self.store.get_suspension("T-1"))
+
+    def test_complete_fresh_task_rolls_back_completely_on_a_midway_failure(self) -> None:
+        before = self.snapshot()
+        self.fail_on_nth_transition(3)
+        with self.assertRaises(StoreError):
+            self.store.complete_fresh_task("T-1", reason="r", actor="a")
+        self.restore_transition()
+        self.assertEqual(self.snapshot(), before)  # ni estado ni eventos parciales
+        # y sigue siendo utilizable
+        self.assertEqual(
+            self.store.complete_fresh_task("T-1", reason="r", actor="a")["status"], "HUMAN_GATE"
+        )
+
+    def test_complete_fresh_task_requires_developing_and_no_suspension(self) -> None:
+        self.make_task("T-2", status="BACKLOG")
+        before = self.store.get_history("T-2")
+        with self.assertRaises(StoreError):
+            self.store.complete_fresh_task("T-2", reason="r", actor="a")
+        self.assertEqual(self.store.get_history("T-2"), before)
+        self.store.create_suspension("T-1", **_suspension_fields())  # suspensión inesperada
+        snapshot = self.snapshot()
+        with self.assertRaises(StoreError):
+            self.store.complete_fresh_task("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), snapshot)
+
+    # ---- tarea REANUDADA ----
+
+    def test_complete_resumed_task_writes_the_chain_and_deletes_the_suspension(self) -> None:
+        self.resumed_task()
+        before_events = len(self.store.get_history("T-1"))
+        task = self.store.complete_resumed_task("T-1", reason="resumed pipeline completed", actor="orchestrator")
+        self.assertEqual(task["status"], "HUMAN_GATE")
+        events = self.store.get_history("T-1")[before_events:]
+        self.assertEqual([(e["from_status"], e["to_status"]) for e in events], HUMAN_GATE_CHAIN)
+        self.assertIsNone(self.store.get_suspension("T-1"))
+
+    def test_complete_resumed_task_rolls_back_completely_on_a_midway_failure(self) -> None:
+        self.resumed_task()
+        before = self.snapshot()
+        self.fail_on_nth_transition(4)  # falla en la última transición
+        with self.assertRaises(StoreError):
+            self.store.complete_resumed_task("T-1", reason="r", actor="a")
+        self.restore_transition()
+        self.assertEqual(self.snapshot(), before)  # suspensión intacta, sin eventos
+        self.assertIsNotNone(self.store.get_suspension("T-1"))
+
+    def test_complete_resumed_task_rolls_back_if_the_suspension_cannot_be_deleted(self) -> None:
+        self.resumed_task()
+        before = self.snapshot()
+
+        def boom(task_id):
+            raise StoreError("simulated delete failure")
+
+        self.store._delete_suspension_locked = boom  # type: ignore[method-assign]
+        with self.assertRaises(StoreError):
+            self.store.complete_resumed_task("T-1", reason="r", actor="a")
+        del self.store._delete_suspension_locked
+        self.assertEqual(self.snapshot(), before)  # las 4 transiciones se deshicieron
+
+    def test_complete_resumed_task_requires_developing_and_a_suspension(self) -> None:
+        before = self.snapshot()
+        with self.assertRaises(StoreError):  # DEVELOPING pero sin suspensión
+            self.store.complete_resumed_task("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), before)
+        self.waiting_task()  # WAITING, no DEVELOPING
+        snapshot = self.snapshot()
+        with self.assertRaises(StoreError):
+            self.store.complete_resumed_task("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), snapshot)
+
+    # ---- bloqueo de un resume YA reclamado ----
+
+    def test_block_claimed_resume(self) -> None:
+        self.resumed_task()
+        task = self.store.block_claimed_resume("T-1", reason="blocked: fixed text", actor="orchestrator")
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertIsNone(self.store.get_suspension("T-1"))
+        last = self.store.get_history("T-1")[-1]
+        self.assertEqual(
+            (last["from_status"], last["to_status"], last["reason"]),
+            ("DEVELOPING", "BLOCKED", "blocked: fixed text"),
+        )
+
+    def test_block_claimed_resume_rolls_back_completely_on_a_midway_failure(self) -> None:
+        self.resumed_task()
+        before = self.snapshot()
+
+        def boom(task_id):
+            raise StoreError("simulated delete failure")
+
+        self.store._delete_suspension_locked = boom  # type: ignore[method-assign]
+        with self.assertRaises(StoreError):
+            self.store.block_claimed_resume("T-1", reason="r", actor="a")
+        del self.store._delete_suspension_locked
+        # Ni estado BLOCKED sin evento ni evento sin estado ni suspensión huérfana.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_block_claimed_resume_requires_developing_and_a_suspension(self) -> None:
+        before = self.snapshot()
+        with self.assertRaises(StoreError):  # DEVELOPING sin suspensión
+            self.store.block_claimed_resume("T-1", reason="r", actor="a")
+        self.waiting_task()
+        snapshot = self.snapshot()
+        with self.assertRaises(StoreError):  # WAITING, no reclamada
+            self.store.block_claimed_resume("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), snapshot)
+        self.assertNotEqual(before, snapshot)
+
+    # ---- bloqueo mientras se ESPERA ----
+
+    def test_block_waiting_capacity(self) -> None:
+        self.waiting_task()
+        task = self.store.block_waiting_capacity("T-1", reason="blocked: limit", actor="orchestrator")
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertIsNone(self.store.get_suspension("T-1"))
+        last = self.store.get_history("T-1")[-1]
+        self.assertEqual(
+            (last["from_status"], last["to_status"], last["reason"]),
+            (WAITING, "BLOCKED", "blocked: limit"),
+        )
+
+    def test_block_waiting_capacity_rolls_back_completely_on_a_midway_failure(self) -> None:
+        self.waiting_task()
+        before = self.snapshot()
+
+        def boom(task_id):
+            raise StoreError("simulated delete failure")
+
+        self.store._delete_suspension_locked = boom  # type: ignore[method-assign]
+        with self.assertRaises(StoreError):
+            self.store.block_waiting_capacity("T-1", reason="r", actor="a")
+        del self.store._delete_suspension_locked
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.store.get_task("T-1")["status"], WAITING)
+
+    def test_block_waiting_capacity_requires_waiting_and_a_suspension(self) -> None:
+        before = self.snapshot()
+        with self.assertRaises(StoreError):  # DEVELOPING, no WAITING
+            self.store.block_waiting_capacity("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), before)
+        self.waiting_task()
+        conn = self.store._conn
+        conn.execute("DELETE FROM task_suspension")  # WAITING sin suspensión (inconsistente)
+        conn.commit()
+        snapshot = self.snapshot()
+        with self.assertRaises(StoreError):
+            self.store.block_waiting_capacity("T-1", reason="r", actor="a")
+        self.assertEqual(self.snapshot(), snapshot)
+
+    # ---- comunes ----
+
+    def test_reasons_and_actors_are_validated_and_bounded(self) -> None:
+        self.resumed_task()
+        before = self.snapshot()
+        for method in (
+            self.store.complete_resumed_task,
+            self.store.block_claimed_resume,
+        ):
+            for kwargs in ({"reason": "", "actor": "a"}, {"reason": "x" * 501, "actor": "a"}, {"reason": "r", "actor": ""}):
+                with self.subTest(method=method.__name__, kwargs=kwargs):
+                    with self.assertRaises(StoreError):
+                        method("T-1", **kwargs)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_new_primitives_reject_invalid_ids(self) -> None:
+        for method in (
+            self.store.complete_fresh_task,
+            self.store.complete_resumed_task,
+            self.store.block_claimed_resume,
+            self.store.block_waiting_capacity,
+        ):
+            with self.subTest(method=method.__name__):
+                with self.assertRaises(InvalidIdError):
+                    method("../x", reason="r", actor="a")
+
+    def test_no_terminal_state_ever_keeps_an_orphan_suspension(self) -> None:
+        self.resumed_task()
+        self.store.complete_resumed_task("T-1", reason="r", actor="a")
+        self.make_task("T-2")
+        self.store.suspend_for_capacity("T-2", **_suspend_fields())
+        self.store.block_waiting_capacity("T-2", reason="r", actor="a")
+        self.make_task("T-3")
+        self.store.suspend_for_capacity("T-3", **_suspend_fields())
+        self.store.claim_capacity_resume("T-3", reason="r", actor="a")
+        self.store.block_claimed_resume("T-3", reason="r", actor="a")
+        rows = self.store._conn.execute(
+            "SELECT t.id, t.status FROM task t JOIN task_suspension s ON s.task_id = t.id "
+            "WHERE t.status IN ('HUMAN_GATE', 'BLOCKED')"
+        ).fetchall()
+        self.assertEqual(rows, [])
+
+
+class AtomicTaskStartTests(SuspensionTestCase):
+    """CAPACITY-RESUME-EXECUTION-002 CORRECTION-002: crear una tarea y
+    avanzarla hasta DEVELOPING es UNA transacción. Si algo falla no queda ni
+    task ni status_event, y el mismo task_id puede reutilizarse."""
+
+    KW = {
+        "specification_reason": "specification accepted",
+        "developing_reason": "development started",
+        "actor": "orchestrator",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.register_project("SAMPLE", "Sample", "./projects/SAMPLE", "ref")
+
+    def start(self, task_id: str = "T-1", store=None, **overrides) -> dict:
+        kwargs = {**self.KW, **overrides}
+        return (store or self.store).create_and_start_task(
+            task_id, "SAMPLE", "Title", "fixed need text", **kwargs
+        )
+
+    def row_counts(self, task_id: str = "T-1") -> tuple[int, int]:
+        conn = self.store._conn
+        tasks = conn.execute("SELECT COUNT(*) FROM task WHERE id = ?", (task_id,)).fetchone()[0]
+        events = conn.execute(
+            "SELECT COUNT(*) FROM status_event WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        return tasks, events
+
+    def assert_nothing_persisted(self, task_id: str = "T-1") -> None:
+        self.assertIsNone(self.store.get_task(task_id))
+        self.assertEqual(self.store.get_history(task_id), [])
+        self.assertEqual(self.row_counts(task_id), (0, 0))
+
+    def fail_transition_call(self, n: int):
+        calls = {"count": 0}
+        real = self.store._transition_locked
+
+        def flaky(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == n:
+                raise StoreError("simulated failure midway")
+            return real(*args, **kwargs)
+
+        self.store._transition_locked = flaky  # type: ignore[method-assign]
+
+    def restore(self, name: str) -> None:
+        delattr(self.store, name)
+
+    # ---- éxito ----
+
+    def test_start_creates_the_task_in_developing_with_the_exact_history(self) -> None:
+        task = self.start()
+        self.assertEqual(task["status"], "DEVELOPING")
+        self.assertEqual(task["attempt_count"], 0)
+        events = self.store.get_history("T-1")
+        self.assertEqual(
+            [(e["from_status"], e["to_status"]) for e in events],
+            [(None, "BACKLOG"), ("BACKLOG", "SPECIFICATION"), ("SPECIFICATION", "DEVELOPING")],
+        )
+        self.assertEqual(
+            [(e["reason"], e["actor"]) for e in events],
+            [
+                ("task created", "system"),
+                ("specification accepted", "orchestrator"),
+                ("development started", "orchestrator"),
+            ],
+        )
+        self.assertEqual([e["id"] for e in events], sorted(e["id"] for e in events))
+
+    def test_history_is_equivalent_to_the_previous_three_step_sequence(self) -> None:
+        self.start("NEW-1")
+        self.store.create_task("OLD-1", "SAMPLE", "Title", "fixed need text")
+        self.store.transition_task("OLD-1", "SPECIFICATION", "specification accepted", "orchestrator")
+        self.store.transition_task("OLD-1", "DEVELOPING", "development started", "orchestrator")
+
+        def shape(task_id: str):
+            return [
+                (e["from_status"], e["to_status"], e["reason"], e["actor"])
+                for e in self.store.get_history(task_id)
+            ]
+
+        self.assertEqual(shape("NEW-1"), shape("OLD-1"))
+        new, old = self.store.get_task("NEW-1"), self.store.get_task("OLD-1")
+        for key in ("project_id", "title", "need_text", "status", "attempt_count"):
+            self.assertEqual(new[key], old[key], key)
+
+    def test_create_task_keeps_its_public_semantics(self) -> None:
+        self.store.create_task("T-1", "SAMPLE", "Title", "need")
+        self.assertEqual(self.store.get_task("T-1")["status"], "BACKLOG")
+        events = self.store.get_history("T-1")
+        self.assertEqual(
+            [(e["from_status"], e["to_status"], e["reason"], e["actor"]) for e in events],
+            [(None, "BACKLOG", "task created", "system")],
+        )
+
+    def test_two_different_tasks_start_independently(self) -> None:
+        self.start("T-1")
+        self.start("T-2")
+        self.assertEqual(self.row_counts("T-1"), (1, 3))
+        self.assertEqual(self.row_counts("T-2"), (1, 3))
+
+    # ---- fallos: rollback COMPLETO ----
+
+    def test_failure_after_the_task_insert_leaves_nothing(self) -> None:
+        def boom(task_id, now):
+            raise StoreError("simulated failure after the task insert")
+
+        self.store._insert_initial_event_locked = boom  # type: ignore[method-assign]
+        project_before = self.store.get_project("SAMPLE")
+        with self.assertRaises(StoreError):
+            self.start()
+        self.restore("_insert_initial_event_locked")
+        self.assert_nothing_persisted()
+        self.assertEqual(self.store.get_project("SAMPLE"), project_before)  # proyecto intacto
+
+    def test_failure_after_the_backlog_event_leaves_nothing(self) -> None:
+        self.fail_transition_call(1)  # falla al pasar a SPECIFICATION
+        with self.assertRaises(StoreError):
+            self.start()
+        self.restore("_transition_locked")
+        self.assert_nothing_persisted()
+
+    def test_failure_after_specification_leaves_nothing(self) -> None:
+        self.fail_transition_call(2)  # SPECIFICATION ya escrita; falla antes de DEVELOPING
+        with self.assertRaises(StoreError):
+            self.start()
+        self.restore("_transition_locked")
+        self.assert_nothing_persisted()
+
+    def test_any_exception_type_rolls_everything_back(self) -> None:
+        def boom(*args, **kwargs):
+            raise RuntimeError("not a StoreError")
+
+        self.store._transition_locked = boom  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self.start()
+        self.restore("_transition_locked")
+        self.assert_nothing_persisted()
+
+    def test_state_machine_rejection_rolls_everything_back(self) -> None:
+        from orchestrator import store as store_module
+
+        calls = {"n": 0}
+        real = store_module.validate_transition
+
+        def picky(from_status, to_status):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise InvalidTransitionError("simulated rejection of SPECIFICATION -> DEVELOPING")
+            return real(from_status, to_status)
+
+        with mock.patch("orchestrator.store.validate_transition", picky):
+            with self.assertRaises(InvalidTransitionError):
+                self.start()
+        self.assert_nothing_persisted()
+
+    def test_the_same_task_id_is_reusable_after_a_rolled_back_start(self) -> None:
+        for n in (1, 2):
+            self.fail_transition_call(n)
+            with self.assertRaises(StoreError):
+                self.start()
+            self.restore("_transition_locked")
+            self.assert_nothing_persisted()
+        task = self.start()  # el fallo previo NO quemó el task_id
+        self.assertEqual(task["status"], "DEVELOPING")
+        self.assertEqual(self.row_counts(), (1, 3))
+
+    def test_the_project_survives_a_failed_start(self) -> None:
+        self.fail_transition_call(2)
+        with self.assertRaises(StoreError):
+            self.start()
+        self.restore("_transition_locked")
+        self.assertIsNotNone(self.store.get_project("SAMPLE"))
+
+    # ---- precondiciones ----
+
+    def test_missing_project_creates_nothing(self) -> None:
+        with self.assertRaises(StoreError):
+            self.store.create_and_start_task("T-1", "NOPE", "Title", "need", **self.KW)
+        self.assert_nothing_persisted()
+
+    def test_duplicate_task_id_fails_closed_and_preserves_everything(self) -> None:
+        self.start()
+        self.store.suspend_for_capacity("T-1", **_suspend_fields())
+        before = (
+            self.store.get_task("T-1"),
+            self.store.get_suspension("T-1"),
+            self.store.get_history("T-1"),
+        )
+        with self.assertRaises(StoreError):
+            self.start(specification_reason="another reason")
+        after = (
+            self.store.get_task("T-1"),
+            self.store.get_suspension("T-1"),
+            self.store.get_history("T-1"),
+        )
+        self.assertEqual(after, before)  # tarea, suspensión e historial idénticos
+
+    def test_duplicate_of_a_task_created_with_create_task_fails_closed(self) -> None:
+        self.store.create_task("T-1", "SAMPLE", "Title", "need")
+        before = (self.store.get_task("T-1"), self.store.get_history("T-1"))
+        with self.assertRaises(StoreError):
+            self.start()
+        self.assertEqual((self.store.get_task("T-1"), self.store.get_history("T-1")), before)
+
+    def test_invalid_input_creates_nothing(self) -> None:
+        for bad in ({"task_id": "../x"}, {"task_id": "a b"}):
+            with self.assertRaises(InvalidIdError):
+                self.store.create_and_start_task(
+                    bad["task_id"], "SAMPLE", "Title", "need", **self.KW
+                )
+        for overrides in (
+            {"specification_reason": ""},
+            {"developing_reason": ""},
+            {"actor": ""},
+            {"specification_reason": "x" * 501},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(StoreError):
+                    self.start(**overrides)
+        for title, need in (("", "need"), ("Title", "")):
+            with self.assertRaises(StoreError):
+                self.store.create_and_start_task("T-1", "SAMPLE", title, need, **self.KW)
+        self.assert_nothing_persisted()
+
+    def test_the_primitive_has_no_place_for_claude_or_task_packet_data(self) -> None:
+        names = set(inspect.signature(Store.create_and_start_task).parameters)
+        self.assertEqual(
+            names,
+            {
+                "self",
+                "task_id",
+                "project_id",
+                "title",
+                "need_text",
+                "specification_reason",
+                "developing_reason",
+                "actor",
+            },
+        )
+        for word in ("stdout", "stderr", "prompt", "result", "session", "usage", "objective", "packet"):
+            for name in names:
+                self.assertNotIn(word, name.lower())
+
+    # ---- concurrencia ----
+
+    def test_concurrent_starts_of_the_same_task_id_have_exactly_one_winner(self) -> None:
+        contenders = 8
+        barrier = threading.Barrier(contenders)
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def contend(index: int) -> None:
+            store = Store(self.db_path)  # una conexión por hilo
+            try:
+                barrier.wait(timeout=10)
+                try:
+                    store.create_and_start_task(
+                        "T-1",
+                        "SAMPLE",
+                        "Title",
+                        "need",
+                        specification_reason="spec",
+                        developing_reason="dev",
+                        actor=f"worker-{index}",
+                    )
+                    result = "won"
+                except StoreError:
+                    result = "lost"
+            finally:
+                store.close()
+            with lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=contend, args=(i,)) for i in range(contenders)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(sorted(outcomes), ["lost"] * (contenders - 1) + ["won"])
+        # Ni doble tarea ni doble cadena de eventos ni estado corrupto.
+        self.assertEqual(self.row_counts(), (1, 3))
+        self.assertEqual(self.store.get_task("T-1")["status"], "DEVELOPING")
+        self.assertEqual(
+            [(e["from_status"], e["to_status"]) for e in self.store.get_history("T-1")],
+            [(None, "BACKLOG"), ("BACKLOG", "SPECIFICATION"), ("SPECIFICATION", "DEVELOPING")],
+        )
+        actors = {e["actor"] for e in self.store.get_history("T-1")} - {"system"}
+        self.assertEqual(len(actors), 1)  # todos los eventos son del MISMO ganador
+
+    def test_two_connections_only_one_wins_deterministically(self) -> None:
+        other = Store(self.db_path)
+        try:
+            self.start()
+            with self.assertRaises(StoreError):
+                self.start(store=other, actor="second")
+        finally:
+            other.close()
+        self.assertEqual(self.row_counts(), (1, 3))
+
+
+class TransitionTaskStateGuardTests(SuspensionTestCase):
+    """CORRECTION-001: transition_task no fuerza una transición si otro
+    proceso ya cambió el estado entre la lectura y el UPDATE."""
+
+    def test_normal_transition_is_unchanged(self) -> None:
+        self.make_task("T-1", status="SPECIFICATION")
+        task = self.store.transition_task("T-1", "DEVELOPING", "go", "director")
+        self.assertEqual(task["status"], "DEVELOPING")
+        last = self.store.get_history("T-1")[-1]
+        self.assertEqual(
+            (last["from_status"], last["to_status"], last["reason"], last["actor"]),
+            ("SPECIFICATION", "DEVELOPING", "go", "director"),
+        )
+
+    def test_a_stale_read_never_forces_the_transition(self) -> None:
+        self.make_task("T-1")  # DEVELOPING
+        self.store.suspend_for_capacity("T-1", **_suspend_fields())  # WAITING
+        real_get = Store.get_task
+        db_path = self.db_path
+        state = {"raced": False}
+
+        def racing_get(store_self, task_id):
+            task = real_get(store_self, task_id)  # lectura (WAITING)
+            if not state["raced"]:
+                state["raced"] = True
+                with Store(db_path) as other:
+                    other.block_waiting_capacity("T-1", reason="other wins", actor="other")
+            return task
+
+        from unittest import mock
+
+        with mock.patch.object(Store, "get_task", racing_get):
+            with self.assertRaises(StoreError):
+                self.store.transition_task("T-1", "BLOCKED", "stale", "me")
+        history = self.store.get_history("T-1")
+        blocked = [e for e in history if e["to_status"] == "BLOCKED"]
+        self.assertEqual(len(blocked), 1)  # solo la del otro proceso
+        self.assertEqual(blocked[0]["reason"], "other wins")
+        self.assertEqual(self.task_status(), "BLOCKED")
+        # El Store sigue siendo utilizable tras el fallo.
+        self.assertEqual(self.store.get_task("T-1")["status"], "BLOCKED")
 
 
 class ParameterizedSqlTests(unittest.TestCase):

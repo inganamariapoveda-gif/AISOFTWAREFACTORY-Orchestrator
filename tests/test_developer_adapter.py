@@ -24,6 +24,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator.adapters.claude_code import (  # noqa: E402
+    DEVELOPER_ROLE_BOUNDARY_HEADING,
+    RESUME_NOTICE,
     ClaudeFailureCategory,
     EXPECTED_HANDSHAKE_RESULT,
     EXPECTED_WRITE_RESULT,
@@ -1320,6 +1322,117 @@ class RunDeveloperTaskSafeFailureDiagnosticsTests(unittest.TestCase):
 # JSON allowlisted); nunca texto de stdout/stderr/result. Ninguna categoría
 # autoriza retry: esto solo etiqueta el fallo.
 # ============================================================
+
+
+class ResumeModeTests(unittest.TestCase):
+    """CAPACITY-RESUME-EXECUTION-002: `resume=True` añade UNA regla fija del
+    motor inmediatamente antes del role boundary final. Por defecto el
+    comportamiento es idéntico al de siempre."""
+
+    BOUNDARY = DEVELOPER_ROLE_BOUNDARY_HEADING + "\n1. Fixed rule.\n2. Another fixed rule."
+    PROMPT = "=== TASK PACKET ===\nobjective text\n\n=== GOVERNANCE EPILOGUE ===\nfixed\n\n" + BOUNDARY
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, prompt: str, **kwargs):
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            result = run_developer_task(
+                developer_config=_valid_task_execution_developer_config(),
+                prompt=prompt,
+                cwd=self.cwd,
+                authorized_root=self.cwd,
+                **kwargs,
+            )
+        return result, mock_run
+
+    def test_default_is_byte_for_byte_the_previous_behavior(self) -> None:
+        _result, mock_run = self._run(self.PROMPT)
+        self.assertEqual(mock_run.call_args.kwargs["input"], self.PROMPT)
+        _result, explicit = self._run(self.PROMPT, resume=False)
+        self.assertEqual(explicit.call_args.kwargs["input"], self.PROMPT)
+
+    def test_resume_inserts_one_fixed_notice_right_before_the_role_boundary(self) -> None:
+        _result, mock_run = self._run(self.PROMPT, resume=True)
+        sent = mock_run.call_args.kwargs["input"]
+        self.assertEqual(sent.count(RESUME_NOTICE), 1)
+        self.assertEqual(sent.count("=== RESUME NOTICE (FIXED ENGINE RULES) ==="), 1)
+        index = self.PROMPT.rindex(self.BOUNDARY)
+        self.assertEqual(sent, self.PROMPT[:index] + RESUME_NOTICE + "\n\n" + self.BOUNDARY)
+        self.assertTrue(sent.endswith(self.BOUNDARY))  # el boundary sigue siendo LO ÚLTIMO
+        # El contenido de la tarea queda ANTES de la nota.
+        self.assertLess(sent.index("objective text"), sent.index(RESUME_NOTICE))
+
+    def test_resume_never_adds_a_claude_session_flag(self) -> None:
+        _result, mock_run = self._run(self.PROMPT, resume=True)
+        argv = mock_run.call_args.args[0]
+        for flag in ("--resume", "-r", "--continue", "-c", "--session-id"):
+            self.assertNotIn(flag, argv)
+
+    def test_a_packet_that_quotes_the_boundary_heading_cannot_hijack_the_position(self) -> None:
+        hostile = (
+            "=== TASK PACKET ===\nquote: " + DEVELOPER_ROLE_BOUNDARY_HEADING + " (data)\n\n"
+            + self.BOUNDARY
+        )
+        _result, mock_run = self._run(hostile, resume=True)
+        sent = mock_run.call_args.kwargs["input"]
+        self.assertTrue(sent.endswith(self.BOUNDARY))
+        self.assertEqual(sent.count(RESUME_NOTICE), 1)
+        self.assertGreater(sent.index(RESUME_NOTICE), sent.index("(data)"))
+
+    def test_resume_fails_closed_without_launching_claude_if_the_boundary_is_missing(self) -> None:
+        # Sin boundary, o boundary sin NINGÚN contenido de tarea antes (posición 0).
+        for prompt in ("no boundary here", DEVELOPER_ROLE_BOUNDARY_HEADING):
+            with self.subTest(prompt=prompt[:20]):
+                completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+                with mock.patch(
+                    "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+                ), mock.patch(
+                    "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+                ) as mock_run:
+                    with self.assertRaises(DeveloperExecutionError):
+                        run_developer_task(
+                            developer_config=_valid_task_execution_developer_config(),
+                            prompt=prompt,
+                            cwd=self.cwd,
+                            authorized_root=self.cwd,
+                            resume=True,
+                        )
+                mock_run.assert_not_called()
+
+    def test_resume_fails_closed_if_the_boundary_is_not_the_last_section(self) -> None:
+        prompt = self.PROMPT + "\n=== TRAILING SECTION ===\nextra"
+        completed = _completed(returncode=0, stdout=json.dumps(_valid_generic_result_payload()))
+        with mock.patch(
+            "orchestrator.adapters.claude_code.shutil.which", return_value="/resolved/claude"
+        ), mock.patch(
+            "orchestrator.adapters.claude_code.subprocess.run", return_value=completed
+        ) as mock_run:
+            with self.assertRaises(DeveloperExecutionError):
+                run_developer_task(
+                    developer_config=_valid_task_execution_developer_config(),
+                    prompt=prompt,
+                    cwd=self.cwd,
+                    authorized_root=self.cwd,
+                    resume=True,
+                )
+        mock_run.assert_not_called()
+
+    def test_notice_is_fixed_text(self) -> None:
+        self.assertNotIn("{", RESUME_NOTICE)
+        self.assertIsNone(__import__("re").search(r"\d", RESUME_NOTICE))
+        self.assertTrue(RESUME_NOTICE.startswith("=== RESUME NOTICE (FIXED ENGINE RULES) ==="))
+        self.assertIn("Preserve those authorized partial changes.", RESUME_NOTICE)
+        self.assertIn("remains fully applicable", RESUME_NOTICE)
 
 
 class ClaudeFailureClassificationTests(unittest.TestCase):

@@ -11,14 +11,17 @@ subprocesos: se llama directamente a orchestrator.app.main().
 """
 
 import contextlib
+import hashlib
 import io
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -30,7 +33,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator import app  # noqa: E402
+from orchestrator import evidence as evidence_mod  # noqa: E402
 from orchestrator.adapters.claude_code import (  # noqa: E402
+    DEVELOPER_ROLE_BOUNDARY_HEADING,
+    RESUME_NOTICE,
     EXPECTED_HANDSHAKE_RESULT,
     EXPECTED_WRITE_RESULT,
     WRITE_PROBE_AFTER_CONTENT,
@@ -42,7 +48,7 @@ from orchestrator.evidence import (  # noqa: E402
     GitChangeEvidence,
 )
 from orchestrator.sandbox import SANDBOX_PREFIX  # noqa: E402
-from orchestrator.store import Store  # noqa: E402
+from orchestrator.store import Store, StoreError  # noqa: E402
 from orchestrator import task_packet as task_packet_mod  # noqa: E402
 from orchestrator.task_packet import TaskPacketError  # noqa: E402
 
@@ -2225,6 +2231,1725 @@ class DeveloperExecutionRoleBoundaryTests(unittest.TestCase):
         hostile_boundary = prompt[prompt.index(app._DEVELOPER_EXECUTION_ROLE_BOUNDARY):]
         benign_boundary = benign_prompt[benign_prompt.index(app._DEVELOPER_EXECUTION_ROLE_BOUNDARY):]
         self.assertEqual(hostile_boundary, benign_boundary)
+
+
+# ============================================================
+# CAPACITY-RESUME-EXECUTION-002: flujo PERSISTIDO (run-task / resume-capacity).
+#
+# Todo con repos y bases SQLite TEMPORALES, Developer/tests simulados
+# (subprocess parcheado) y un reloj falso: nunca se toca la DB real, nunca se
+# invoca a Claude y nunca se espera de verdad.
+# ============================================================
+
+REAL_ORCHESTRATOR_DB = REPO_ROOT / "orchestrator.db"
+TASK_ID = "TASKEXEC-001"
+WAITING = "WAITING_FOR_CLAUDE_CAPACITY"
+SENTINELS = (
+    "SENTINEL_RESULT_5d2",
+    "SENTINEL_SESSION_5d2",
+    "SENTINEL_USAGE_5d2",
+    "SENTINEL_MODELUSAGE_5d2",
+    "SENTINEL_STDERR_5d2",
+    "SENTINEL_OBJECTIVE_5d2",
+)
+ALLOWED_DETAIL_KEYS = {
+    "exit_code",
+    "type",
+    "subtype",
+    "is_error",
+    "api_error_status",
+    "stop_reason",
+    "permission_denial_count",
+    "json_top_level_keys",
+}
+ISO_MICROSECONDS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}\+00:00")
+
+
+class FakeClock:
+    """Reloj UTC controlable: los tests avanzan el tiempo, nunca esperan."""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+class PersistedExecutionTestCase(TaskExecutionProbeTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = FakeClock()
+        patcher = mock.patch("orchestrator.app._now_utc", new=self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.set_capacity_wait()
+        self._write_taskexec_packet(
+            mandatory_tests=["unit"], authorized_files=["allowed.txt", "new_authorized.txt"]
+        )
+        self.rules_path = self.projects_dir / "TASKEXEC" / "PROJECT_RULES.yaml"
+        self.permissions_path = self.config_dir / "PERMISSIONS.yaml"
+
+    def tearDown(self) -> None:
+        # Ninguna prueba de este flujo puede haber creado la DB REAL.
+        self.assertFalse(REAL_ORCHESTRATOR_DB.exists())
+        super().tearDown()
+
+    # ---- configuración / ejecución ----
+
+    def set_capacity_wait(self, **overrides) -> None:
+        data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
+        block = {
+            "auto_wait": True,
+            "retry_interval_seconds": 1800,
+            "max_attempts": 12,
+            "max_wait_seconds": 28800,
+        }
+        block.update(overrides)
+        data["agents"]["developer"]["capacity_wait"] = block
+        _write_yaml(self.config_dir / "AGENTS.yaml", data)
+
+    def capture(self, *argv: str) -> tuple[int, dict | None]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.run_cli(*argv)
+        text = out.getvalue()
+        return rc, (json.loads(text) if text.strip() else None)
+
+    def run_task(self, developer=None, test=None):
+        test = test or mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer, test=test):
+            rc, result = self.capture("run-task", str(self.taskexec_packet_path))
+        return rc, result, test
+
+    def resume(self, developer=None, test=None, task_id: str = TASK_ID):
+        test = test or mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer, test=test):
+            rc, result = self.capture("resume-capacity", task_id)
+        return rc, result, test
+
+    @staticmethod
+    def never_called():
+        return mock.MagicMock(side_effect=AssertionError("Developer must not run"))
+
+    # ---- Developer simulado ----
+
+    def capacity_payload(self, **overrides) -> dict:
+        payload = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "api_error_status": 429,
+            "stop_reason": "end_turn",
+            "permission_denials": [],
+            "result": SENTINELS[0],
+            "session_id": SENTINELS[1],
+            "usage": {"note": SENTINELS[2]},
+            "modelUsage": {"m": SENTINELS[3]},
+        }
+        payload.update(overrides)
+        return payload
+
+    def _developer(self, run):
+        prompts: list[str] = []
+
+        def wrapped(args, **kwargs):
+            prompts.append(kwargs.get("input"))
+            return run(args, **kwargs)
+
+        mocked = mock.MagicMock(side_effect=wrapped)
+        mocked.prompts = prompts
+        return mocked
+
+    def developer_capacity(self, *, edits=None, stderr: str = "", on_run=None, payload=None):
+        """Developer que deja `edits` (path -> contenido) y falla con 429."""
+        chosen = (
+            edits
+            if edits is not None
+            else {"allowed.txt": "PARTIAL", "new_authorized.txt": "partial new"}
+        )
+
+        def run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            for name, content in chosen.items():
+                (cwd / name).write_text(content, encoding="utf-8")
+            if on_run is not None:
+                on_run()
+            body = payload if payload is not None else self.capacity_payload()
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=json.dumps(body), stderr=stderr
+            )
+
+        return self._developer(run)
+
+    def developer_completes(self, *, on_run=None):
+        seen: dict = {}
+
+        def run(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            seen["allowed_before"] = (cwd / "allowed.txt").read_text(encoding="utf-8")
+            seen["new_exists"] = (cwd / "new_authorized.txt").exists()
+            seen["args"] = list(args)
+            if on_run is not None:
+                on_run()
+            (cwd / "allowed.txt").write_text("AFTER", encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=self._developer_success_payload(), stderr=""
+            )
+
+        mocked = self._developer(run)
+        mocked.seen = seen
+        return mocked
+
+    # ---- inspección de la DB / repo ----
+
+    def dump_db(self) -> str:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            return "\n".join(conn.iterdump())
+        finally:
+            conn.close()
+
+    def task(self) -> dict | None:
+        with Store(self.db_path) as store:
+            return store.get_task(TASK_ID)
+
+    def suspension(self) -> dict | None:
+        with Store(self.db_path) as store:
+            return store.get_suspension(TASK_ID)
+
+    def history(self) -> list[dict]:
+        with Store(self.db_path) as store:
+            return store.get_history(TASK_ID)
+
+    def history_pairs(self) -> list[tuple]:
+        return [(e["from_status"], e["to_status"]) for e in self.history()]
+
+    def head(self) -> str:
+        return _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
+
+    def branch(self) -> str:
+        return _git("branch", "--show-current", cwd=self.taskexec_repo).stdout.strip()
+
+    def repo_files(self) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(self.taskexec_repo)): path.read_bytes()
+            for path in sorted(self.taskexec_repo.rglob("*"))
+            if path.is_file() and ".git" not in path.relative_to(self.taskexec_repo).parts
+        }
+
+    def current_fingerprint(self):
+        root = self.taskexec_repo.resolve()
+        before = evidence_mod.GitEvidenceSnapshot(
+            repo_root=root,
+            authorized_root=root,
+            head_sha=self.head(),
+            branch=self.branch(),
+            is_clean=True,
+            status_entries=(),
+        )
+        return evidence_mod.capture_working_tree_fingerprint(
+            before, ["allowed.txt", "new_authorized.txt"]
+        )
+
+    @staticmethod
+    def sha256_of(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def suspend_with_partial(self) -> dict:
+        """run-task hasta WAITING con ediciones parciales autorizadas."""
+        rc, result, _test = self.run_task(developer=self.developer_capacity())
+        self.assertEqual(rc, 10)
+        return result
+
+    def assert_partial_edits(self, allowed: str = "PARTIAL", new: str = "partial new") -> None:
+        self.assertEqual((self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), allowed)
+        self.assertEqual(
+            (self.taskexec_repo / "new_authorized.txt").read_text(encoding="utf-8"), new
+        )
+
+
+class PersistedStartTests(PersistedExecutionTestCase):
+    def test_run_task_success_persists_the_full_state_chain(self) -> None:
+        head_before = self.head()
+        developer = self.developer_completes()
+        rc, result, test = self.run_task(developer=developer)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(result["human_gate"], "HUMAN_FUNCTIONAL_TEST")
+        self.assertFalse(result["commit_performed"])
+        developer.assert_called_once()
+        test.assert_called_once()  # mandatory test ejecutado
+        self.assertEqual(
+            self.history_pairs(),
+            [
+                (None, "BACKLOG"),
+                ("BACKLOG", "SPECIFICATION"),
+                ("SPECIFICATION", "DEVELOPING"),
+                ("DEVELOPING", "AUTOMATED_TEST"),
+                ("AUTOMATED_TEST", "TECHNICAL_REVIEW"),
+                ("TECHNICAL_REVIEW", "SECURITY_REVIEW"),
+                ("SECURITY_REVIEW", "HUMAN_GATE"),
+            ],
+        )
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "HUMAN_GATE")
+        self.assertEqual(task["attempt_count"], 0)  # el contador funcional no se toca
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.head(), head_before)  # sin commit
+
+    def test_project_and_task_are_registered_before_claude_runs(self) -> None:
+        seen: dict = {}
+
+        def on_run():
+            with Store(self.db_path) as store:
+                seen["status"] = store.get_task(TASK_ID)["status"]
+                seen["project"] = store.get_project("TASKEXEC")
+
+        rc, _result, _test = self.run_task(developer=self.developer_completes(on_run=on_run))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["status"], "DEVELOPING")  # ya en DEVELOPING al invocar a Claude
+        self.assertIsNotNone(seen["project"])
+
+    def test_project_row_uses_the_same_representation_as_register_project(self) -> None:
+        other_db = self.root / "other.db"
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = app.main(["--db-path", str(other_db), "register-project", "TASKEXEC"])
+        self.assertEqual(rc, 0)
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        with Store(other_db) as registered, Store(self.db_path) as persisted:
+            expected = registered.get_project("TASKEXEC")
+            actual = persisted.get_project("TASKEXEC")
+        assert expected is not None and actual is not None
+        for key in ("id", "name", "repo_path", "rules_ref"):
+            self.assertEqual(actual[key], expected[key], key)
+
+    def test_existing_compatible_project_is_reused_unchanged(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.main(["--db-path", str(self.db_path), "register-project", "TASKEXEC"])
+        with Store(self.db_path) as store:
+            before = store.get_project("TASKEXEC")
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        with Store(self.db_path) as store:
+            self.assertEqual(store.get_project("TASKEXEC"), before)
+
+    def test_incompatible_existing_project_blocks_before_claude(self) -> None:
+        with Store(self.db_path) as store:
+            store.register_project("TASKEXEC", "Task execution test project", "./elsewhere", "x")
+        dump_before = self.dump_db()
+        developer = self.never_called()
+        rc, _result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)  # nada modificado silenciosamente
+
+    def test_duplicate_task_id_fails_closed_without_touching_anything(self) -> None:
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        dump_before = self.dump_db()
+        head = self.head()
+        developer = self.never_called()
+        rc, _result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)
+        self.assertEqual(self.head(), head)
+
+    def test_dirty_repository_blocks_before_claude_and_before_any_db_write(self) -> None:
+        (self.taskexec_repo / "stray.txt").write_text("dirty", encoding="utf-8")
+        developer = self.never_called()
+        rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIn("not clean", result["reason"])
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())  # ninguna escritura
+
+    def test_invalid_task_packet_never_reaches_claude_or_the_db(self) -> None:
+        self.taskexec_packet_path.write_text("task_id: [broken", encoding="utf-8")
+        developer = self.never_called()
+        rc, _result, _test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_packet_outside_the_orchestrator_repository_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside) / "EXTERNAL.yaml"
+            external.write_text(self.taskexec_packet_path.read_text(encoding="utf-8"), encoding="utf-8")
+            developer = self.never_called()
+            with self.patched_subprocess(developer=developer):
+                rc, _result = self.capture("run-task", str(external))
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_identity_is_the_raw_sha256_and_the_packet_path_is_relative_posix(self) -> None:
+        self.suspend_with_partial()
+        suspension = self.suspension()
+        assert suspension is not None
+        self.assertEqual(suspension["task_packet_path"], "tasks/TASKEXEC_TASK.yaml")
+        self.assertEqual(suspension["task_packet_sha256"], self.sha256_of(self.taskexec_packet_path))
+        self.assertEqual(suspension["project_rules_sha256"], self.sha256_of(self.rules_path))
+        self.assertEqual(suspension["permissions_sha256"], self.sha256_of(self.permissions_path))
+        path = suspension["task_packet_path"]
+        self.assertFalse(Path(path).is_absolute())
+        self.assertNotIn("..", path.split("/"))
+        self.assertNotIn("\\", path)
+
+    def test_project_rules_changing_while_loading_is_rejected(self) -> None:
+        real = app._require_project_rules
+
+        def racing(project_id):
+            rules = real(project_id)
+            self.rules_path.write_text(
+                self.rules_path.read_text(encoding="utf-8") + "\n# changed during load\n",
+                encoding="utf-8",
+            )
+            return rules
+
+        developer = self.never_called()
+        with mock.patch.object(app, "_require_project_rules", racing):
+            rc, _result, _test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_permissions_changing_while_loading_is_rejected(self) -> None:
+        real = app._require_core_config
+
+        def racing():
+            config = real()
+            self.permissions_path.write_text(
+                self.permissions_path.read_text(encoding="utf-8") + "\n# changed during load\n",
+                encoding="utf-8",
+            )
+            return config
+
+        developer = self.never_called()
+        with mock.patch.object(app, "_require_core_config", racing):
+            rc, _result, _test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+
+class PersistedAtomicStartTests(PersistedExecutionTestCase):
+    """CORRECTION-002: run-task crea la tarea y la lleva a DEVELOPING de forma
+    ATÓMICA. Un fallo de inicio no deja task ni eventos (el task_id sigue
+    libre), el proyecto ya registrado permanece y Claude nunca se invoca."""
+
+    def inject(self, point: str):
+        """Fallo inyectado en un punto del inicio atómico (a nivel de clase,
+        solo mientras dura el `with`)."""
+        if point == "after_task_insert":
+
+            def boom(store_self, task_id, now):
+                raise StoreError("simulated failure after the task insert")
+
+            return mock.patch.object(Store, "_insert_initial_event_locked", boom)
+
+        fail_on = {"after_backlog_event": 1, "after_specification": 2}[point]
+        real = Store._transition_locked
+        calls = {"count": 0}
+
+        def flaky(store_self, *args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == fail_on:
+                raise StoreError("simulated failure during the atomic start")
+            return real(store_self, *args, **kwargs)
+
+        return mock.patch.object(Store, "_transition_locked", flaky)
+
+    def assert_no_task_left(self) -> None:
+        with Store(self.db_path) as store:
+            self.assertIsNone(store.get_task(TASK_ID))
+            self.assertEqual(store.get_history(TASK_ID), [])
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM task").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM status_event").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def _assert_failed_start_then_reuse(self, point: str) -> None:
+        developer = self.never_called()
+        with self.inject(point):
+            rc, _result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)  # falla cerrado
+        developer.assert_not_called()  # NUNCA Claude en un fallo de inicio
+        test.assert_not_called()
+        self.assert_no_task_left()
+        with Store(self.db_path) as store:  # el proyecto registrado permanece
+            self.assertIsNotNone(store.get_project("TASKEXEC"))
+        # El MISMO task_id vuelve a poder usarse y completa el flujo normal.
+        rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+
+    def test_failure_after_the_task_insert_leaves_no_task_and_frees_the_task_id(self) -> None:
+        self._assert_failed_start_then_reuse("after_task_insert")
+
+    def test_failure_after_the_backlog_event_leaves_no_task_and_frees_the_task_id(self) -> None:
+        self._assert_failed_start_then_reuse("after_backlog_event")
+
+    def test_failure_after_specification_leaves_no_task_and_frees_the_task_id(self) -> None:
+        self._assert_failed_start_then_reuse("after_specification")
+
+    def test_run_task_uses_the_atomic_start_and_not_the_old_three_step_sequence(self) -> None:
+        real_start = Store.create_and_start_task
+        calls: list[str] = []
+
+        def spy(store_self, task_id, *args, **kwargs):
+            calls.append(task_id)
+            return real_start(store_self, task_id, *args, **kwargs)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("run-task must not use the non-atomic create_task sequence")
+
+        with mock.patch.object(Store, "create_and_start_task", spy), mock.patch.object(
+            Store, "create_task", forbidden
+        ):
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [TASK_ID])
+
+    def test_successful_history_reasons_and_actors_are_unchanged(self) -> None:
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        events = self.history()
+        self.assertEqual(
+            [(e["from_status"], e["to_status"], e["reason"], e["actor"]) for e in events[:3]],
+            [
+                (None, "BACKLOG", "task created", "system"),
+                ("BACKLOG", "SPECIFICATION", app._REASON_SPECIFICATION, app.PERSISTED_ACTOR),
+                ("SPECIFICATION", "DEVELOPING", app._REASON_DEVELOPING, app.PERSISTED_ACTOR),
+            ],
+        )
+        self.assertEqual(len(events), 7)  # sin eventos adicionales
+
+    def test_developer_only_runs_after_the_task_is_in_developing(self) -> None:
+        seen: dict = {}
+
+        def on_run():
+            with Store(self.db_path) as store:
+                seen["status"] = store.get_task(TASK_ID)["status"]
+                seen["pairs"] = [(e["from_status"], e["to_status"]) for e in store.get_history(TASK_ID)]
+
+        self.run_task(developer=self.developer_completes(on_run=on_run))
+        self.assertEqual(seen["status"], "DEVELOPING")
+        self.assertEqual(
+            seen["pairs"],
+            [(None, "BACKLOG"), ("BACKLOG", "SPECIFICATION"), ("SPECIFICATION", "DEVELOPING")],
+        )
+
+    def test_real_duplicate_is_still_rejected_and_nothing_changes(self) -> None:
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        dump_before = self.dump_db()
+        developer = self.never_called()
+        rc, _result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)  # tarea, historial y suspensión idénticos
+
+    def test_duplicate_after_a_capacity_suspension_preserves_the_suspension(self) -> None:
+        self.suspend_with_partial()
+        dump_before = self.dump_db()
+        developer = self.never_called()
+        rc, _result, _test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)
+        self.assertIsNotNone(self.suspension())
+
+    def test_two_concurrent_starts_of_the_same_task_only_one_reaches_the_developer(self) -> None:
+        # Entre la comprobación previa de duplicado y el inicio atómico, OTRO
+        # proceso gana: el perdedor falla cerrado y NUNCA llega a Claude.
+        real_start = Store.create_and_start_task
+        db_path = self.db_path
+
+        def racing_start(store_self, task_id, project_id, title, need_text, **kwargs):
+            with Store(db_path) as other:
+                real_start(
+                    other,
+                    task_id,
+                    project_id,
+                    title,
+                    need_text,
+                    specification_reason="winner spec",
+                    developing_reason="winner dev",
+                    actor="winner",
+                )
+            return real_start(store_self, task_id, project_id, title, need_text, **kwargs)
+
+        developer = self.never_called()
+        with mock.patch.object(Store, "create_and_start_task", racing_start):
+            rc, _result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        test.assert_not_called()
+        events = self.history()
+        self.assertEqual(len(events), 3)  # una sola cadena de eventos
+        self.assertEqual({e["actor"] for e in events} - {"system"}, {"winner"})
+        self.assertEqual(self.task()["status"], "DEVELOPING")  # la del ganador, intacta
+
+    def test_nothing_from_the_task_packet_or_claude_reaches_the_new_rows(self) -> None:
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["objective"] = SENTINELS[5]
+        _write_yaml(self.taskexec_packet_path, packet)
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, self.dump_db())
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["title"], TASK_ID)
+        self.assertEqual(task["need_text"], f"persisted execution of Task Packet {TASK_ID}")
+
+
+class PersistedFirstCapacityTests(PersistedExecutionTestCase):
+    def test_capacity_without_changes_waits(self) -> None:
+        developer = self.developer_capacity(edits={})
+        rc, result, test = self.run_task(developer=developer)
+
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertEqual(result["state"], WAITING)
+        self.assertFalse(result["developer_completed"])
+        self.assertIsNone(result["human_gate"])
+        self.assertFalse(result["commit_performed"])
+        self.assertEqual(result["mandatory_test_results"], [])
+        self.assertEqual(result["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertEqual(result["developer_failure_details"]["api_error_status"], 429)
+        self.assertLessEqual(set(result["developer_failure_details"]), ALLOWED_DETAIL_KEYS)
+        self.assertEqual(result["capacity_wait_count"], 1)
+        self.assertEqual(result["capacity_wait_max_attempts"], 12)
+        self.assertEqual(result["capacity_wait_max_seconds"], 28800)
+        self.assertRegex(result["capacity_wait_started_at"], ISO_MICROSECONDS)
+        self.assertRegex(result["next_retry_at"], ISO_MICROSECONDS)
+        started = app._parse_utc(result["capacity_wait_started_at"])
+        self.assertEqual(app._parse_utc(result["next_retry_at"]), started + timedelta(seconds=1800))
+        self.assertEqual(result["reason"], app._PUBLIC_REASON_SUSPENDED)
+        developer.assert_called_once()
+        test.assert_not_called()
+
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], WAITING)
+        self.assertEqual(task["attempt_count"], 0)
+        suspension = self.suspension()
+        assert suspension is not None
+        self.assertEqual(suspension["capacity_wait_count"], 1)
+        self.assertEqual(suspension["touched_paths_json"], "[]")
+        self.assertEqual(suspension["baseline_head_sha"], self.head())
+        self.assertEqual(suspension["baseline_branch"], self.branch())
+        self.assertEqual(suspension["working_tree_fingerprint"], self.current_fingerprint().fingerprint)
+        self.assertEqual(suspension["capacity_wait_started_at"], result["capacity_wait_started_at"])
+        self.assertEqual(suspension["next_retry_at"], result["next_retry_at"])
+        self.assertEqual(
+            self.history_pairs()[-1], ("DEVELOPING", WAITING)
+        )
+
+    def test_capacity_with_partial_authorized_changes_persists_the_fingerprint(self) -> None:
+        result = self.suspend_with_partial()
+        self.assertEqual(result["state"], WAITING)
+        self.assertEqual(result["changed_paths"], ["allowed.txt"])
+        self.assertEqual(result["untracked_paths"], ["new_authorized.txt"])
+        self.assertEqual(result["touched_paths"], ["allowed.txt", "new_authorized.txt"])
+        self.assertEqual(result["out_of_scope_paths"], [])
+        suspension = self.suspension()
+        assert suspension is not None
+        self.assertEqual(
+            json.loads(suspension["touched_paths_json"]), ["allowed.txt", "new_authorized.txt"]
+        )
+        self.assertEqual(suspension["working_tree_fingerprint"], self.current_fingerprint().fingerprint)
+        self.assert_partial_edits()  # sin rollback
+        # Ninguna ejecución de capacidad cuenta como intento funcional.
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["attempt_count"], 0)
+
+    def _assert_blocked_without_suspension(self, rc, result, developer, test) -> None:
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_called_once()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_PIPELINE_BLOCKED)
+
+    def test_out_of_scope_edit_blocks_without_suspension(self) -> None:
+        developer = self.developer_capacity(
+            edits={"allowed.txt": "PARTIAL", "other.txt": "unauthorized"}
+        )
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assertEqual(result["out_of_scope_paths"], ["other.txt"])
+        self.assertEqual((self.taskexec_repo / "other.txt").read_text(encoding="utf-8"), "unauthorized")
+        self.assertEqual((self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL")
+
+    def test_forbidden_file_edit_blocks_without_suspension(self) -> None:
+        developer = self.developer_capacity(
+            edits={"allowed.txt": "PARTIAL", "untouched.txt": "MODIFIED"}
+        )
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assertIn("untouched.txt", result["out_of_scope_paths"])
+        self.assertEqual((self.taskexec_repo / "untouched.txt").read_text(encoding="utf-8"), "MODIFIED")
+
+    def test_head_change_blocks_without_suspension(self) -> None:
+        head_before = self.head()
+
+        def commit():
+            _git("add", "allowed.txt", cwd=self.taskexec_repo)
+            _git("commit", "-m", "unauthorized commit", cwd=self.taskexec_repo)
+
+        developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL"}, on_run=commit)
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assertFalse(result["head_unchanged"])
+        self.assertNotEqual(self.head(), head_before)  # no se revierte
+        self.assertEqual((self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL")
+
+    def test_branch_change_by_the_developer_blocks_without_suspension(self) -> None:
+        def switch_branch():
+            _git("checkout", "-b", "hijacked", cwd=self.taskexec_repo)
+
+        developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL"}, on_run=switch_branch)
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assertEqual(self.branch(), "hijacked")  # no se revierte
+
+    def test_fingerprint_that_cannot_be_captured_blocks_without_suspension(self) -> None:
+        developer = self.developer_capacity()
+        with mock.patch(
+            "orchestrator.evidence.capture_working_tree_fingerprint",
+            side_effect=EvidenceError("touched path is a symlink"),
+        ):
+            rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assert_partial_edits()
+
+    def test_link_like_touched_path_blocks_without_suspension(self) -> None:
+        # Fallo real de la huella (no un mock): un touched path link-like.
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "external.txt"
+            target.write_text("EXTERNAL", encoding="utf-8")
+
+            def make_link():
+                try:
+                    (self.taskexec_repo / "new_authorized.txt").symlink_to(target)
+                except (OSError, NotImplementedError):
+                    self.skipTest("symlinks are not available in this environment")
+
+            developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL"}, on_run=make_link)
+            rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+
+    def test_auto_wait_disabled_blocks_without_suspension(self) -> None:
+        self.set_capacity_wait(auto_wait=False)
+        developer = self.developer_capacity()
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+        self.assert_partial_edits()
+
+    def test_missing_capacity_wait_block_means_auto_wait_disabled(self) -> None:
+        data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
+        del data["agents"]["developer"]["capacity_wait"]
+        _write_yaml(self.config_dir / "AGENTS.yaml", data)
+        developer = self.developer_capacity()
+        rc, result, test = self.run_task(developer=developer)
+        self._assert_blocked_without_suspension(rc, result, developer, test)
+
+
+class PersistedNonCapacityTests(PersistedExecutionTestCase):
+    def _assert_blocked(self, developer, category: str) -> None:
+        rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["developer_failure_category"], category)
+        developer.assert_called_once()  # Developer una única vez, sin retry
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())  # nunca hay suspensión
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+        if (self.taskexec_repo / "new_authorized.txt").exists():
+            self.assert_partial_edits()  # sin rollback
+
+    def test_max_turns_blocks(self) -> None:
+        payload = self.capacity_payload(subtype="error_max_turns", api_error_status=None)
+        self._assert_blocked(self.developer_capacity(payload=payload), "CLAUDE_MAX_TURNS")
+
+    def test_timeout_blocks(self) -> None:
+        def run(args, **kwargs):
+            (Path(kwargs["cwd"]) / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            raise subprocess.TimeoutExpired(cmd=args, timeout=90)
+
+        self._assert_blocked(self._developer(run), "CLAUDE_TIMEOUT")
+
+    def test_permission_denial_blocks(self) -> None:
+        payload = self.capacity_payload(
+            api_error_status=None, permission_denials=[{"tool_name": "Bash"}]
+        )
+        self._assert_blocked(self.developer_capacity(payload=payload), "CLAUDE_PERMISSION_DENIED")
+
+    def test_missing_executable_blocks(self) -> None:
+        def run(args, **kwargs):
+            raise FileNotFoundError("claude")
+
+        self._assert_blocked(self._developer(run), "CLAUDE_EXECUTABLE_MISSING")
+
+    def test_general_error_blocks(self) -> None:
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="boom")
+
+        self._assert_blocked(self._developer(run), "CLAUDE_EXECUTION_ERROR")
+
+    def test_failing_mandatory_test_blocks_the_persisted_task(self) -> None:
+        developer = self.developer_completes()
+        test = mock.MagicMock(
+            side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="FAIL"
+            )
+        )
+        rc, result, _test = self.run_task(developer=developer, test=test)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+
+
+class PersistedResumeTests(PersistedExecutionTestCase):
+    def test_resume_recovers_everything_after_the_original_process_is_gone(self) -> None:
+        # "Proceso A": run-task hasta WAITING; su Store ya se cerró.
+        self.suspend_with_partial()
+        # "Proceso B": conexión NUEVA sobre el MISMO archivo SQLite; nada del
+        # proceso A sobrevive en memoria (cada comando abre y cierra su Store).
+        with Store(self.db_path) as store_b:
+            task = store_b.get_task(TASK_ID)
+            assert task is not None
+            self.assertEqual(task["status"], WAITING)
+            self.assertIsNotNone(store_b.get_suspension(TASK_ID))
+        self.clock.advance(1800)
+        developer = self.developer_completes()
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        developer.assert_called_once()
+        test.assert_called_once()
+
+    def test_resume_before_next_retry_changes_nothing(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1799)  # un segundo antes de vencer
+        dump_before = self.dump_db()
+        files_before = self.repo_files()
+        developer = self.never_called()
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertEqual(result["state"], WAITING)
+        self.assertEqual(result["reason"], "retry not due")
+        self.assertEqual(result["capacity_wait_count"], 1)
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)  # sin claim, DB intacta
+        self.assertEqual(self.repo_files(), files_before)
+
+    def test_resume_at_exactly_next_retry_is_due(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+
+    def test_resume_success_continues_over_partial_edits_to_human_gate(self) -> None:
+        self.suspend_with_partial()
+        head = self.head()
+        self.clock.advance(1800)
+        developer = self.developer_completes()
+        rc, result, test = self.resume(developer=developer)
+
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertFalse(result["commit_performed"])
+        # El Developer VE las ediciones parciales autorizadas.
+        self.assertEqual(developer.seen["allowed_before"], "PARTIAL")
+        self.assertTrue(developer.seen["new_exists"])
+        # Nota de reanudación presente exactamente una vez; sin --resume de Claude.
+        self.assertEqual(developer.prompts[0].count("=== RESUME NOTICE (FIXED ENGINE RULES) ==="), 1)
+        self.assertNotIn("--resume", developer.seen["args"])
+        # Pipeline normal tras el Developer.
+        test.assert_called_once()
+        self.assertTrue(result["pre_test_evidence_passed"])
+        self.assertTrue(result["post_test_evidence_passed"])
+        self.assertEqual(result["mandatory_test_results"], [{"test_id": "unit", "result": "PASS", "exit_code": 0}])
+        # BASELINE ORIGINAL: el archivo creado en el primer intento cuenta como
+        # tocado (un baseline nuevo post-fallo no lo vería).
+        self.assertEqual(result["touched_paths"], ["allowed.txt", "new_authorized.txt"])
+        self.assertEqual(result["out_of_scope_paths"], [])
+        self.assertTrue(result["head_unchanged"])
+        self.assertEqual(self.head(), head)
+        # Persistencia: cadena de estados, suspensión eliminada, sin commit.
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "HUMAN_GATE")
+        self.assertEqual(task["attempt_count"], 0)
+        self.assertIsNone(self.suspension())
+        self.assertEqual(
+            self.history_pairs(),
+            [
+                (None, "BACKLOG"),
+                ("BACKLOG", "SPECIFICATION"),
+                ("SPECIFICATION", "DEVELOPING"),
+                ("DEVELOPING", WAITING),
+                (WAITING, "DEVELOPING"),
+                ("DEVELOPING", "AUTOMATED_TEST"),
+                ("AUTOMATED_TEST", "TECHNICAL_REVIEW"),
+                ("TECHNICAL_REVIEW", "SECURITY_REVIEW"),
+                ("SECURITY_REVIEW", "HUMAN_GATE"),
+            ],
+        )
+        self.assertEqual(
+            (self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "AFTER"
+        )
+
+    def test_resume_non_capacity_failure_blocks_and_cleans_up(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="boom")
+
+        developer = self._developer(run)
+        files_before = self.repo_files()
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["developer_failure_category"], "CLAUDE_EXECUTION_ERROR")
+        developer.assert_called_once()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_PIPELINE_BLOCKED)
+        self.assertEqual(self.repo_files(), files_before)  # sin rollback
+
+    def test_resume_failing_mandatory_test_blocks_and_cleans_up(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        test = mock.MagicMock(
+            side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="FAIL"
+            )
+        )
+        rc, result, _test = self.resume(developer=self.developer_completes(), test=test)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+
+    # ---- capacidad otra vez ----
+
+    def test_second_capacity_failure_updates_the_suspension(self) -> None:
+        first = self.suspend_with_partial()
+        first_suspension = self.suspension()
+        assert first_suspension is not None
+        self.clock.advance(1800)
+        developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL-2"})
+        rc, result, test = self.resume(developer=developer)
+
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertEqual(result["state"], WAITING)
+        self.assertEqual(result["capacity_wait_count"], 2)
+        self.assertEqual(result["capacity_wait_started_at"], first["capacity_wait_started_at"])
+        expected_retry = app._iso_utc(self.clock.now + timedelta(seconds=1800))
+        self.assertEqual(result["next_retry_at"], expected_retry)
+        developer.assert_called_once()
+        test.assert_not_called()
+
+        second = self.suspension()
+        assert second is not None
+        self.assertEqual(second["capacity_wait_count"], 2)
+        self.assertEqual(second["capacity_wait_started_at"], first_suspension["capacity_wait_started_at"])
+        self.assertEqual(second["next_retry_at"], expected_retry)
+        self.assertNotEqual(second["working_tree_fingerprint"], first_suspension["working_tree_fingerprint"])
+        self.assertEqual(second["working_tree_fingerprint"], self.current_fingerprint().fingerprint)
+        for unchanged in (
+            "task_packet_path",
+            "task_packet_sha256",
+            "project_rules_sha256",
+            "permissions_sha256",
+            "baseline_head_sha",
+            "baseline_branch",
+        ):
+            self.assertEqual(second[unchanged], first_suspension[unchanged], unchanged)
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], WAITING)
+        self.assertEqual(task["attempt_count"], 0)
+        self.assertEqual(
+            self.history_pairs()[-3:],
+            [("DEVELOPING", WAITING), (WAITING, "DEVELOPING"), ("DEVELOPING", WAITING)],
+        )
+        self.assert_partial_edits(allowed="PARTIAL-2")
+
+    def test_repeated_resumes_keep_the_original_baseline(self) -> None:
+        self.suspend_with_partial()
+        baseline = self.suspension()["baseline_head_sha"]
+        for round_number in range(2, 5):
+            self.clock.advance(1800)
+            rc, result, _test = self.resume(
+                developer=self.developer_capacity(edits={"allowed.txt": f"PARTIAL-{round_number}"})
+            )
+            self.assertEqual(rc, 10)
+            self.assertEqual(result["capacity_wait_count"], round_number)
+            self.assertEqual(self.suspension()["baseline_head_sha"], baseline)
+
+    # ---- límites ----
+
+    def _set_suspension_count(self, count: int) -> None:
+        with Store(self.db_path) as store:
+            existing = store.get_suspension(TASK_ID)
+            assert existing is not None
+            store.update_suspension(
+                TASK_ID,
+                working_tree_fingerprint=existing["working_tree_fingerprint"],
+                touched_paths=json.loads(existing["touched_paths_json"]),
+                capacity_wait_count=count,
+                next_retry_at=existing["next_retry_at"],
+            )
+
+    def test_count_equal_to_max_attempts_can_still_resume_once(self) -> None:
+        self.suspend_with_partial()
+        self._set_suspension_count(12)
+        self.clock.advance(1800)
+        developer = self.developer_completes()
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 0)  # count == max_attempts NO bloquea antes de Claude
+        developer.assert_called_once()
+
+    def test_a_thirteenth_suspension_is_never_created(self) -> None:
+        self.suspend_with_partial()
+        self._set_suspension_count(12)
+        self.clock.advance(1800)
+        developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL-13"})
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_called_once()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())  # ni fila con count=13
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+        self.assertEqual(
+            (self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "PARTIAL-13"
+        )  # ediciones parciales preservadas
+
+    def test_the_twelfth_suspension_is_still_created(self) -> None:
+        # Frontera: max_attempts = 12 PERMITE 12 suspensiones. Con count=11, una
+        # nueva falla de capacidad crea la número 12 (WAITING, no BLOCKED).
+        self.suspend_with_partial()
+        self._set_suspension_count(11)
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(
+            developer=self.developer_capacity(edits={"allowed.txt": "PARTIAL-12"})
+        )
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertEqual(result["state"], WAITING)
+        self.assertEqual(result["capacity_wait_count"], 12)
+        suspension = self.suspension()
+        assert suspension is not None
+        self.assertEqual(suspension["capacity_wait_count"], 12)
+
+    def test_max_attempts_one_allows_exactly_one_suspension(self) -> None:
+        self.set_capacity_wait(max_attempts=1)
+        first = self.suspend_with_partial()  # la PRIMERA suspensión sí se crea
+        self.assertEqual(first["capacity_wait_count"], 1)
+        self.assertEqual(first["capacity_wait_max_attempts"], 1)
+        self.clock.advance(1800)
+        developer = self.developer_capacity(edits={"allowed.txt": "PARTIAL-2"})
+        rc, result, _test = self.resume(developer=developer)  # count == max: se reanuda una vez
+        developer.assert_called_once()
+        self.assertEqual(rc, 1)  # ...pero la suspensión 2 excede max_attempts
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertIsNone(self.suspension())
+
+    def test_max_attempts_two_allows_exactly_two_suspensions(self) -> None:
+        self.set_capacity_wait(max_attempts=2)
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_capacity(edits={"allowed.txt": "P2"}))
+        self.assertEqual((rc, result["capacity_wait_count"]), (10, 2))
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_capacity(edits={"allowed.txt": "P3"}))
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertIsNone(self.suspension())
+
+    def test_count_above_max_attempts_in_the_db_blocks_without_claude(self) -> None:
+        self.suspend_with_partial()
+        self._set_suspension_count(13)
+        self.clock.advance(1800)
+        developer = self.never_called()
+        files_before = self.repo_files()
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertIsNone(self.suspension())
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertEqual(self.history_pairs()[-1], (WAITING, "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_LIMIT_REACHED)
+        self.assertEqual(self.repo_files(), files_before)
+
+    def test_max_wait_elapsed_before_claim_blocks_atomically_without_claude(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(28800)  # >= max_wait_seconds
+        developer = self.never_called()
+        files_before = self.repo_files()
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], (WAITING, "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_LIMIT_REACHED)
+        self.assertEqual(self.repo_files(), files_before)
+
+    def test_max_wait_elapsed_during_the_run_blocks_the_new_suspension(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        developer = self.developer_capacity(
+            edits={"allowed.txt": "PARTIAL-2"}, on_run=lambda: self.clock.advance(28800)
+        )
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_called_once()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+
+    def test_started_at_is_never_restarted_by_later_suspensions(self) -> None:
+        first = self.suspend_with_partial()
+        for _ in range(3):
+            self.clock.advance(1800)
+            self.resume(developer=self.developer_capacity(edits={"allowed.txt": "X"}))
+        self.assertEqual(
+            self.suspension()["capacity_wait_started_at"], first["capacity_wait_started_at"]
+        )
+
+    # ---- la configuración ACTUAL gobierna la reanudación ----
+
+    def test_auto_wait_disabled_while_waiting_closes_the_suspension(self) -> None:
+        self.suspend_with_partial()
+        self.set_capacity_wait(auto_wait=False)
+        self.clock.advance(1800)
+        developer = self.never_called()
+        files_before = self.repo_files()
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_not_called()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], (WAITING, "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_AUTO_WAIT_DISABLED)
+        self.assertEqual(self.repo_files(), files_before)
+
+    def test_more_restrictive_current_limits_are_applied(self) -> None:
+        self.suspend_with_partial()
+        self.set_capacity_wait(retry_interval_seconds=60, max_wait_seconds=60)
+        self.clock.advance(1800)
+        developer = self.never_called()
+        rc, _result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertIsNone(self.suspension())
+
+    def test_agents_yaml_is_deliberately_not_part_of_the_identity(self) -> None:
+        self.suspend_with_partial()
+        # Cambiar la política de espera es legítimo y NO invalida la identidad.
+        self.set_capacity_wait(retry_interval_seconds=900, max_attempts=20)
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+
+    # ---- precondiciones y concurrencia ----
+
+    def test_resume_of_unknown_or_non_waiting_tasks_fails_closed(self) -> None:
+        developer = self.never_called()
+        rc, _result, _test = self.resume(developer=developer, task_id="NOPE-1")
+        self.assertEqual(rc, 1)
+        rc, _result, _test = self.resume(developer=developer, task_id="bad id")
+        self.assertEqual(rc, 1)
+        rc, _result, _test = self.run_task(developer=self.developer_completes())
+        dump_before = self.dump_db()
+        rc, _result, _test = self.resume(developer=developer)  # tarea en HUMAN_GATE
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_before)
+
+    def test_task_already_claimed_by_another_process_never_reaches_the_developer(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        with Store(self.db_path) as other:  # el otro proceso ya ganó el claim
+            other.claim_capacity_resume(TASK_ID, reason="other process", actor="other")
+        developer = self.never_called()
+        rc, _result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+
+    def test_losing_the_claim_race_never_reaches_the_developer(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        real_claim = Store.claim_capacity_resume
+        db_path = self.db_path
+
+        def racing_claim(store_self, task_id, **kwargs):
+            # Entre la comprobación previa y el claim, OTRO proceso gana.
+            with Store(db_path) as other:
+                real_claim(other, task_id, reason="winner", actor="winner")
+            return real_claim(store_self, task_id, **kwargs)
+
+        developer = self.never_called()
+        with mock.patch.object(Store, "claim_capacity_resume", racing_claim):
+            rc, _result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)  # el perdedor falla cerrado
+        developer.assert_not_called()
+        test.assert_not_called()
+        claims = [e for e in self.history() if (e["from_status"], e["to_status"]) == (WAITING, "DEVELOPING")]
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["actor"], "winner")
+
+    def test_resume_never_consumes_a_functional_attempt(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        self.resume(developer=self.developer_capacity(edits={"allowed.txt": "X"}))
+        self.clock.advance(1800)
+        self.resume(developer=self.developer_completes())
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["attempt_count"], 0)
+
+
+class PersistedContinuityTests(PersistedExecutionTestCase):
+    """Tras la suspensión, CUALQUIER cambio de identidad o de working tree
+    debe BLOQUEAR sin invocar al Developer, eliminar la suspensión y dejar el
+    repositorio exactamente como está (sin rollback)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.suspend_with_partial()
+
+    def assert_blocked_resume(self, expected_reason: str) -> dict:
+        self.clock.advance(1800)
+        developer = self.never_called()
+        files_before = self.repo_files()
+        rc, result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["reason"], expected_reason)
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertIsNone(self.suspension())  # suspensión eliminada
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertEqual(self.history_pairs()[-1], ("DEVELOPING", "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], expected_reason)
+        self.assertEqual(self.repo_files(), files_before)  # ediciones NO revertidas
+        return result
+
+    def _update_suspension_column(self, column: str, value) -> None:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(f"UPDATE task_suspension SET {column} = ? WHERE task_id = ?", (value, TASK_ID))
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ---- identidad ----
+
+    def test_task_packet_changed(self) -> None:
+        # Un solo comentario añadido basta: se hashean los BYTES CRUDOS.
+        self.taskexec_packet_path.write_text(
+            self.taskexec_packet_path.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+        )
+        self.assert_blocked_resume(app._REASON_IDENTITY_CHANGED)
+
+    def test_task_packet_deleted(self) -> None:
+        self.taskexec_packet_path.unlink()
+        self.assert_blocked_resume(app._REASON_VERIFICATION_FAILED)
+
+    def test_project_rules_changed(self) -> None:
+        self.rules_path.write_text(
+            self.rules_path.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+        )
+        self.assert_blocked_resume(app._REASON_IDENTITY_CHANGED)
+
+    def test_permissions_changed(self) -> None:
+        self.permissions_path.write_text(
+            self.permissions_path.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+        )
+        self.assert_blocked_resume(app._REASON_IDENTITY_CHANGED)
+
+    def test_persisted_packet_path_traversal_is_rejected(self) -> None:
+        for bad in ("../evil.yaml", "/etc/passwd", "tasks\\..\\evil.yaml", "C:/evil.yaml"):
+            with self.subTest(path=bad):
+                self.assertRaises(app.CliError, app._resolve_persisted_packet_path, bad)
+        self._update_suspension_column("task_packet_path", "../evil.yaml")
+        self.assert_blocked_resume(app._REASON_VERIFICATION_FAILED)
+
+    # ---- repositorio ----
+
+    def test_head_changed(self) -> None:
+        _git("commit", "--allow-empty", "-m", "external commit", cwd=self.taskexec_repo)
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_branch_changed(self) -> None:
+        _git("checkout", "-b", "another-branch", cwd=self.taskexec_repo)
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_tracked_file_changed(self) -> None:
+        (self.taskexec_repo / "allowed.txt").write_text("TAMPERED", encoding="utf-8")
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_same_size_tracked_change_is_detected(self) -> None:
+        (self.taskexec_repo / "allowed.txt").write_text("PARTIAL"[::-1], encoding="utf-8")
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_untracked_file_changed(self) -> None:
+        (self.taskexec_repo / "new_authorized.txt").write_text("TAMPERED", encoding="utf-8")
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_extra_untracked_file_appeared(self) -> None:
+        (self.taskexec_repo / "extra.txt").write_text("surprise", encoding="utf-8")
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_touched_file_deleted(self) -> None:
+        (self.taskexec_repo / "new_authorized.txt").unlink()
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_tracked_file_deleted(self) -> None:
+        (self.taskexec_repo / "allowed.txt").unlink()
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_rename(self) -> None:
+        _git("mv", "allowed.txt", "renamed.txt", cwd=self.taskexec_repo)
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_staging_altered(self) -> None:
+        _git("add", "allowed.txt", cwd=self.taskexec_repo)  # mismo contenido, distinto staging
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_link_like_touched_path_appeared(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "external.txt"
+            target.write_text("EXTERNAL", encoding="utf-8")
+            link = self.taskexec_repo / "new_authorized.txt"
+            link.unlink()
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not available in this environment")
+            self.assert_blocked_resume(app._REASON_VERIFICATION_FAILED)
+
+    # ---- registro persistido ----
+
+    def test_touched_paths_json_invalid(self) -> None:
+        self._update_suspension_column("touched_paths_json", "this is not json")
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_touched_paths_json_mismatch(self) -> None:
+        self._update_suspension_column("touched_paths_json", json.dumps(["allowed.txt"]))
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_touched_paths_json_wrong_shape(self) -> None:
+        self._update_suspension_column("touched_paths_json", json.dumps({"allowed.txt": 1}))
+        self.assert_blocked_resume(app._REASON_CONTINUITY_BROKEN)
+
+    def test_scope_revalidation_failure_blocks_before_claude(self) -> None:
+        with mock.patch.object(app, "_evaluate_scope_security", return_value=(False, "x")):
+            self.assert_blocked_resume(app._REASON_SCOPE_INVALID)
+
+    def test_invalid_timestamp_in_the_record_blocks_while_waiting(self) -> None:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("UPDATE task_suspension SET next_retry_at = 'tomorrow'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.clock.advance(1800)
+        developer = self.never_called()
+        rc, _result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.history_pairs()[-1], (WAITING, "BLOCKED"))
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_INVALID_RECORD)
+
+
+class PersistedOrphanWaitingTests(PersistedExecutionTestCase):
+    """CAPACITY-RESUME-EXECUTION-002 CORRECTION-001: task WAITING pero SIN
+    task_suspension es una inconsistencia persistente del orquestador. Se
+    cierra de forma segura (WAITING -> BLOCKED, motivo fijo), sin Claude, sin
+    reconstruir nada y sin tocar las ediciones parciales."""
+
+    def make_orphan(self) -> None:
+        self.suspend_with_partial()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("DELETE FROM task_suspension")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(self.suspension())
+        self.assertEqual(self.task()["status"], WAITING)
+
+    def test_orphan_waiting_is_closed_as_blocked_without_claude(self) -> None:
+        self.make_orphan()
+        events_before = self.history()
+        files_before = self.repo_files()
+        head_before = self.head()
+        developer = self.never_called()
+
+        rc, result, test = self.resume(developer=developer)
+
+        # H: exit code 1; estado público BLOCKED con texto fijo.
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertFalse(result["developer_completed"])
+        self.assertFalse(result["commit_performed"])
+        self.assertEqual(result["reason"], app._REASON_SUSPENSION_MISSING)
+        # No se finge un nuevo fallo de Claude.
+        self.assertNotIn("developer_failure_category", result)
+        # D/E: ni Developer ni mandatory tests.
+        developer.assert_not_called()
+        test.assert_not_called()
+        # A: la tarea ya no queda atrapada en WAITING.
+        task = self.task()
+        assert task is not None
+        self.assertEqual(task["status"], "BLOCKED")
+        # B/C: EXACTAMENTE un status_event nuevo, WAITING -> BLOCKED, motivo fijo.
+        events = self.history()
+        self.assertEqual(len(events), len(events_before) + 1)
+        self.assertEqual(events[:-1], events_before)
+        last = events[-1]
+        self.assertEqual((last["from_status"], last["to_status"]), (WAITING, "BLOCKED"))
+        self.assertEqual(last["reason"], "blocked: capacity suspension record missing")
+        self.assertEqual(last["actor"], app.PERSISTED_ACTOR)
+        # F: no se crea (ni se reconstruye) ninguna suspensión.
+        self.assertIsNone(self.suspension())
+        # G: ediciones parciales intactas; HEAD sin cambios.
+        self.assertEqual(self.repo_files(), files_before)
+        self.assert_partial_edits()
+        self.assertEqual(self.head(), head_before)
+        self.assertEqual(task["attempt_count"], 0)
+
+    def test_orphan_close_is_idempotent_and_never_reopens(self) -> None:
+        self.make_orphan()
+        self.resume(developer=self.never_called())
+        dump_after_close = self.dump_db()
+        developer = self.never_called()
+        rc, _result, _test = self.resume(developer=developer)  # ya BLOCKED
+        self.assertEqual(rc, 1)
+        developer.assert_not_called()
+        self.assertEqual(self.dump_db(), dump_after_close)  # sin más cambios
+
+    def test_orphan_does_not_depend_on_the_retry_time(self) -> None:
+        # Da igual que "no esté vencida": una inconsistencia no espera.
+        self.make_orphan()
+        self.clock.advance(1)  # muy antes de next_retry_at
+        developer = self.never_called()
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        developer.assert_not_called()
+
+    def test_state_race_while_closing_an_orphan_fails_closed(self) -> None:
+        # Entre la lectura y la transición OTRO proceso cambia el estado: no se
+        # fuerza la transición, no se invoca a Claude y no se duplica el evento.
+        self.make_orphan()
+        real_transition = Store.transition_task
+        db_path = self.db_path
+
+        def racing_transition(store_self, task_id, to_status, reason, actor):
+            with Store(db_path) as other:
+                real_transition(other, task_id, "BLOCKED", "other process", "other")
+            return real_transition(store_self, task_id, to_status, reason, actor)
+
+        developer = self.never_called()
+        with mock.patch.object(Store, "transition_task", racing_transition):
+            rc, _result, test = self.resume(developer=developer)
+        self.assertEqual(rc, 1)  # error: nunca sigue adelante
+        developer.assert_not_called()
+        test.assert_not_called()
+        closes = [
+            e for e in self.history() if (e["from_status"], e["to_status"]) == (WAITING, "BLOCKED")
+        ]
+        self.assertEqual(len(closes), 1)  # solo el evento del otro proceso
+        self.assertEqual(closes[0]["reason"], "other process")
+        self.assertEqual(self.task()["status"], "BLOCKED")
+        self.assert_partial_edits()
+
+    def test_valid_waiting_with_a_suspension_is_unchanged(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertIsNone(self.suspension())
+        self.assertNotIn(
+            app._REASON_SUSPENSION_MISSING, {event["reason"] for event in self.history()}
+        )
+
+    def test_the_probe_is_unaffected_by_orphan_handling(self) -> None:
+        with mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=self.developer_capacity(),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        store_mock.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+
+class PersistedDataSecurityTests(PersistedExecutionTestCase):
+    def test_no_claude_data_or_prompt_content_reaches_the_database(self) -> None:
+        # Sentinels en el objective (viaja en el prompt), stderr, result,
+        # session_id, usage y modelUsage; se recorre run-task + dos resumes.
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["objective"] = SENTINELS[5]
+        _write_yaml(self.taskexec_packet_path, packet)
+
+        rc, first, _test = self.run_task(
+            developer=self.developer_capacity(stderr=SENTINELS[4])
+        )
+        self.assertEqual(rc, 10)
+        self.clock.advance(1800)
+        rc, second, _test = self.resume(developer=self.developer_capacity(stderr=SENTINELS[4]))
+        self.assertEqual(rc, 10)
+
+        dump = self.dump_db()
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, dump)
+        # La salida pública del estado WAITING tampoco contiene datos de Claude.
+        for result in (first, second):
+            raw = json.dumps(result)
+            for sentinel in SENTINELS[:5]:
+                self.assertNotIn(sentinel, raw)
+            self.assertLessEqual(set(result["developer_failure_details"]), ALLOWED_DETAIL_KEYS)
+
+    def test_every_status_event_reason_is_a_fixed_engine_text(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        self.resume(developer=self.developer_capacity(edits={"allowed.txt": "X"}))
+        self.clock.advance(1800)
+        self.resume(developer=self.developer_completes())
+        allowed = {
+            value
+            for name, value in vars(app).items()
+            if name.startswith("_REASON_") and isinstance(value, str)
+        } | {"task created"}
+        reasons = {event["reason"] for event in self.history()}
+        self.assertLessEqual(reasons, allowed)
+        for actor in {event["actor"] for event in self.history()}:
+            self.assertIn(actor, {"system", app.PERSISTED_ACTOR})
+
+    def test_blocked_reasons_never_carry_the_developer_error_text(self) -> None:
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=json.dumps({"result": SENTINELS[0]}), stderr=SENTINELS[4]
+            )
+
+        rc, _result, _test = self.run_task(developer=self._developer(run))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.history()[-1]["reason"], app._REASON_PIPELINE_BLOCKED)
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, self.dump_db())
+
+    def test_no_claude_session_is_persisted_or_reused(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        developer = self.developer_completes()
+        self.resume(developer=developer)
+        self.assertNotIn("--resume", developer.seen["args"])
+        self.assertNotIn("-r", developer.seen["args"])
+        self.assertNotIn("session", self.dump_db().lower().replace("session_id_column", ""))
+
+
+class ResumePromptTests(PersistedExecutionTestCase):
+    def test_fresh_prompt_has_no_notice_and_resume_prompt_has_exactly_one(self) -> None:
+        fresh_developer = self.developer_capacity()
+        self.run_task(developer=fresh_developer)
+        self.clock.advance(1800)
+        resume_developer = self.developer_completes()
+        self.resume(developer=resume_developer)
+
+        fresh_prompt = fresh_developer.prompts[0]
+        resume_prompt = resume_developer.prompts[0]
+        boundary = app._DEVELOPER_EXECUTION_ROLE_BOUNDARY
+        packet = task_packet_mod.load_task_packet_from_yaml_file(self.taskexec_packet_path)
+
+        # Fresco: exactamente el prompt determinista de siempre, sin nota.
+        self.assertEqual(fresh_prompt, app._build_developer_execution_prompt(packet))
+        self.assertNotIn("RESUME NOTICE", fresh_prompt)
+        # Resume: UNA nota fija, entre el contenido del packet y el role boundary.
+        self.assertEqual(resume_prompt.count("=== RESUME NOTICE (FIXED ENGINE RULES) ==="), 1)
+        self.assertEqual(resume_prompt.count(RESUME_NOTICE), 1)
+        index = fresh_prompt.rindex(boundary)
+        self.assertEqual(resume_prompt, fresh_prompt[:index] + RESUME_NOTICE + "\n\n" + fresh_prompt[index:])
+        self.assertLess(resume_prompt.index("=== GOVERNANCE EPILOGUE"), resume_prompt.index(RESUME_NOTICE))
+        self.assertLess(resume_prompt.index(RESUME_NOTICE), resume_prompt.index(boundary))
+
+    def test_role_boundary_is_still_the_last_section_of_both_prompts(self) -> None:
+        fresh_developer = self.developer_capacity()
+        self.run_task(developer=fresh_developer)
+        self.clock.advance(1800)
+        resume_developer = self.developer_completes()
+        self.resume(developer=resume_developer)
+        boundary = app._DEVELOPER_EXECUTION_ROLE_BOUNDARY
+        self.assertTrue(fresh_developer.prompts[0].endswith(boundary))
+        self.assertTrue(resume_developer.prompts[0].endswith(boundary))
+
+    def test_notice_is_fixed_text_without_dynamic_data(self) -> None:
+        self.assertTrue(app._DEVELOPER_EXECUTION_ROLE_BOUNDARY.startswith(DEVELOPER_ROLE_BOUNDARY_HEADING))
+        self.assertNotIn("{", RESUME_NOTICE)
+        self.assertNotIn("}", RESUME_NOTICE)
+        self.assertIsNone(re.search(r"\d", RESUME_NOTICE))  # sin contadores ni timestamps
+        for word in ("allowed.txt", "TASKEXEC", "session", "SENTINEL"):
+            self.assertNotIn(word, RESUME_NOTICE)
+
+    def test_two_resumes_of_the_same_packet_get_the_same_prompt(self) -> None:
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        first = self.developer_capacity(edits={"allowed.txt": "PARTIAL-2"})
+        self.resume(developer=first)
+        self.clock.advance(1800)
+        second = self.developer_completes()
+        self.resume(developer=second)
+        self.assertEqual(first.prompts[0], second.prompts[0])
+
+
+class StatelessProbeRegressionTests(PersistedExecutionTestCase):
+    """task-execution-probe sigue siendo STATELESS y backward-compatible."""
+
+    def test_temporary_limit_is_still_blocked_without_store_or_db(self) -> None:
+        developer = self.developer_capacity()
+        test = mock.MagicMock(side_effect=self._test_passes)
+        with mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=developer, test=test
+        ):
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual(rc, 1)  # exit code existente
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["developer_failure_category"], "CLAUDE_TEMPORARY_LIMIT")
+        self.assertNotIn("capacity_wait_count", result)
+        developer.assert_called_once()
+        test.assert_not_called()
+        store_mock.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_success_is_unchanged_and_needs_no_database(self) -> None:
+        with mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=self.developer_completes(),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        store_mock.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_execute_task_packet_new_parameters_are_optional_keyword_only(self) -> None:
+        import inspect
+
+        parameters = inspect.signature(app.execute_task_packet).parameters
+        for name, default in (("before", None), ("resume", False), ("capacity_hook", None)):
+            self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertEqual(parameters[name].default, default)
+
+    def test_resume_requires_the_original_before(self) -> None:
+        packet = task_packet_mod.load_task_packet_from_yaml_file(self.taskexec_packet_path)
+        with self.assertRaises(ValueError):
+            app.execute_task_packet(
+                packet,
+                project_rules={},
+                developer_config={},
+                permissions={},
+                orchestrator_repo_root=self.root,
+                mandatory_test_timeout=1,
+                resume=True,
+            )
+
+
+class PersistedStaticSafetyTests(unittest.TestCase):
+    def test_no_sleep_scheduler_session_resume_or_destructive_git_in_sources(self) -> None:
+        for name in ("app.py", "adapters/claude_code.py", "store.py"):
+            text = (SRC_DIR / "orchestrator" / name).read_text(encoding="utf-8")
+            for needle in ("time.sleep", "import time", "asyncio", "threading", "schtasks", "shell=True"):
+                self.assertNotIn(needle, text, f"{needle!r} found in {name}")
+            self.assertIsNone(
+                re.search(r'\[\s*"(restore|reset|clean|checkout|push|merge)"', text),
+                f"destructive git subcommand in {name}",
+            )
+        adapter = (SRC_DIR / "orchestrator" / "adapters" / "claude_code.py").read_text(encoding="utf-8")
+        self.assertNotIn('"--resume"', adapter)
+        self.assertNotIn("'--resume'", adapter)
+        store_source = (SRC_DIR / "orchestrator" / "store.py").read_text(encoding="utf-8")
+        for needle in ("session_id", "stdout", "stderr", "prompt"):
+            self.assertNotIn(f"{needle} TEXT", store_source)
+
+    def test_new_commands_are_registered_and_exit_codes_are_the_approved_ones(self) -> None:
+        choices = app.build_parser()._subparsers._group_actions[0].choices
+        self.assertIn("run-task", choices)
+        self.assertIn("resume-capacity", choices)
+        self.assertEqual(
+            (app.EXIT_HUMAN_GATE, app.EXIT_BLOCKED_OR_ERROR, app.EXIT_WAITING_FOR_CAPACITY),
+            (0, 1, 10),
+        )
 
 
 if __name__ == "__main__":

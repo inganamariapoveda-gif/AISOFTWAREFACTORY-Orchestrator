@@ -709,12 +709,56 @@ def _validate_task_execution_config(
     return executable, output_format, max_turns, timeout_seconds, permission_mode
 
 
+# CAPACITY-RESUME-EXECUTION-002: modo de REANUDACIÓN del Developer. El
+# heading identifica la sección "role boundary" que el motor añade SIEMPRE
+# al final del prompt (app._DEVELOPER_EXECUTION_ROLE_BOUNDARY); la nota de
+# reanudación se inserta INMEDIATAMENTE ANTES, de modo que el role boundary
+# siga siendo la última autoridad del prompt.
+DEVELOPER_ROLE_BOUNDARY_HEADING = (
+    "=== DEVELOPER EXECUTION ROLE BOUNDARY (FIXED ENGINE RULES) ==="
+)
+
+# Texto FIJO del motor: sin datos dinámicos (ni paths, contadores,
+# timestamps, session_id ni nada de Claude).
+RESUME_NOTICE = """=== RESUME NOTICE (FIXED ENGINE RULES) ===
+This execution CONTINUES the same authorized Task Packet after a temporary Claude capacity interruption.
+
+The working tree may already contain partial changes created by an earlier attempt and limited to AUTHORIZED_FILES.
+
+Preserve those authorized partial changes.
+
+Inspect the current authorized files and complete only the remaining work required by the ORIGINAL Task Packet.
+
+Do not revert, discard, restart from a clean tree, broaden scope, change architecture, or modify unauthorized files.
+
+The Developer Execution Role Boundary below remains fully applicable."""
+
+
+def _insert_resume_notice(prompt: str) -> str:
+    """Inserta RESUME_NOTICE justo antes de la sección role boundary FINAL
+    del prompt. Falla cerrado (DeveloperExecutionError) si el prompt no
+    termina en esa sección (nunca se adivina una posición)."""
+    index = prompt.rfind(DEVELOPER_ROLE_BOUNDARY_HEADING)
+    if index <= 0:
+        raise DeveloperExecutionError(
+            "resume notice could not be placed: role boundary section not found"
+        )
+    # El role boundary debe ser la ÚLTIMA sección: ningún otro heading "==="
+    # puede aparecer después de él.
+    if "\n=== " in prompt[index + len(DEVELOPER_ROLE_BOUNDARY_HEADING) :]:
+        raise DeveloperExecutionError(
+            "resume notice could not be placed: role boundary is not the last section"
+        )
+    return prompt[:index] + RESUME_NOTICE + "\n\n" + prompt[index:]
+
+
 def run_developer_task(
     *,
     developer_config: dict[str, Any],
     prompt: str,
     cwd: Path | str,
     authorized_root: Path | str,
+    resume: bool = False,
 ) -> DeveloperResult:
     """Ejecuta una única instrucción de desarrollo estructurada (Task
     Packet) con Claude Code CLI, dentro de authorized_root.
@@ -725,10 +769,17 @@ def run_developer_task(
     verdadero, o forma inesperada. Nunca convierte un fallo en éxito y
     nunca exige un texto exacto de 'result' (no PASS/SUCCESS/DONE ni
     equivalente): solo su forma estructural. TASK-EXECUTION-005: usa
-    EXCLUSIVAMENTE developer.task_execution, nunca developer.write_probe."""
+    EXCLUSIVAMENTE developer.task_execution, nunca developer.write_probe.
+
+    CAPACITY-RESUME-EXECUTION-002: `resume=False` (por defecto) deja el
+    comportamiento EXACTAMENTE igual. Con `resume=True` se añade la regla
+    fija RESUME_NOTICE inmediatamente antes del role boundary final. No se
+    reutiliza ninguna sesión de Claude (nunca `--resume`)."""
     executable_name, output_format, max_turns, timeout_seconds, permission_mode = (
         _validate_task_execution_config(developer_config)
     )
+    if resume:
+        prompt = _insert_resume_notice(prompt)
     executable_path = _resolve_executable(executable_name)
     resolved_cwd = _resolve_cwd(cwd, authorized_root)
 
