@@ -1,0 +1,12 @@
+# NOTIFICATIONS.yaml — avisos SALIENTES de Human Gate (HUMAN-GATE-NOTIFY-001)
+#
+# Slack es solo un canal de aviso; SQLite sigue siendo la fuente de verdad.
+# NUNCA colocar aqui la URL del webhook ni ninguna credencial: solo el NOMBRE
+# de la variable de entorno (del proceso/usuario) que contiene el valor.
+
+notifications:
+  enabled: true
+  provider: slack
+  webhook_env_var: AISOFTWAREFACTORY_SLACK_WEBHOOK_URL
+  events:
+    human_gate: true

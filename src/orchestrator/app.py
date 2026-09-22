@@ -31,14 +31,23 @@ from .adapters.claude_code import (
     run_handshake,
     run_write_probe,
 )
+from .adapters.slack_notifier import SlackWebhookNotifier
 from .config_loader import (
     ConfigError,
+    NotificationsConfig,
     OrchestratorConfig,
     load_core_config,
+    load_notifications_config,
     load_project_rules,
     resolve_project_root,
 )
 from .evidence import EvidenceError
+from .notifications import (
+    PUBLIC_CONFIG_INVALID,
+    PUBLIC_FAILED,
+    NotifierPort,
+    dispatch_human_gate_notification,
+)
 from .sandbox import SandboxError
 from .state_machine import StateMachineError
 from .store import InvalidIdError, Store, StoreError, validate_id
@@ -1186,6 +1195,66 @@ def cmd_run_task(args: argparse.Namespace) -> int:
     return exit_code
 
 
+# ============================================================
+# HUMAN-GATE-NOTIFY-001: aviso saliente al entrar a un Human Gate.
+#
+# Un ÚNICO hook, llamado solo después de complete_fresh_task /
+# complete_resumed_task (HUMAN_GATE ya committed). Slack es solo un canal:
+# SQLite es la fuente de verdad, un fallo de aviso jamás cambia la tarea ni
+# el exit code, y la semántica es at-most-once (sin reintentos).
+# ============================================================
+
+
+def _gate_actions(config: OrchestratorConfig) -> dict[str, str]:
+    """Texto ESTÁTICO de cada gate (GATES.yaml validado)."""
+    actions: dict[str, str] = {}
+    for gate in config.gates.get("human_gates", []):
+        if isinstance(gate, dict) and isinstance(gate.get("name"), str):
+            if isinstance(gate.get("action"), str):
+                actions[gate["name"]] = gate["action"]
+    return actions
+
+
+def _build_notifier(
+    notifications: NotificationsConfig, gate_actions: dict[str, str]
+) -> NotifierPort:
+    """Raíz de composición: único lugar donde se elige el adapter."""
+    if notifications.provider == "slack" and notifications.webhook_env_var:
+        return SlackWebhookNotifier(
+            webhook_env_var=notifications.webhook_env_var, gate_actions=gate_actions
+        )
+    raise ConfigError("unsupported notification provider")
+
+
+def _notify_human_gate(
+    store: Store, completed_task: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Devuelve los campos PÚBLICOS aditivos ({} si las notificaciones están
+    desactivadas). Nunca lanza."""
+    try:
+        notifications = load_notifications_config(CONFIG_DIR)
+    except Exception:  # noqa: BLE001 - config inválida: no se envía, no se bloquea
+        return {"notification_status": PUBLIC_CONFIG_INVALID}
+    if not notifications.enabled or not notifications.human_gate:
+        return {}
+    try:
+        notifier = _build_notifier(notifications, _gate_actions(_require_core_config()))
+        outcome = dispatch_human_gate_notification(
+            store,
+            notifier,
+            project_id=completed_task["project_id"],
+            task_id=completed_task["id"],
+            gate_type=str(result.get("human_gate") or HUMAN_GATE_FUNCTIONAL_TEST),
+            status_event_id=completed_task["human_gate_status_event_id"],
+        )
+    except Exception:  # noqa: BLE001 - un fallo del aviso NUNCA cambia la tarea
+        return {"notification_status": PUBLIC_FAILED}
+    fields: dict[str, Any] = {"notification_status": outcome.status}
+    if outcome.error_category is not None:
+        fields["notification_error_category"] = outcome.error_category
+    return fields
+
+
 def _block_developing_best_effort(store: Store, task_id: str) -> None:
     try:
         store.transition_task(task_id, STATE_BLOCKED, _REASON_UNEXPECTED_ERROR, PERSISTED_ACTOR)
@@ -1198,7 +1267,12 @@ def _finish_fresh_task(store: Store, task_id: str, result: dict[str, Any]) -> in
     FRESCA (la tarea sigue en DEVELOPING mientras el pipeline trabaja)."""
     state = result["state"]
     if state == STATE_HUMAN_GATE:
-        store.complete_fresh_task(task_id, reason=_REASON_COMPLETED, actor=PERSISTED_ACTOR)
+        completed = store.complete_fresh_task(
+            task_id, reason=_REASON_COMPLETED, actor=PERSISTED_ACTOR
+        )
+        # HUMAN_GATE ya está committed: el aviso es solo un canal y NUNCA
+        # cambia la tarea ni el exit code.
+        result.update(_notify_human_gate(store, completed, result))
         return EXIT_HUMAN_GATE
     if state == STATE_WAITING_FOR_CLAUDE_CAPACITY:
         return EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la suspensión
@@ -1428,9 +1502,11 @@ def _run_claimed_resume(
     assert result is not None
     state = result["state"]
     if state == STATE_HUMAN_GATE:
-        store.complete_resumed_task(
+        completed = store.complete_resumed_task(
             task_id, reason=_REASON_RESUME_COMPLETED, actor=PERSISTED_ACTOR
         )
+        # Mismo aviso que el camino fresco (cubre también a `resume-due`).
+        result.update(_notify_human_gate(store, completed, result))
         exit_code = EXIT_HUMAN_GATE
     elif state == STATE_WAITING_FOR_CLAUDE_CAPACITY:
         exit_code = EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la nueva suspensión
@@ -1463,6 +1539,8 @@ _RESUME_DUE_SAFE_FIELDS = (
     "developer_failure_category",
     "capacity_wait_count",
     "next_retry_at",
+    "notification_status",
+    "notification_error_category",
 )
 
 

@@ -1481,6 +1481,247 @@ class WaitingCapacityCandidatesTests(SuspensionTestCase):
         self.assertNotIn(WAITING, store_mod._SELECT_WAITING_CANDIDATES_SQL)
 
 
+class NotificationEventStoreTests(SuspensionTestCase):
+    """HUMAN-GATE-NOTIFY-001: notification_event (at-most-once por entrada a
+    HUMAN_GATE) sin ningún dato sensible."""
+
+    def gate_task(self, task_id: str = "T-1") -> int:
+        self.make_task(task_id)
+        completed = self.store.complete_fresh_task(task_id, reason="pipeline completed", actor="orchestrator")
+        return completed["human_gate_status_event_id"]
+
+    def claim(self, task_id: str, event_id, **overrides):
+        kwargs = {"event_type": "human_gate", "provider": "slack", "gate_type": "HUMAN_FUNCTIONAL_TEST"}
+        kwargs.update(overrides)
+        return self.store.claim_human_gate_notification(task_id, event_id, **kwargs)
+
+    def dump(self) -> str:
+        return "\n".join(self.store._conn.iterdump())
+
+    # ---- schema ----
+
+    def test_table_is_created_automatically_with_the_minimal_columns(self) -> None:
+        rows = self.store._conn.execute("PRAGMA table_info(notification_event)").fetchall()
+        self.assertEqual(
+            [r[1] for r in rows],
+            [
+                "id", "task_id", "status_event_id", "event_type", "provider",
+                "gate_type", "status", "error_category", "attempted_at", "completed_at",
+            ],
+        )
+        fks = {(r[2], r[3]) for r in self.store._conn.execute("PRAGMA foreign_key_list(notification_event)")}
+        self.assertEqual(fks, {("task", "task_id"), ("status_event", "status_event_id")})
+
+    def test_existing_databases_gain_the_table(self) -> None:
+        path = Path(self._tmp.name) / "legacy.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT NOT NULL, repo_path TEXT NOT NULL,"
+            " rules_ref TEXT NOT NULL, created_at TEXT NOT NULL);"
+        )
+        conn.commit()
+        conn.close()
+        with Store(path) as legacy:
+            tables = {r[0] for r in legacy._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("notification_event", tables)
+
+    def test_the_table_holds_no_message_secret_or_claude_columns(self) -> None:
+        columns = {r[1] for r in self.store._conn.execute("PRAGMA table_info(notification_event)")}
+        for forbidden in ("message", "text", "payload", "webhook", "url", "response", "body",
+                          "stdout", "stderr", "prompt", "result", "session_id", "path", "token"):
+            self.assertFalse(any(forbidden in c for c in columns), forbidden)
+
+    # ---- identidad del gate ----
+
+    def test_complete_fresh_task_returns_the_id_of_the_human_gate_status_event(self) -> None:
+        event_id = self.gate_task()
+        history = self.store.get_history("T-1")
+        self.assertEqual(history[-1]["id"], event_id)
+        self.assertEqual(history[-1]["to_status"], "HUMAN_GATE")
+
+    def test_complete_resumed_task_returns_the_id_of_the_human_gate_status_event(self) -> None:
+        self.make_task("T-1")
+        self.store.suspend_for_capacity("T-1", **_suspend_fields())
+        self.store.claim_capacity_resume("T-1", reason="resume", actor="orchestrator")
+        completed = self.store.complete_resumed_task("T-1", reason="r", actor="orchestrator")
+        history = self.store.get_history("T-1")
+        self.assertEqual(completed["human_gate_status_event_id"], history[-1]["id"])
+        self.assertEqual(history[-1]["to_status"], "HUMAN_GATE")
+
+    # ---- claim ----
+
+    def test_claim_creates_one_attempting_row_with_minimal_metadata(self) -> None:
+        event_id = self.gate_task()
+        notification_id = self.claim("T-1", event_id)
+        self.assertIsInstance(notification_id, int)
+        (row,) = self.store.get_notifications("T-1")
+        self.assertEqual(row["id"], notification_id)
+        self.assertEqual(
+            (row["task_id"], row["status_event_id"], row["event_type"], row["provider"],
+             row["gate_type"], row["status"], row["error_category"], row["completed_at"]),
+            ("T-1", event_id, "human_gate", "slack", "HUMAN_FUNCTIONAL_TEST", "ATTEMPTING", None, None),
+        )
+        self.assertIsNotNone(row["attempted_at"])
+
+    def test_unique_prevents_a_second_attempt_for_the_same_gate_entry(self) -> None:
+        event_id = self.gate_task()
+        self.assertIsNotNone(self.claim("T-1", event_id))
+        dump = self.dump()
+        self.assertIsNone(self.claim("T-1", event_id))  # already_exists
+        self.assertEqual(self.dump(), dump)
+        self.assertEqual(len(self.store.get_notifications("T-1")), 1)
+
+    def test_a_different_provider_or_event_type_is_a_different_claim(self) -> None:
+        event_id = self.gate_task()
+        self.assertIsNotNone(self.claim("T-1", event_id))
+        self.assertIsNotNone(self.claim("T-1", event_id, provider="email"))
+        self.assertIsNotNone(self.claim("T-1", event_id, event_type="other_event"))
+
+    def test_a_new_entry_to_human_gate_allows_a_new_notification(self) -> None:
+        first = self.gate_task()
+        self.assertIsNotNone(self.claim("T-1", first))
+        self.store.transition_task("T-1", "CHANGES_REQUESTED", "needs work", "human")
+        self.store.transition_task("T-1", "DEVELOPING", "fix", "orchestrator")
+        second = self.store.complete_fresh_task("T-1", reason="again", actor="orchestrator")[
+            "human_gate_status_event_id"
+        ]
+        self.assertNotEqual(first, second)
+        self.assertIsNone(self.claim("T-1", first))  # el gate viejo sigue deduplicado
+        self.assertIsNotNone(self.claim("T-1", second))  # el nuevo ingreso sí notifica
+        self.assertEqual(len(self.store.get_notifications("T-1")), 2)
+
+    def test_claim_fails_closed_unless_the_event_is_the_human_gate_entry_of_the_task(self) -> None:
+        event_id = self.gate_task()
+        other_event = self.store.get_history("T-1")[-2]["id"]  # SECURITY_REVIEW
+        self.make_task("T-2")
+        for label, task_id, status_event_id in (
+            ("missing event", "T-1", 99999),
+            ("not HUMAN_GATE", "T-1", other_event),
+            ("other task's event", "T-2", event_id),
+        ):
+            with self.subTest(label):
+                dump = self.dump()
+                with self.assertRaises(StoreError):
+                    self.claim(task_id, status_event_id)
+                self.assertEqual(self.dump(), dump)
+
+    def test_claim_validates_its_inputs(self) -> None:
+        event_id = self.gate_task()
+        for kwargs in (
+            {"event_type": "Human Gate"}, {"event_type": ""}, {"provider": "Slack"},
+            {"provider": "../x"}, {"gate_type": "human_gate"}, {"gate_type": "X" * 80},
+        ):
+            with self.subTest(kwargs):
+                with self.assertRaises(StoreError):
+                    self.claim("T-1", event_id, **kwargs)
+        for bad_id in ("1", True, None):
+            with self.assertRaises(StoreError):
+                self.claim("T-1", bad_id)
+        with self.assertRaises(InvalidIdError):
+            self.claim("../x", event_id)
+        self.assertEqual(self.store.get_notifications("T-1"), [])
+
+    # ---- complete ----
+
+    def test_complete_sent_and_failed(self) -> None:
+        event_id = self.gate_task()
+        sent_id = self.claim("T-1", event_id)
+        row = self.store.complete_notification(sent_id, status="SENT")
+        self.assertEqual((row["status"], row["error_category"]), ("SENT", None))
+        self.assertIsNotNone(row["completed_at"])
+        failed_event = self.gate_task("T-2")
+        failed_id = self.claim("T-2", failed_event)
+        row = self.store.complete_notification(failed_id, status="FAILED", error_category="HTTP_4XX")
+        self.assertEqual((row["status"], row["error_category"]), ("FAILED", "HTTP_4XX"))
+
+    def test_error_categories_are_a_fixed_vocabulary(self) -> None:
+        from orchestrator.store import NOTIFICATION_ERROR_CATEGORIES
+
+        self.assertEqual(
+            NOTIFICATION_ERROR_CATEGORIES,
+            {"HTTP_4XX", "HTTP_5XX", "TIMEOUT", "NETWORK", "MISSING_SECRET", "INVALID_WEBHOOK", "CONFIG_INVALID"},
+        )
+        event_id = self.gate_task()
+        notification_id = self.claim("T-1", event_id)
+        for bad in ("BOOM", "http 400", "", None, "Traceback (most recent call last)"):
+            with self.subTest(bad):
+                with self.assertRaises(StoreError):
+                    self.store.complete_notification(notification_id, status="FAILED", error_category=bad)
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(notification_id, status="SENT", error_category="NETWORK")
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(notification_id, status="ATTEMPTING")
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(notification_id, status="DONE")
+        self.assertEqual(self.store.get_notifications("T-1")[0]["status"], "ATTEMPTING")
+        # La CHECK de SQLite también protege la tabla frente a una escritura directa.
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute(
+                "UPDATE notification_event SET status = 'FAILED', error_category = 'anything'"
+            )
+        self.store._conn.rollback()
+
+    def test_complete_only_updates_a_row_that_is_still_attempting(self) -> None:
+        event_id = self.gate_task()
+        notification_id = self.claim("T-1", event_id)
+        self.store.complete_notification(notification_id, status="SENT")
+        dump = self.dump()
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(notification_id, status="FAILED", error_category="NETWORK")
+        self.assertEqual(self.dump(), dump)  # la fila terminada no se toca
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(424242, status="SENT")
+
+    def test_race_between_two_connections_fails_closed(self) -> None:
+        event_id = self.gate_task()
+        notification_id = self.claim("T-1", event_id)
+        with Store(self.db_path) as other:
+            self.assertIsNone(
+                other.claim_human_gate_notification(
+                    "T-1", event_id, event_type="human_gate", provider="slack",
+                    gate_type="HUMAN_FUNCTIONAL_TEST",
+                )
+            )
+            other.complete_notification(notification_id, status="SENT")  # gana el otro
+        with self.assertRaises(StoreError):
+            self.store.complete_notification(notification_id, status="FAILED", error_category="TIMEOUT")
+        (row,) = self.store.get_notifications("T-1")
+        self.assertEqual(row["status"], "SENT")
+
+    def test_claim_is_atomic_and_leaves_no_partial_row_on_failure(self) -> None:
+        event_id = self.gate_task()
+        dump = self.dump()
+        with mock.patch.object(Store, "_write_transaction", side_effect=StoreError("busy")):
+            with self.assertRaises(StoreError):
+                self.claim("T-1", event_id)
+        self.assertEqual(self.dump(), dump)
+        self.assertFalse(self.store._conn.in_transaction)
+
+    # ---- no data ----
+
+    def test_only_fixed_metadata_reaches_the_table(self) -> None:
+        event_id = self.gate_task()
+        notification_id = self.claim("T-1", event_id)
+        self.store.complete_notification(notification_id, status="FAILED", error_category="HTTP_5XX")
+        (row,) = self.store.get_notifications("T-1")
+        allowed_text = {
+            "T-1", "human_gate", "slack", "HUMAN_FUNCTIONAL_TEST", "FAILED", "HTTP_5XX",
+            row["attempted_at"], row["completed_at"],
+        }
+        for key, value in row.items():
+            if isinstance(value, str):
+                self.assertIn(value, allowed_text, key)
+
+    def test_get_notifications_is_read_only_and_validates_the_id(self) -> None:
+        event_id = self.gate_task()
+        self.claim("T-1", event_id)
+        dump = self.dump()
+        self.store.get_notifications("T-1")
+        self.assertEqual(self.dump(), dump)
+        with self.assertRaises(InvalidIdError):
+            self.store.get_notifications("../x")
+
+
 class ParameterizedSqlTests(unittest.TestCase):
     def test_store_never_builds_sql_with_string_interpolation(self) -> None:
         source = (SRC_DIR / "orchestrator" / "store.py").read_text(encoding="utf-8")

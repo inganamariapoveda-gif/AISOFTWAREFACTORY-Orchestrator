@@ -68,6 +68,25 @@ CREATE TABLE IF NOT EXISTS task_suspension (
     next_retry_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notification_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES task(id),
+    status_event_id INTEGER NOT NULL REFERENCES status_event(id),
+    event_type TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    gate_type TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('ATTEMPTING', 'SENT', 'FAILED')),
+    error_category TEXT
+        CHECK (error_category IS NULL OR error_category IN (
+            'HTTP_4XX', 'HTTP_5XX', 'TIMEOUT', 'NETWORK',
+            'MISSING_SECRET', 'INVALID_WEBHOOK', 'CONFIG_INVALID'
+        )),
+    attempted_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (status_event_id, event_type, provider)
+);
 """
 
 # CAPACITY-RESUME-FOUNDATION-001: estado a partir del cual se suspende y al
@@ -103,6 +122,39 @@ TASK_SUSPENSION_COLUMNS: tuple[str, ...] = (
     "capacity_wait_started_at",
     "next_retry_at",
     "updated_at",
+)
+
+# HUMAN-GATE-NOTIFY-001: notification_event registra SOLO metadata de un
+# intento de aviso (nunca mensaje, webhook, respuesta ni datos de Claude).
+# Vocabularios fijos; el Store no conoce a ningún proveedor concreto.
+NOTIFICATION_STATUS_ATTEMPTING = "ATTEMPTING"
+NOTIFICATION_STATUS_SENT = "SENT"
+NOTIFICATION_STATUS_FAILED = "FAILED"
+NOTIFICATION_ERROR_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "HTTP_4XX",
+        "HTTP_5XX",
+        "TIMEOUT",
+        "NETWORK",
+        "MISSING_SECRET",
+        "INVALID_WEBHOOK",
+        "CONFIG_INVALID",
+    }
+)
+_NOTIFICATION_EVENT_TYPE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_NOTIFICATION_PROVIDER_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_NOTIFICATION_GATE_TYPE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_NOTIFICATION_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "status_event_id",
+    "event_type",
+    "provider",
+    "gate_type",
+    "status",
+    "error_category",
+    "attempted_at",
+    "completed_at",
 )
 
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
@@ -182,6 +234,29 @@ _INSERT_STATUS_EVENT_SQL = (
 # solo un proceso puede ganar una carrera.
 _UPDATE_TASK_STATUS_SQL = (
     "UPDATE task SET status = ?, updated_at = ? WHERE id = ? AND status = ?"
+)
+
+# HUMAN-GATE-NOTIFY-001: literales completos y parametrizados.
+_SELECT_GATE_EVENT_SQL = (
+    "SELECT task_id, to_status FROM status_event WHERE id = ?"
+)
+_SELECT_EXISTING_NOTIFICATION_SQL = (
+    "SELECT id FROM notification_event "
+    "WHERE status_event_id = ? AND event_type = ? AND provider = ?"
+)
+_CLAIM_NOTIFICATION_SQL = (
+    "INSERT INTO notification_event "
+    "(task_id, status_event_id, event_type, provider, gate_type, status, attempted_at) "
+    "VALUES (?, ?, ?, ?, ?, 'ATTEMPTING', ?)"
+)
+_COMPLETE_NOTIFICATION_SQL = (
+    "UPDATE notification_event SET status = ?, error_category = ?, completed_at = ? "
+    "WHERE id = ? AND status = 'ATTEMPTING'"
+)
+_SELECT_NOTIFICATIONS_SQL = (
+    "SELECT id, task_id, status_event_id, event_type, provider, gate_type, status, "
+    "error_category, attempted_at, completed_at FROM notification_event "
+    "WHERE task_id = ? ORDER BY id ASC"
 )
 
 
@@ -438,6 +513,111 @@ class Store:
         validate_id(task_id, "task_id")
         return self._fetch_suspension(task_id)
 
+    # ------------------------------------------------------------------
+    # HUMAN-GATE-NOTIFY-001: registro de avisos salientes (at-most-once).
+    #
+    # El Store solo PERSISTE metadata mínima de cada intento. Nunca guarda el
+    # mensaje, el webhook, la respuesta remota, ni datos de Claude/Task Packet.
+    # ------------------------------------------------------------------
+
+    def claim_human_gate_notification(
+        self,
+        task_id: str,
+        status_event_id: int,
+        *,
+        event_type: str,
+        provider: str,
+        gate_type: str,
+    ) -> int | None:
+        """ATÓMICO (BEGIN IMMEDIATE): reclama el aviso de UNA entrada a
+        HUMAN_GATE insertando una fila ATTEMPTING.
+
+        Devuelve el id de la fila reclamada (el llamador puede enviar), o None
+        si ya existía un intento para (status_event_id, event_type, provider):
+        NO se crea otro y el llamador NO debe enviar (at-most-once).
+        Fail closed: el status_event debe existir, pertenecer a la tarea y ser
+        la entrada a HUMAN_GATE."""
+        validate_id(task_id, "task_id")
+        if not isinstance(status_event_id, int) or isinstance(status_event_id, bool):
+            raise StoreError("status_event_id must be an integer")
+        if not isinstance(event_type, str) or not _NOTIFICATION_EVENT_TYPE_RE.fullmatch(event_type):
+            raise StoreError("invalid notification event_type")
+        if not isinstance(provider, str) or not _NOTIFICATION_PROVIDER_RE.fullmatch(provider):
+            raise StoreError("invalid notification provider")
+        if not isinstance(gate_type, str) or not _NOTIFICATION_GATE_TYPE_RE.fullmatch(gate_type):
+            raise StoreError("invalid notification gate_type")
+        with self._write_transaction():
+            with closing(self._conn.cursor()) as cur:
+                cur.execute(_SELECT_GATE_EVENT_SQL, (status_event_id,))
+                row = cur.fetchone()
+            if row is None or row[0] != task_id or row[1] != "HUMAN_GATE":
+                raise StoreError(
+                    "status_event is not the HUMAN_GATE entry of the task; "
+                    "notification not claimed"
+                )
+            with closing(self._conn.cursor()) as cur:
+                cur.execute(
+                    _SELECT_EXISTING_NOTIFICATION_SQL, (status_event_id, event_type, provider)
+                )
+                if cur.fetchone() is not None:
+                    return None  # already_exists: no se reclama, no se envía
+                # Bajo BEGIN IMMEDIATE nadie más inserta entre el SELECT y el
+                # INSERT; UNIQUE(status_event_id, event_type, provider) es la
+                # segunda defensa (un duplicado haría rollback y StoreError).
+                cur.execute(
+                    _CLAIM_NOTIFICATION_SQL,
+                    (task_id, status_event_id, event_type, provider, gate_type, _utcnow()),
+                )
+                if cur.rowcount != 1 or not isinstance(cur.lastrowid, int):
+                    raise StoreError("notification claim was not recorded")
+                return cur.lastrowid
+
+    def complete_notification(
+        self, notification_id: int, *, status: str, error_category: str | None = None
+    ) -> dict[str, Any]:
+        """ATÓMICO: ATTEMPTING -> SENT | FAILED (+ error_category de
+        vocabulario fijo, solo con FAILED). UPDATE con guard (AND status =
+        'ATTEMPTING') y rowcount == 1: una fila que ya no está ATTEMPTING NO
+        se toca (StoreError, fail closed)."""
+        if not isinstance(notification_id, int) or isinstance(notification_id, bool):
+            raise StoreError("notification_id must be an integer")
+        if status == NOTIFICATION_STATUS_SENT:
+            if error_category is not None:
+                raise StoreError("a SENT notification cannot have an error_category")
+        elif status == NOTIFICATION_STATUS_FAILED:
+            if error_category not in NOTIFICATION_ERROR_CATEGORIES:
+                raise StoreError("a FAILED notification needs a fixed error_category")
+        else:
+            raise StoreError("notification status must be SENT or FAILED")
+        with self._write_transaction():
+            with closing(self._conn.cursor()) as cur:
+                cur.execute(
+                    _COMPLETE_NOTIFICATION_SQL,
+                    (status, error_category, _utcnow(), notification_id),
+                )
+                if cur.rowcount != 1:
+                    raise StoreError(
+                        "notification is not in ATTEMPTING (or does not exist); not updated"
+                    )
+        with closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "SELECT id, task_id, status_event_id, event_type, provider, gate_type, "
+                "status, error_category, attempted_at, completed_at "
+                "FROM notification_event WHERE id = ?",
+                (notification_id,),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        return dict(zip(_NOTIFICATION_COLUMNS, row))
+
+    def get_notifications(self, task_id: str) -> list[dict[str, Any]]:
+        """Solo lectura: intentos de aviso de una tarea (solo metadata)."""
+        validate_id(task_id, "task_id")
+        with closing(self._conn.cursor()) as cur:
+            cur.execute(_SELECT_NOTIFICATIONS_SQL, (task_id,))
+            rows = cur.fetchall()
+        return [dict(zip(_NOTIFICATION_COLUMNS, row)) for row in rows]
+
     def list_waiting_capacity_candidates(self) -> list[dict[str, Any]]:
         """CAPACITY-WAKEUP-001: descubrimiento de tareas en
         WAITING_FOR_CLAUDE_CAPACITY. SOLO LECTURA (un SELECT parametrizado):
@@ -625,9 +805,10 @@ class Store:
 
     def _transition_locked(
         self, task_id: str, from_status: str, to_status: str, reason: str, actor: str
-    ) -> None:
+    ) -> int:
         """UPDATE condicional del estado + status_event. Debe llamarse DENTRO
-        de _write_transaction(). rowcount != 1 -> StoreError (fail closed)."""
+        de _write_transaction(). rowcount != 1 -> StoreError (fail closed).
+        Devuelve el id del status_event creado en ESTA transacción."""
         now = _utcnow()
         with closing(self._conn.cursor()) as cur:
             cur.execute(_UPDATE_TASK_STATUS_SQL, (to_status, now, task_id, from_status))
@@ -640,6 +821,10 @@ class Store:
                 _INSERT_STATUS_EVENT_SQL,
                 (task_id, from_status, to_status, reason, actor, now),
             )
+            event_id = cur.lastrowid
+        if not isinstance(event_id, int) or isinstance(event_id, bool):
+            raise StoreError("status_event id was not returned")
+        return event_id
 
     def suspend_for_capacity(
         self,
@@ -862,15 +1047,26 @@ class Store:
                 f"(found {task['status']!r})"
             )
 
-    def _advance_to_human_gate_locked(self, task_id: str, reason: str, actor: str) -> None:
+    def _advance_to_human_gate_locked(self, task_id: str, reason: str, actor: str) -> int:
         """DEVELOPING -> AUTOMATED_TEST -> TECHNICAL_REVIEW -> SECURITY_REVIEW
         -> HUMAN_GATE, validando cada paso con la máquina de estados y
-        escribiendo un status_event por transición. DENTRO de una transacción."""
+        escribiendo un status_event por transición. DENTRO de una transacción.
+        Devuelve el id del status_event de la ENTRADA a HUMAN_GATE (última
+        transición), creado en la misma transacción."""
         current = STATE_DEVELOPING
+        gate_event_id = 0
         for target in _HUMAN_GATE_CHAIN:
             validate_transition(current, target)
-            self._transition_locked(task_id, current, target, reason, actor)
+            gate_event_id = self._transition_locked(task_id, current, target, reason, actor)
             current = target
+        return gate_event_id
+
+    def _human_gate_result(self, task_id: str, gate_event_id: int) -> dict[str, Any]:
+        result = self.get_task(task_id)
+        assert result is not None
+        # HUMAN-GATE-NOTIFY-001: id del status_event que produjo la entrada a
+        # HUMAN_GATE (identidad del gate para deduplicar notificaciones).
+        return {**result, "human_gate_status_event_id": gate_event_id}
 
     def _delete_suspension_locked(self, task_id: str) -> None:
         with closing(self._conn.cursor()) as cur:
@@ -890,10 +1086,8 @@ class Store:
                 raise StoreError(
                     f"task {task_id!r} has a suspension: use complete_resumed_task"
                 )
-            self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
-        result = self.get_task(task_id)
-        assert result is not None
-        return result
+            gate_event_id = self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
+        return self._human_gate_result(task_id, gate_event_id)
 
     def complete_resumed_task(self, task_id: str, *, reason: str, actor: str) -> dict[str, Any]:
         """ATÓMICO: DEVELOPING -> ... -> HUMAN_GATE de una tarea REANUDADA
@@ -904,11 +1098,9 @@ class Store:
             self._require_task_status_locked(task_id, STATE_DEVELOPING)
             if self._fetch_suspension(task_id) is None:
                 raise StoreError(f"task {task_id!r} has no active suspension")
-            self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
+            gate_event_id = self._advance_to_human_gate_locked(task_id, reason_text, actor_text)
             self._delete_suspension_locked(task_id)
-        result = self.get_task(task_id)
-        assert result is not None
-        return result
+        return self._human_gate_result(task_id, gate_event_id)
 
     def block_claimed_resume(self, task_id: str, *, reason: str, actor: str) -> dict[str, Any]:
         """ATÓMICO: una reanudación YA reclamada (DEVELOPING, con suspensión)

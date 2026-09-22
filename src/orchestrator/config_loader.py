@@ -448,6 +448,66 @@ def load_core_config(config_dir: Path | str) -> OrchestratorConfig:
     )
 
 
+# HUMAN-GATE-NOTIFY-001: config OPCIONAL de notificaciones salientes. Vive
+# fuera de load_core_config: si NOTIFICATIONS.yaml no existe, las
+# notificaciones están desactivadas y ninguna config/prueba existente se rompe.
+# El YAML nunca contiene el secreto: solo el NOMBRE de la variable de entorno
+# que lo contiene.
+NOTIFICATIONS_FILENAME = "NOTIFICATIONS.yaml"
+ALLOWED_NOTIFICATION_PROVIDERS = frozenset({"slack"})
+ALLOWED_NOTIFICATION_EVENTS = frozenset({"human_gate"})
+_NOTIFICATION_KEYS = frozenset({"enabled", "provider", "webhook_env_var", "events"})
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class NotificationsConfig:
+    enabled: bool
+    provider: str | None
+    webhook_env_var: str | None
+    human_gate: bool
+
+
+DISABLED_NOTIFICATIONS = NotificationsConfig(
+    enabled=False, provider=None, webhook_env_var=None, human_gate=False
+)
+
+
+def load_notifications_config(config_dir: Path | str) -> NotificationsConfig:
+    """Carga config/NOTIFICATIONS.yaml. Ausente -> desactivado. Presente e
+    inválido -> ConfigError (el llamador lo traduce a config_invalid sin
+    afectar a ninguna tarea). Validación estricta: sin claves desconocidas."""
+    path = Path(config_dir) / NOTIFICATIONS_FILENAME
+    if not path.exists():
+        return DISABLED_NOTIFICATIONS
+    data = _load_yaml_mapping(path)
+    if set(data) != {"notifications"}:
+        raise ConfigError(f"unexpected top-level keys in {path}")
+    block = data["notifications"]
+    if not isinstance(block, dict) or set(block) != _NOTIFICATION_KEYS:
+        raise ConfigError(f"'notifications' in {path} must contain exactly {sorted(_NOTIFICATION_KEYS)}")
+    enabled = block["enabled"]
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"notifications.enabled in {path} must be a boolean")
+    provider = block["provider"]
+    if not isinstance(provider, str) or provider not in ALLOWED_NOTIFICATION_PROVIDERS:
+        raise ConfigError(f"notifications.provider in {path} is not an allowed provider")
+    env_var = block["webhook_env_var"]
+    if not isinstance(env_var, str) or not _ENV_VAR_NAME_RE.match(env_var):
+        raise ConfigError(
+            f"notifications.webhook_env_var in {path} must match {_ENV_VAR_NAME_RE.pattern}"
+        )
+    events = block["events"]
+    if not isinstance(events, dict) or not events or not set(events) <= ALLOWED_NOTIFICATION_EVENTS:
+        raise ConfigError(f"notifications.events in {path} has unknown or missing events")
+    human_gate = events.get("human_gate")
+    if not isinstance(human_gate, bool):
+        raise ConfigError(f"notifications.events.human_gate in {path} must be a boolean")
+    return NotificationsConfig(
+        enabled=enabled, provider=provider, webhook_env_var=env_var, human_gate=human_gate
+    )
+
+
 def load_project_rules(rules_path: Path | str) -> dict[str, Any]:
     """Carga y valida PROJECT_RULES.yaml de un proyecto. Falla cerrado."""
     rules_path = Path(rules_path)

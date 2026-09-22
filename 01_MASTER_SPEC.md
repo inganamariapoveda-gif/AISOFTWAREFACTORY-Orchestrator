@@ -72,7 +72,7 @@ El MVP debe, para una tarea de bajo riesgo sobre el repositorio de un proyecto p
 5. Ejecutar revisión técnica y revisión de seguridad automáticas, contrastadas contra evidencia (no solo narrativa del agente).
 6. Ante un fallo, transitar a `CHANGES_REQUESTED` y reenviar corrección a Claude Code automáticamente, hasta un límite configurable de intentos.
 7. Alcanzar `TECH_APPROVED` cuando se cumplan criterios técnicos y de seguridad.
-8. Presentar un `HUMAN_GATE` donde la PO responde `APROBADO` o describe el problema.
+8. Presentar un `HUMAN_GATE` donde la PO responde `APROBADO` o describe el problema, y **enviar un aviso saliente simple** (Slack Incoming Webhook) al entrar en él; el aviso es solo un canal, SQLite sigue siendo la fuente de verdad (§9).
 9. Confirmar el cambio en una **rama de tarea** (sin push, sin merge, sin producción) y cerrar la tarea.
 10. Persistir toda la traza en SQLite de forma reconstruible.
 
@@ -82,7 +82,7 @@ Todo esto en ejecución **local**, un proceso, un operador.
 
 ## 4. Fuera de alcance (deliberado)
 
-Dashboard avanzado · SaaS · multiusuario · marketplace de agentes · multiagente avanzado · facturación · infraestructura distribuida (Kubernetes, Docker, colas, Redis, servidores) · despliegue automático a producción · aplicación móvil · sistema complejo de notificaciones · integraciones empresariales no necesarias para demostrar el ciclo · `git push`, `git merge` y cualquier operación sobre producción · eliminaciones irreversibles · gestión de credenciales de terceros.
+Dashboard avanzado · SaaS · multiusuario · marketplace de agentes · multiagente avanzado · facturación · infraestructura distribuida (Kubernetes, Docker, colas, Redis, servidores) · despliegue automático a producción · aplicación móvil · sistema complejo de notificaciones (aprobaciones entrantes, bot interactivo, botones, múltiples canales, motor de mensajería; el **aviso saliente simple** de un Human Gate SÍ está dentro del MVP, §3.8 y §9) · integraciones empresariales no necesarias para demostrar el ciclo · `git push`, `git merge` y cualquier operación sobre producción · eliminaciones irreversibles · gestión de credenciales de terceros.
 
 ---
 
@@ -230,6 +230,8 @@ Clasificación del cambio a partir de `git diff`, archivos tocados vs `archivos_
 
 Regla de interacción: la PO debe poder resolver el gate respondiendo simplemente `APROBADO` o con una descripción del problema. Un problema descrito genera `CHANGES_REQUESTED`; una decisión no resuelta genera `BLOCKED`. **La PO nunca analiza código, SQL, comandos ni diffs**: el Director es responsable de transformar toda cuestión técnica escalada en una decisión comprensible.
 
+**Aviso saliente:** al entrar en `HUMAN_GATE` (tras `run-task`, `resume-capacity` o `resume-due`), el motor intenta UN aviso saliente mediante `NotifierPort` (adapter de Slack Incoming Webhook, solo salida). El aviso contiene únicamente `project_id`, `task_id`, el tipo de gate, el texto estático de `GATES.yaml` y un estado fijo; nunca código, diffs, contenido de archivos, Task Packet ni salida de Claude. Semántica *at-most-once* (sin reintentos automáticos), un intento por entrada al gate (`status_event`), registrado en `notification_event`. Un fallo del aviso **nunca** cambia la tarea ni el resultado: sigue en `HUMAN_GATE`. La URL del webhook es un secreto que solo vive en una variable de entorno (nombre configurado en `config/NOTIFICATIONS.yaml`, opcional). Fuera de alcance: aprobar desde Slack, botones, eventos entrantes, bot interactivo, múltiples canales.
+
 ---
 
 ## 10. Seguridad (controles mínimos desde el MVP)
@@ -278,6 +280,7 @@ Entidades (campos clave; todas con timestamps `created_at`/`updated_at` según c
 - `agent_run` (id, task_id, agent, role, phase, input_ref, output_ref, exit_status, started_at, ended_at)
 - `status_event` (id, task_id, from_status, to_status, reason, actor)
 - `task_suspension` (task_id, task_packet_path, task_packet_sha256, project_rules_sha256, permissions_sha256, baseline_head_sha, baseline_branch, working_tree_fingerprint, touched_paths_json, capacity_wait_count, capacity_wait_started_at, next_retry_at) — suspensión temporal de una tarea en `WAITING_FOR_CLAUDE_CAPACITY` (§5.2) por una señal estructurada de capacidad de Claude. Una fila activa por tarea; guarda solo identidad del Task Packet y de la configuración relevante mediante hashes, baseline Git original, huella del working tree, contador y tiempos de espera; nunca datos de Claude (stdout, stderr, resultado, sesión, uso, prompt) ni contenido de archivos
+- `notification_event` (id, task_id, status_event_id, event_type, provider, gate_type, status[`ATTEMPTING`|`SENT`|`FAILED`], error_category, attempted_at, completed_at; único por status_event_id + event_type + provider) — intento de aviso saliente al entrar en un Human Gate. Guarda solo metadata mínima y vocabulario fijo; nunca el mensaje, la URL del webhook, la respuesta remota, el Task Packet ni datos de Claude
 - `modified_file` (id, agent_run_id, path, change_type)
 - `test_result` (id, agent_run_id, kind[`test`|`lint`|`tsc`|`build`], passed, summary_ref)
 - `review_result` (id, task_id, phase[`technical`], verdict, findings_ref)
@@ -315,13 +318,13 @@ Un solo proceso Python, ejecución local, patrón **puertos y adaptadores** para
 **Componentes:**
 - `core/state_machine` — estados y transiciones (§5).
 - `core/policy_engine` — carga YAML, clasifica acciones VERDE/AMARILLO/ROJO, evalúa condiciones de parada.
-- `config/loader` — lee y valida los cinco archivos YAML.
+- `config/loader` — lee y valida los cinco archivos YAML; `NOTIFICATIONS.yaml` es un sexto archivo OPCIONAL (ausente = avisos desactivados) que solo nombra la variable de entorno del webhook, nunca su valor.
 - `persistence/store` — SQLite vía `sqlite3` (biblioteca estándar).
 - `verifier/runner` — ejecuta verificación independiente (§11) y captura evidencia.
 - `gates/cli` — interacción con la Product Owner (Human Gates). El gate interno de aprobación del Director (AMARILLO contemplado) no requiere intervención humana. No existe rol permanente de operador técnico humano.
 - `app` — driver del ciclo (bucle que avanza estados).
 
-**Puertos (contratos):** `DirectorPort` (generar spec, revisar técnica, revisar seguridad), `DeveloperPort` (implementar Task Packet), `GitPort` (status, diff, branch, commit). Cambiar de proveedor = cambiar de adaptador, no el núcleo.
+**Puertos (contratos):** `DirectorPort` (generar spec, revisar técnica, revisar seguridad), `DeveloperPort` (implementar Task Packet), `GitPort` (status, diff, branch, commit), `NotifierPort` (`notify(event)`: aviso saliente de Human Gate; adapter `adapters/slack_notifier`, el motor no importa Slack). Cambiar de proveedor = cambiar de adaptador, no el núcleo.
 
 Tecnologías: **Python · SQLite · YAML/JSON · Git · Claude Code CLI · OpenAI API (vía adaptador) · ejecución local.** No se introducen otras.
 

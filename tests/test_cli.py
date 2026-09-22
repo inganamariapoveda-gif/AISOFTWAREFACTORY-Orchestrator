@@ -12,8 +12,10 @@ subprocesos: se llama directamente a orchestrator.app.main().
 
 import contextlib
 import hashlib
+import inspect
 import io
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -3936,6 +3938,8 @@ class ResumeDueTestCase(PersistedExecutionTestCase):
         "developer_failure_category",
         "capacity_wait_count",
         "next_retry_at",
+        "notification_status",
+        "notification_error_category",
     }
 
     def resume_due(self, developer=None, test=None) -> tuple[int, dict | None, mock.MagicMock]:
@@ -4460,6 +4464,648 @@ class ResumeDueRegressionTests(ResumeDueTestCase):
         )
         for needle in ("sleep", "while ", "threading", "Thread", "subprocess", "schtasks", "Register-"):
             self.assertNotIn(needle, source, needle)
+
+
+SLACK_ENV_VAR = "AISOFTWAREFACTORY_SLACK_WEBHOOK_URL"
+SLACK_WEBHOOK = "https://hooks.slack.com/services/TSENTINELWH/BSENTINELWH/SENTINELWEBHOOKSECRET"
+_SLACK_OPENER_PATH = "orchestrator.adapters.slack_notifier.build_no_redirect_opener"
+
+
+class _FakeNotifier:
+    """NotifierPort falso: registra cada evento; nunca toca la red."""
+
+    provider = "fake"
+
+    def __init__(self, result=None) -> None:
+        from orchestrator.notifications import NotificationResult
+
+        self.result = result or NotificationResult("SENT")
+        self.events: list = []
+
+    def notify(self, event):
+        self.events.append(event)
+        return self.result
+
+
+class _SlackFakeResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def close(self) -> None:
+        pass
+
+
+class _SlackFakeOpener:
+    def __init__(self, outcome=None) -> None:
+        self.outcome = _SlackFakeResponse(200) if outcome is None else outcome
+        self.calls: list = []
+
+    def open(self, request, timeout=None):
+        self.calls.append((request, timeout))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _slack_http_error(code: int):
+    import urllib.error
+
+    return urllib.error.HTTPError(SLACK_WEBHOOK, code, "msg", {}, io.BytesIO(b"raw slack body"))
+
+
+class NotifyTestCase(ResumeDueTestCase):
+    """HUMAN-GATE-NOTIFY-001: aviso saliente al entrar a HUMAN_GATE. Sin Slack
+    real: notifier falso o capa HTTP falsa. El fixture no trae
+    NOTIFICATIONS.yaml (desactivado) hasta que la prueba lo habilita."""
+
+    def write_notifications(self, **overrides) -> None:
+        block = {
+            "enabled": True,
+            "provider": "slack",
+            "webhook_env_var": SLACK_ENV_VAR,
+            "events": {"human_gate": True},
+        }
+        block.update(overrides)
+        _write_yaml(self.config_dir / "NOTIFICATIONS.yaml", {"notifications": block})
+
+    def use_real_gates(self) -> None:
+        shutil.copyfile(REPO_ROOT / "config" / "GATES.yaml", self.config_dir / "GATES.yaml")
+
+    def fake_channel(self, notifier=None):
+        fake = notifier or _FakeNotifier()
+        return fake, mock.patch.object(app, "_build_notifier", return_value=fake)
+
+    @contextlib.contextmanager
+    def slack(self, outcome=None, env=SLACK_WEBHOOK):
+        """Adapter REAL de Slack sobre un opener falso y un entorno de proceso
+        controlado (nunca se toca el entorno real: se restaura al salir)."""
+        opener = _SlackFakeOpener(outcome)
+        with mock.patch.dict(os.environ, clear=False):
+            if env is None:
+                os.environ.pop(SLACK_ENV_VAR, None)
+            else:
+                os.environ[SLACK_ENV_VAR] = env
+            with mock.patch(_SLACK_OPENER_PATH, return_value=opener):
+                yield opener
+
+    def rows(self, task_id: str = TASK_ID) -> list[dict]:
+        with Store(self.db_path) as store:
+            return store.get_notifications(task_id)
+
+    def blocked_events(self, task_id: str = TASK_ID) -> list:
+        with Store(self.db_path) as store:
+            return [e for e in store.get_history(task_id) if e["to_status"] == "BLOCKED"]
+
+    def assert_gate_with_one_notification(self, result, fake, status: str = "sent") -> None:
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(result["notification_status"], status)
+        self.assertEqual(len(fake.events), 1)
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "SENT")
+        self.assertEqual(rows[0]["gate_type"], "HUMAN_FUNCTIONAL_TEST")
+        event = fake.events[0]
+        self.assertEqual(
+            (event.event_type, event.project_id, event.task_id, event.gate_type),
+            ("human_gate", "TASKEXEC", TASK_ID, "HUMAN_FUNCTIONAL_TEST"),
+        )
+        self.assertEqual(event.dedupe_key, f"human_gate:{TASK_ID}:{rows[0]['status_event_id']}")
+
+
+class NotifyEntryPointTests(NotifyTestCase):
+    def test_fresh_human_gate_notifies_exactly_once(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        self.assert_gate_with_one_notification(result, fake)
+
+    def test_resumed_human_gate_notifies_exactly_once(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            self.suspend_with_partial()
+            self.assertEqual(fake.events, [])  # WAITING no notifica
+            self.clock.advance(1800)
+            rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        self.assert_gate_with_one_notification(result, fake)
+
+    def test_resume_due_notifies_exactly_once_without_its_own_hook(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            rc, result, _test = self.resume_due(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["final_state"], "HUMAN_GATE")
+        self.assertEqual(result["notification_status"], "sent")
+        self.assertLessEqual(set(result), self.RESULT_KEYS)
+        self.assertEqual(len(fake.events), 1)
+        self.assertEqual(len(self.rows()), 1)
+        source = inspect.getsource(app.cmd_resume_due)
+        for needle in ("notif", "slack", "Slack", "_notify"):
+            self.assertNotIn(needle, source)  # ni Slack ni hook propio en resume-due
+
+    def test_the_second_heartbeat_does_not_notify_again(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            self.resume_due(developer=self.developer_completes())
+            rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual((rc, result["status"]), (0, "no_due_task"))
+        self.assertEqual(len(fake.events), 1)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_the_public_json_gains_only_the_additive_fields(self) -> None:
+        self.write_notifications()
+        _fake, patcher = self.fake_channel()
+        with patcher:
+            _rc, enabled, _test = self.run_task(developer=self.developer_completes())
+        assert enabled is not None
+        self.assertEqual(enabled["notification_status"], "sent")
+        self.assertNotIn("notification_error_category", enabled)
+
+
+class NotifyFailureTests(NotifyTestCase):
+    def assert_failure_never_blocks(self, outcome, env, category, *, network: bool) -> None:
+        self.write_notifications()
+        with self.slack(outcome, env) as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)  # el exit funcional NO cambia
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(result["notification_status"], "failed")
+        self.assertEqual(result["notification_error_category"], category)
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+        self.assertEqual(self.blocked_events(), [])  # ningún BLOCKED por Slack
+        (row,) = self.rows()
+        self.assertEqual((row["status"], row["error_category"]), ("FAILED", category))
+        self.assertEqual(len(opener.calls), 1 if network else 0)
+        if network:
+            self.assertEqual(opener.calls[0][1], 5)  # timeout explícito
+        self.assertNotIn("SENTINEL", json.dumps(result))
+        self.assertNotIn("SENTINEL", self.dump_db())
+
+    def test_slack_success(self) -> None:
+        self.write_notifications()
+        with self.slack(_SlackFakeResponse(200)) as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["notification_status"], "sent")
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(opener.calls[0][0].full_url, SLACK_WEBHOOK)
+        (row,) = self.rows()
+        self.assertEqual((row["status"], row["error_category"], row["provider"]), ("SENT", None, "slack"))
+
+    def test_http_400(self) -> None:
+        self.assert_failure_never_blocks(_slack_http_error(400), SLACK_WEBHOOK, "HTTP_4XX", network=True)
+
+    def test_http_500(self) -> None:
+        self.assert_failure_never_blocks(_slack_http_error(500), SLACK_WEBHOOK, "HTTP_5XX", network=True)
+
+    def test_timeout(self) -> None:
+        self.assert_failure_never_blocks(TimeoutError("timed out"), SLACK_WEBHOOK, "TIMEOUT", network=True)
+
+    def test_network_error(self) -> None:
+        import urllib.error
+
+        self.assert_failure_never_blocks(
+            urllib.error.URLError("dns failure for " + SLACK_WEBHOOK), SLACK_WEBHOOK, "NETWORK", network=True
+        )
+
+    def test_missing_secret(self) -> None:
+        self.assert_failure_never_blocks(None, None, "MISSING_SECRET", network=False)
+
+    def test_invalid_webhook(self) -> None:
+        self.assert_failure_never_blocks(
+            None, "http://hooks.slack.com/services/TSENTINEL/B/X", "INVALID_WEBHOOK", network=False
+        )
+
+    def test_a_failure_does_not_change_resume_capacity_or_resume_due_exit_codes(self) -> None:
+        self.write_notifications()
+        with self.slack(_slack_http_error(500)):
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            rc, result, _test = self.resume(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual((result["state"], result["notification_status"]), ("HUMAN_GATE", "failed"))
+
+    def test_a_failure_does_not_change_the_resume_due_exit_code(self) -> None:
+        self.write_notifications()
+        with self.slack(_slack_http_error(400)):
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            rc, result, _test = self.resume_due(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["final_state"], "HUMAN_GATE")
+        self.assertEqual(result["notification_status"], "failed")
+        self.assertEqual(result["notification_error_category"], "HTTP_4XX")
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+
+    def test_a_claim_failure_never_changes_the_task_nor_the_exit_code(self) -> None:
+        self.write_notifications()
+        _fake, patcher = self.fake_channel()
+        with patcher, mock.patch.object(
+            Store, "claim_human_gate_notification", side_effect=StoreError("busy")
+        ):
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual((result["state"], result["notification_status"]), ("HUMAN_GATE", "failed"))
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+        self.assertEqual(self.rows(), [])
+
+    def test_an_unexpected_notifier_exception_never_changes_the_task(self) -> None:
+        self.write_notifications()
+        with mock.patch.object(app, "_build_notifier", side_effect=RuntimeError("boom SENTINEL")):
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual((result["state"], result["notification_status"]), ("HUMAN_GATE", "failed"))
+        self.assertNotIn("SENTINEL", json.dumps(result))
+
+
+class NotifyDisabledTests(NotifyTestCase):
+    def assert_no_notification_activity(self, fake, result) -> None:
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertNotIn("notification_status", result)
+        self.assertNotIn("notification_error_category", result)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+
+    def run_and_check(self) -> None:
+        fake, patcher = self.fake_channel()
+        with patcher as builder, self.slack() as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        builder.assert_not_called()
+        self.assertEqual(opener.calls, [])
+        self.assert_no_notification_activity(fake, result)
+
+    def test_absent_config_keeps_the_previous_behavior(self) -> None:
+        self.assertFalse((self.config_dir / "NOTIFICATIONS.yaml").exists())
+        self.run_and_check()
+
+    def test_enabled_false(self) -> None:
+        self.write_notifications(enabled=False)
+        self.run_and_check()
+
+    def test_event_disabled(self) -> None:
+        self.write_notifications(events={"human_gate": False})
+        self.run_and_check()
+
+    def test_disabled_resume_paths_are_unchanged(self) -> None:
+        self.write_notifications(enabled=False)
+        fake, patcher = self.fake_channel()
+        with patcher:
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            rc, result, _test = self.resume_due(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertNotIn("notification_status", result)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_the_stateless_probe_never_notifies(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher as builder, mock.patch("orchestrator.app.Store") as store_mock, self.patched_subprocess(
+            developer=self.developer_completes(),
+            test=mock.MagicMock(side_effect=self._test_passes),
+        ):
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertNotIn("notification_status", result)
+        builder.assert_not_called()
+        store_mock.assert_not_called()
+        self.assertEqual(fake.events, [])
+        self.assertFalse(self.db_path.exists())
+
+
+class NotifyConfigInvalidTests(NotifyTestCase):
+    def assert_config_invalid(self, content: dict) -> None:
+        _write_yaml(self.config_dir / "NOTIFICATIONS.yaml", content)
+        fake, patcher = self.fake_channel()
+        with patcher as builder, self.slack() as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(result["notification_status"], "config_invalid")
+        self.assertNotIn("notification_error_category", result)
+        builder.assert_not_called()
+        self.assertEqual(opener.calls, [])
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])  # sin proveedor confiable que reclamar
+        self.assertEqual(self.task()["status"], "HUMAN_GATE")
+
+    def valid_block(self, **changes) -> dict:
+        block = {
+            "enabled": True,
+            "provider": "slack",
+            "webhook_env_var": SLACK_ENV_VAR,
+            "events": {"human_gate": True},
+        }
+        block.update(changes)
+        return {"notifications": block}
+
+    def test_unknown_key_is_config_invalid(self) -> None:
+        self.assert_config_invalid(self.valid_block(extra=1))
+
+    def test_bad_provider_is_config_invalid(self) -> None:
+        self.assert_config_invalid(self.valid_block(provider="email"))
+
+    def test_bad_env_var_name_is_config_invalid(self) -> None:
+        self.assert_config_invalid(self.valid_block(webhook_env_var="lower case"))
+
+    def test_unparseable_yaml_is_also_config_invalid(self) -> None:
+        (self.config_dir / "NOTIFICATIONS.yaml").write_text("notifications: [unclosed", encoding="utf-8")
+        with self.slack() as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["notification_status"], "config_invalid")
+        self.assertEqual(opener.calls, [])
+
+
+class NotifyOtherStatesTests(NotifyTestCase):
+    def test_blocked_never_notifies(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        failing_test = mock.MagicMock(
+            side_effect=lambda args, **kw: subprocess.CompletedProcess(args, 1, "", "")
+        )
+        with patcher:
+            rc, result, _test = self.run_task(developer=self.developer_completes(), test=failing_test)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertNotIn("notification_status", result)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.task()["status"], "BLOCKED")
+
+    def test_waiting_for_capacity_never_notifies(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            rc, result, _test = self.run_task(developer=self.developer_capacity())
+        self.assertEqual(rc, 10)
+        assert result is not None
+        self.assertNotIn("notification_status", result)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.task()["status"], WAITING)
+
+    def test_a_resume_that_suspends_again_or_blocks_never_notifies(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher:
+            self.suspend_with_partial()
+            self.clock.advance(1800)
+            rc, result, _test = self.resume(developer=self.developer_capacity())
+            self.assertEqual(rc, 10)
+            self.taskexec_packet_path.write_text(
+                self.taskexec_packet_path.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+            )
+            self.clock.advance(1800)
+            rc, result, _test = self.resume(developer=self.never_called())
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertNotIn("notification_status", result)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_intermediate_states_never_notify(self) -> None:
+        self.write_notifications()
+        seen: list[int] = []
+        fake, patcher = self.fake_channel()
+
+        def observing_developer(args, **kwargs):
+            seen.append(len(fake.events))  # el Developer corre en DEVELOPING
+            return self.developer_completes()(args, **kwargs)
+
+        with patcher:
+            rc, _result, _test = self.run_task(developer=mock.MagicMock(side_effect=observing_developer))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, [0])  # nada se notificó antes del HUMAN_GATE
+        self.assertEqual(len(fake.events), 1)  # solo la entrada final a HUMAN_GATE
+
+    def test_manual_transitions_never_notify(self) -> None:
+        self.write_notifications()
+        fake, patcher = self.fake_channel()
+        with patcher as builder, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_cli("init-storage"), 0)
+            self.assertEqual(self.run_cli("register-project", "SAMPLE"), 0)
+            self.assertEqual(self.run_cli("create-task", "MAN-1", "SAMPLE", "title", "need"), 0)
+            for state in (
+                "SPECIFICATION", "DEVELOPING", "AUTOMATED_TEST", "TECHNICAL_REVIEW",
+                "SECURITY_REVIEW", "TECH_APPROVED", "HUMAN_GATE",
+            ):
+                rc = self.run_cli("transition", "MAN-1", state, "--reason", "manual", "--actor", "human")
+                self.assertEqual(rc, 0, state)
+        builder.assert_not_called()
+        self.assertEqual(fake.events, [])
+        with Store(self.db_path) as store:
+            self.assertEqual(store.get_task("MAN-1")["status"], "HUMAN_GATE")
+            self.assertEqual(store.get_notifications("MAN-1"), [])
+
+
+class NotifyDedupeTests(NotifyTestCase):
+    def completed_task(self) -> dict:
+        with Store(self.db_path) as store:
+            task = store.get_task(TASK_ID)
+            assert task is not None
+            history = store.get_history(TASK_ID)
+        gate_event = [e for e in history if e["to_status"] == "HUMAN_GATE"][-1]
+        return {**task, "human_gate_status_event_id": gate_event["id"]}
+
+    def notify_again(self):
+        with Store(self.db_path) as store:
+            return app._notify_human_gate(
+                store, self.completed_task(), {"human_gate": "HUMAN_FUNCTIONAL_TEST"}
+            )
+
+    def test_a_repeated_invocation_for_the_same_gate_never_calls_slack_again(self) -> None:
+        self.write_notifications()
+        with self.slack() as opener:
+            self.run_task(developer=self.developer_completes())
+            self.assertEqual(len(opener.calls), 1)
+            fields = self.notify_again()
+            fields_again = self.notify_again()
+        self.assertEqual(fields, {"notification_status": "already_attempted"})
+        self.assertEqual(fields_again, fields)
+        self.assertEqual(len(opener.calls), 1)  # sigue siendo UNA sola llamada
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_an_attempting_row_left_by_a_dead_process_is_never_resent(self) -> None:
+        self.write_notifications()
+        with self.slack() as opener, mock.patch.object(
+            Store, "complete_notification", side_effect=StoreError("process died here")
+        ):
+            self.run_task(developer=self.developer_completes())
+        self.assertEqual(len(opener.calls), 1)
+        (row,) = self.rows()
+        self.assertEqual(row["status"], "ATTEMPTING")
+        with self.slack() as opener2:
+            fields = self.notify_again()
+        self.assertEqual(fields, {"notification_status": "already_attempted"})
+        self.assertEqual(opener2.calls, [])  # NO se reenvía
+        self.assertEqual(self.rows()[0]["status"], "ATTEMPTING")  # no se modifica automáticamente
+
+    def test_a_failed_notification_is_not_retried_by_the_heartbeat(self) -> None:
+        self.write_notifications()
+        with self.slack(_slack_http_error(500)):
+            self.run_task(developer=self.developer_completes())
+        with self.slack() as opener:
+            rc, result, _test = self.resume_due(developer=self.never_called())
+        self.assertEqual((rc, result["status"]), (0, "no_due_task"))
+        self.assertEqual(opener.calls, [])
+        self.assertEqual(self.rows()[0]["status"], "FAILED")
+
+    def test_a_new_entry_to_human_gate_notifies_again(self) -> None:
+        self.write_notifications()
+        with self.slack() as opener:
+            self.run_task(developer=self.developer_completes())
+            with Store(self.db_path) as store:
+                store.transition_task(TASK_ID, "CHANGES_REQUESTED", "needs work", "human")
+                store.transition_task(TASK_ID, "DEVELOPING", "fix", "orchestrator")
+                completed = store.complete_fresh_task(TASK_ID, reason="again", actor="orchestrator")
+                fields = app._notify_human_gate(
+                    store, completed, {"human_gate": "HUMAN_FUNCTIONAL_TEST"}
+                )
+        self.assertEqual(fields, {"notification_status": "sent"})
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(self.rows()), 2)
+
+
+class NotifyContentTests(NotifyTestCase):
+    def test_no_secret_claude_data_or_task_content_leaks_anywhere(self) -> None:
+        self.use_real_gates()
+        self.write_notifications()
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["objective"] = SENTINELS[5]
+        _write_yaml(self.taskexec_packet_path, packet)
+
+        def leaky_developer(args, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            (cwd / "allowed.txt").write_text(SENTINELS[0], encoding="utf-8")  # contenido de archivo
+            payload = json.loads(self._developer_success_payload())
+            payload.update({"result": SENTINELS[0], "session_id": SENTINELS[1], "usage": {"n": SENTINELS[2]}})
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=json.dumps(payload), stderr=SENTINELS[4]
+            )
+
+        out, err = io.StringIO(), io.StringIO()
+        with self.slack() as opener, contextlib.redirect_stderr(err):
+            rc, result, _test = self.run_task(developer=self._developer(leaky_developer))
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(len(opener.calls), 1)
+        request = opener.calls[0][0]
+        slack_payload = request.data.decode("utf-8")
+        public_json = json.dumps(result)
+        db_rows = json.dumps(self.rows())
+        for name, blob in (("slack payload", slack_payload), ("public json", public_json), ("notification_event", db_rows)):
+            for sentinel in SENTINELS:
+                self.assertNotIn(sentinel, blob, f"{sentinel} in {name}")
+        # el webhook es solo el DESTINO de la petición: nunca contenido
+        self.assertEqual(request.full_url, SLACK_WEBHOOK)
+        for name, blob in (
+            ("slack payload", slack_payload), ("public json", public_json),
+            ("notification_event", db_rows), ("database", self.dump_db()), ("stderr", err.getvalue()),
+        ):
+            self.assertNotIn("SENTINELWEBHOOK", blob, name)
+            self.assertNotIn("hooks.slack.com", blob, name)
+
+    def test_the_message_has_only_the_approved_content(self) -> None:
+        self.use_real_gates()
+        self.write_notifications()
+        with self.slack() as opener:
+            self.run_task(developer=self.developer_completes())
+        request = opener.calls[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(set(body), {"text"})  # sin `channel`
+        self.assertEqual(
+            body["text"].split("\n"),
+            [
+                "🚦 AISOFTWAREFACTORY — Acción requerida",
+                "",
+                "Proyecto: TASKEXEC",
+                "Tarea: TASKEXEC-001",
+                "Gate: HUMAN_FUNCTIONAL_TEST",
+                "Acción: prueba funcionalmente -&gt; APROBADO o describe el problema",
+                "Estado: listo para revisión humana",
+            ],
+        )
+        for forbidden in (
+            "persisted execution", "Change the content", "allowed.txt", "new_authorized",
+            "sha256", "unit", "@channel", "@here", "@everyone", "<!", "diff",
+        ):
+            self.assertNotIn(forbidden, body["text"])
+
+    def test_https_is_enforced_before_any_network_use(self) -> None:
+        self.write_notifications()
+        with self.slack(env="http://hooks.slack.com/services/T/B/X") as opener:
+            rc, result, _test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["notification_error_category"], "INVALID_WEBHOOK")
+        self.assertEqual(opener.calls, [])
+
+    def test_the_composition_root_builds_the_slack_adapter_only_for_the_slack_provider(self) -> None:
+        from orchestrator.adapters.slack_notifier import SlackWebhookNotifier
+        from orchestrator.config_loader import NotificationsConfig
+
+        config = NotificationsConfig(True, "slack", SLACK_ENV_VAR, True)
+        notifier = app._build_notifier(config, {})
+        self.assertIsInstance(notifier, SlackWebhookNotifier)
+        with self.assertRaises(app.ConfigError):
+            app._build_notifier(NotificationsConfig(True, "email", SLACK_ENV_VAR, True), {})
+
+
+class NotifyStaticSafetyTests(unittest.TestCase):
+    def test_no_new_dependency_scheduler_env_write_or_inbound_code(self) -> None:
+        for name in ("app.py", "notifications.py", "store.py", "adapters/slack_notifier.py"):
+            text = (SRC_DIR / "orchestrator" / name).read_text(encoding="utf-8")
+            for needle in (
+                "import requests", "import httpx", "aiohttp", "http.server", "socketserver",
+                "schtasks", "Register-ScheduledTask", "putenv", "os.environ[", "winreg",
+                "time.sleep", "threading", "asyncio", "shell=True",
+            ):
+                self.assertNotIn(needle, text, f"{needle!r} found in {name}")
+        self.assertEqual(
+            tomllib_dependencies(),
+            ["PyYAML==6.0.3"],
+        )
+
+
+def tomllib_dependencies() -> list[str]:
+    import tomllib
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return list(data["project"]["dependencies"])
 
 
 class PersistedStaticSafetyTests(unittest.TestCase):

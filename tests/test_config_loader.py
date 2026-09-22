@@ -12,8 +12,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator.config_loader import (  # noqa: E402
+    DISABLED_NOTIFICATIONS,
     ConfigError,
+    NotificationsConfig,
     load_core_config,
+    load_notifications_config,
     load_project_rules,
     resolve_project_root,
 )
@@ -914,6 +917,105 @@ class ProjectRootResolutionTests(unittest.TestCase):
                 resolve_project_root(
                     rules, project_id="X", orchestrator_repo_root=orchestrator_root
                 )
+
+
+class NotificationsConfigTests(unittest.TestCase):
+    """HUMAN-GATE-NOTIFY-001: NOTIFICATIONS.yaml es OPCIONAL y estricto."""
+
+    VALID = {
+        "notifications": {
+            "enabled": True,
+            "provider": "slack",
+            "webhook_env_var": "AISOFTWAREFACTORY_SLACK_WEBHOOK_URL",
+            "events": {"human_gate": True},
+        }
+    }
+
+    def load(self, data) -> NotificationsConfig:
+        with tempfile.TemporaryDirectory() as tmp:
+            if data is not None:
+                (Path(tmp) / "NOTIFICATIONS.yaml").write_text(
+                    yaml.safe_dump(data), encoding="utf-8"
+                )
+            return load_notifications_config(tmp)
+
+    def mutated(self, **changes) -> dict:
+        data = yaml.safe_load(yaml.safe_dump(self.VALID))
+        data["notifications"].update(changes)
+        return data
+
+    def test_absent_file_means_disabled(self) -> None:
+        config = self.load(None)
+        self.assertEqual(config, DISABLED_NOTIFICATIONS)
+        self.assertFalse(config.enabled)
+
+    def test_valid_enabled(self) -> None:
+        config = self.load(self.VALID)
+        self.assertEqual(
+            config,
+            NotificationsConfig(
+                enabled=True,
+                provider="slack",
+                webhook_env_var="AISOFTWAREFACTORY_SLACK_WEBHOOK_URL",
+                human_gate=True,
+            ),
+        )
+
+    def test_valid_disabled_and_event_disabled(self) -> None:
+        self.assertFalse(self.load(self.mutated(enabled=False)).enabled)
+        config = self.load(self.mutated(events={"human_gate": False}))
+        self.assertTrue(config.enabled)
+        self.assertFalse(config.human_gate)
+
+    def test_invalid_variants_are_rejected(self) -> None:
+        bad = {
+            "unknown key": self.mutated(extra=True),
+            "unknown top-level key": {**self.VALID, "other": 1},
+            "missing key": {"notifications": {"enabled": True, "provider": "slack"}},
+            "enabled not a bool": self.mutated(enabled="yes"),
+            "provider invalid": self.mutated(provider="email"),
+            "provider not a string": self.mutated(provider=1),
+            "event unknown": self.mutated(events={"human_gate": True, "other": True}),
+            "event not a bool": self.mutated(events={"human_gate": "yes"}),
+            "events empty": self.mutated(events={}),
+            "env var lowercase": self.mutated(webhook_env_var="my_webhook"),
+            "env var with a url": self.mutated(webhook_env_var="https://hooks.slack.com/services/T/B/X"),
+            "env var with a space": self.mutated(webhook_env_var="A B"),
+            "env var empty": self.mutated(webhook_env_var=""),
+            "env var starts with a digit": self.mutated(webhook_env_var="1ABC"),
+            "not a mapping": ["notifications"],
+        }
+        for label, data in bad.items():
+            with self.subTest(label):
+                with self.assertRaises(ConfigError):
+                    self.load(data)
+
+    def test_secret_shaped_keys_are_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            self.load(self.mutated(webhook_token="x"))
+
+    def test_invalid_yaml_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "NOTIFICATIONS.yaml").write_text("notifications: [unclosed", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_notifications_config(tmp)
+
+    def test_the_real_yaml_is_valid_and_holds_no_secret(self) -> None:
+        path = CONFIG_DIR / "NOTIFICATIONS.yaml"
+        config = load_notifications_config(CONFIG_DIR)
+        self.assertEqual(config.provider, "slack")
+        self.assertEqual(config.webhook_env_var, "AISOFTWAREFACTORY_SLACK_WEBHOOK_URL")
+        text = path.read_text(encoding="utf-8")
+        for needle in ("https://", "http://", "hooks.slack.com", "xoxb-", "xoxp-"):
+            self.assertNotIn(needle, text)
+
+    def test_load_core_config_does_not_require_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("POLICIES.yaml", "AGENTS.yaml", "GATES.yaml", "PERMISSIONS.yaml"):
+                (Path(tmp) / name).write_text(
+                    (CONFIG_DIR / name).read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            load_core_config(tmp)  # sin NOTIFICATIONS.yaml: no falla
 
 
 if __name__ == "__main__":
