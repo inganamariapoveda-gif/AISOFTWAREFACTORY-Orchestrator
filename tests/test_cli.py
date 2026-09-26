@@ -110,6 +110,20 @@ def _write_yaml(path: Path, data: dict) -> None:
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
 
+# STATE-RECONCILIATION-001: Preconditions sintácticamente válido pero sin
+# ninguna pretensión de coincidir con un repo real -- para fixtures que
+# nunca pasan por reconcile_preconditions() (p. ej. cmd_task_packet_probe,
+# que es puramente en memoria).
+_DUMMY_PRECONDITIONS = {
+    "git": {
+        "expected_branch": "main",
+        "expected_head": "a" * 40,
+        "require_clean": True,
+    },
+    "external_resources": [],
+}
+
+
 def _project_row_exists(db_path: Path, project_id: str) -> bool:
     """Lectura directa de solo verificación (fuera de Store) para confirmar,
     en las pruebas de CORRECTION-002, que un register-project/create-task
@@ -172,6 +186,10 @@ class CliFixtureTestCase(unittest.TestCase):
                 "mandatory_tests": ["unit"],
                 "stop_rules": ["Unauthorized file modified"],
                 "required_evidence": ["git_diff", "test_output"],
+                # SAMPLE_TASK.yaml no es un repo git real (lo usa solo
+                # cmd_task_packet_probe, en memoria, sin reconciliación):
+                # basta con que preconditions sea sintácticamente válido.
+                "preconditions": _DUMMY_PRECONDITIONS,
             },
         )
 
@@ -834,7 +852,27 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         *,
         mandatory_tests: list[str],
         authorized_files: list[str] | None = None,
+        preconditions: dict | None = None,
     ) -> None:
+        if preconditions is None:
+            # STATE-RECONCILIATION-001: por defecto, preconditions.git
+            # refleja la realidad REAL y ACTUAL de self.taskexec_repo en
+            # el momento de escribir el packet -- exactamente lo que un
+            # Director honesto declararía. Esto mantiene MATCH para todo
+            # test que no esté deliberadamente probando drift; los tests
+            # que SÍ quieren simular drift pasan `preconditions` explícito.
+            preconditions = {
+                "git": {
+                    "expected_branch": _git(
+                        "branch", "--show-current", cwd=self.taskexec_repo
+                    ).stdout.strip(),
+                    "expected_head": _git(
+                        "rev-parse", "HEAD", cwd=self.taskexec_repo
+                    ).stdout.strip(),
+                    "require_clean": True,
+                },
+                "external_resources": [],
+            }
         _write_yaml(
             self.taskexec_packet_path,
             {
@@ -853,6 +891,7 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
                 "mandatory_tests": mandatory_tests,
                 "stop_rules": ["Unauthorized file modified"],
                 "required_evidence": ["git_diff", "test_output"],
+                "preconditions": preconditions,
             },
         )
 
@@ -2145,6 +2184,7 @@ def _make_role_boundary_task_packet(**overrides) -> task_packet_mod.TaskPacket:
         "mandatory_tests": ["unit"],
         "stop_rules": ["Unauthorized file modified"],
         "required_evidence": ["git_diff"],
+        "preconditions": _DUMMY_PRECONDITIONS,
     }
     data.update(overrides)
     return task_packet_mod.parse_task_packet(data)
@@ -2566,13 +2606,23 @@ class PersistedStartTests(PersistedExecutionTestCase):
         self.assertEqual(self.head(), head)
 
     def test_dirty_repository_blocks_before_claude_and_before_any_db_write(self) -> None:
+        # STATE-RECONCILIATION-001: la detección de working tree sucio
+        # ahora ocurre en la reconciliación de precondiciones (declaradas
+        # como require_clean: true en el packet), ANTES de la vieja
+        # comprobación is_clean de cmd_run_task -- que sigue existiendo
+        # más abajo, sin cambios, como red de seguridad redundante.
         (self.taskexec_repo / "stray.txt").write_text("dirty", encoding="utf-8")
         developer = self.never_called()
         rc, result, test = self.run_task(developer=developer)
         self.assertEqual(rc, 1)
         assert result is not None
-        self.assertEqual(result["state"], "BLOCKED")
-        self.assertIn("not clean", result["reason"])
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        self.assertEqual(result["classification"], "DRIFT_MATERIAL")
+        clean_check = next(
+            c for c in result["checks"] if c["check_type"] == "git_working_tree_clean"
+        )
+        self.assertEqual(clean_check["classification"], "DRIFT_MATERIAL")
+        self.assertFalse(clean_check["observed"])
         developer.assert_not_called()
         test.assert_not_called()
         self.assertFalse(self.db_path.exists())  # ninguna escritura
@@ -2821,6 +2871,224 @@ class PersistedAtomicStartTests(PersistedExecutionTestCase):
         assert task is not None
         self.assertEqual(task["title"], TASK_ID)
         self.assertEqual(task["need_text"], f"persisted execution of Task Packet {TASK_ID}")
+
+
+class ReconciliationIntegrationTests(PersistedExecutionTestCase):
+    """STATE-RECONCILIATION-001: cmd_run_task bloquea ANTES de tocar Claude
+    o la DB cuando la realidad técnica ya no coincide con lo declarado en
+    preconditions. Los dos incidentes reales que motivaron esta tarea
+    (CAPACITY-WAKEUP-001 reemitida sobre un HEAD/rama obsoletos; el
+    scheduler tratado como no instalado cuando ya existía) están cubiertos
+    explícitamente al final de esta clase."""
+
+    def _set_preconditions(self, preconditions: dict) -> None:
+        packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        packet["preconditions"] = preconditions
+        _write_yaml(self.taskexec_packet_path, packet)
+
+    def _real_git_preconditions(self) -> dict:
+        return {
+            "git": {
+                "expected_branch": self.branch(),
+                "expected_head": self.head(),
+                "require_clean": True,
+            },
+            "external_resources": [],
+        }
+
+    def test_match_lets_the_existing_flow_continue_unchanged(self) -> None:
+        # 28. MATCH permite seguir al flujo existente, sin cambiar su
+        # comportamiento (mismo resultado que sin reconciliación).
+        self._set_preconditions(self._real_git_preconditions())
+        rc, result, test = self.run_task(developer=self.developer_completes())
+        self.assertEqual(rc, 0)
+        assert result is not None
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        test.assert_called_once()
+
+    def test_head_mismatch_blocks_before_developer(self) -> None:
+        # 29. HEAD mismatch bloquea ANTES de developer.
+        preconditions = self._real_git_preconditions()
+        preconditions["git"]["expected_head"] = "b" * 40
+        self._set_preconditions(preconditions)
+        head_before = self.head()
+        developer = self.never_called()
+        rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        self.assertEqual(result["classification"], "DRIFT_MATERIAL")
+        head_check = next(c for c in result["checks"] if c["check_type"] == "git_head")
+        self.assertEqual(head_check["classification"], "DRIFT_MATERIAL")
+        developer.assert_not_called()  # 34
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+        self.assertEqual(self.head(), head_before)  # 35: repo no cambia
+
+    def test_branch_mismatch_blocks_before_developer(self) -> None:
+        # 30. branch mismatch bloquea ANTES de developer.
+        preconditions = self._real_git_preconditions()
+        preconditions["git"]["expected_branch"] = "totally-different-branch"
+        self._set_preconditions(preconditions)
+        developer = self.never_called()
+        rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        branch_check = next(c for c in result["checks"] if c["check_type"] == "git_branch")
+        self.assertEqual(branch_check["classification"], "DRIFT_MATERIAL")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_external_resource_mismatch_blocks_before_developer(self) -> None:
+        # 32. external resource mismatch bloquea ANTES de developer.
+        preconditions = self._real_git_preconditions()
+        preconditions["external_resources"] = [
+            {
+                "type": "windows_scheduled_task",
+                "name": "AISOFTWAREFACTORY-Orchestrator-ResumeDue-Test-Absent",
+                "expected_present": True,
+            }
+        ]
+        self._set_preconditions(preconditions)
+        developer = self.never_called()
+        with mock.patch(
+            "orchestrator.reconciliation._query_windows_scheduled_task_presence",
+            return_value=False,
+        ):
+            rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        resource_check = next(c for c in result["checks"] if c["check_type"] == "external_resource")
+        self.assertEqual(resource_check["classification"], "DRIFT_MATERIAL")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_external_resource_unknown_blocks_before_developer(self) -> None:
+        # 33. external check UNKNOWN bloquea ANTES de developer.
+        preconditions = self._real_git_preconditions()
+        preconditions["external_resources"] = [
+            {
+                "type": "windows_scheduled_task",
+                "name": "AISOFTWAREFACTORY-Orchestrator-ResumeDue-Test-Unknown",
+                "expected_present": True,
+            }
+        ]
+        self._set_preconditions(preconditions)
+        developer = self.never_called()
+        with mock.patch(
+            "orchestrator.reconciliation._query_windows_scheduled_task_presence",
+            return_value=None,
+        ):
+            rc, result, test = self.run_task(developer=developer)
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        self.assertEqual(result["classification"], "UNKNOWN")
+        developer.assert_not_called()
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_blocked_output_never_leaks_raw_stdout_or_stderr(self) -> None:
+        # 37. output no incluye stdout/stderr sensible.
+        preconditions = self._real_git_preconditions()
+        preconditions["git"]["expected_head"] = "c" * 40
+        self._set_preconditions(preconditions)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.run_cli("run-task", str(self.taskexec_packet_path))
+        raw = out.getvalue()
+        self.assertEqual(rc, 1)
+        result = json.loads(raw)
+        for forbidden in ("stdout", "stderr", "traceback", "Traceback"):
+            self.assertNotIn(forbidden, result)
+        self.assertNotIn("Traceback", raw)
+
+    def test_reconciliation_never_creates_or_modifies_a_windows_task(self) -> None:
+        # 36. no se crea/modifica recurso Windows: solo /Query, nunca
+        # /Create, /Delete, /Change, /Run ni /End, y nunca en un proceso
+        # con shell=True.
+        preconditions = self._real_git_preconditions()
+        preconditions["external_resources"] = [
+            {"type": "windows_scheduled_task", "name": "SomeTask", "expected_present": True}
+        ]
+        self._set_preconditions(preconditions)
+        real_run = subprocess.run
+
+        def spy(args, **kwargs):
+            if isinstance(args, list) and args and "schtasks" in str(args[0]).lower():
+                forbidden = {"/Create", "/Delete", "/Change", "/Run", "/End"}
+                self.assertFalse(forbidden & set(args))
+                self.assertFalse(kwargs.get("shell", False))
+                return subprocess.CompletedProcess(args=args, returncode=1)
+            return real_run(args, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=spy):
+            rc, result, test = self.run_task(developer=self.never_called())
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["status"], "reconciliation_blocked")
+        test.assert_not_called()
+
+    # ----------------------------------------------------------------
+    # Incidentes reales de regresión (criterios de aceptación obligatorios)
+    # ----------------------------------------------------------------
+
+    def test_incident_a_stale_branch_and_head_blocks_before_developer(self) -> None:
+        """INCIDENTE A: un Task Packet fue generado asumiendo una rama/HEAD
+        de Git que ya no son la realidad (exactamente lo que ocurrió al
+        reemitir CAPACITY-WAKEUP-001 sobre un estado anterior al commit que
+        ya lo implementaba). La reconciliación debe bloquear, con
+        developer_calls == 0, ANTES de tocar la DB."""
+        preconditions = self._real_git_preconditions()
+        preconditions["git"]["expected_branch"] = "task/capacity-resume-execution-002"
+        preconditions["git"]["expected_head"] = "8" * 40  # nunca coincide con el repo real
+        self._set_preconditions(preconditions)
+
+        developer = self.never_called()
+        rc, result, test = self.run_task(developer=developer)
+
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["classification"], "DRIFT_MATERIAL")
+        self.assertEqual(developer.call_count, 0)  # developer_calls == 0
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_incident_b_scheduled_task_exists_when_expected_absent_blocks(self) -> None:
+        """INCIDENTE B: el Task Packet declara windows_scheduled_task con
+        expected_present: false, pero la consulta real observa que existe
+        (exactamente lo que ocurrió al asumir que el scheduler no estaba
+        instalado cuando ya llevaba un día activo). Debe bloquear, con
+        developer_calls == 0."""
+        preconditions = self._real_git_preconditions()
+        preconditions["external_resources"] = [
+            {
+                "type": "windows_scheduled_task",
+                "name": "AISOFTWAREFACTORY-Orchestrator-ResumeDue",
+                "expected_present": False,
+            }
+        ]
+        self._set_preconditions(preconditions)
+
+        developer = self.never_called()
+        with mock.patch(
+            "orchestrator.reconciliation._query_windows_scheduled_task_presence",
+            return_value=True,  # la tarea SÍ existe
+        ):
+            rc, result, test = self.run_task(developer=developer)
+
+        self.assertEqual(rc, 1)
+        assert result is not None
+        self.assertEqual(result["classification"], "DRIFT_MATERIAL")
+        resource_check = next(c for c in result["checks"] if c["check_type"] == "external_resource")
+        self.assertEqual(resource_check["classification"], "DRIFT_MATERIAL")
+        self.assertEqual(developer.call_count, 0)  # developer_calls == 0
+        test.assert_not_called()
+        self.assertFalse(self.db_path.exists())
 
 
 class PersistedFirstCapacityTests(PersistedExecutionTestCase):
@@ -3970,6 +4238,18 @@ class ResumeDueTestCase(PersistedExecutionTestCase):
         packet["task_id"] = task_id
         packet["project_id"] = project_id
         packet["authorized_files"] = ["allowed.txt", "new_authorized.txt"]
+        # STATE-RECONCILIATION-001: este es un repo INDEPENDIENTE de
+        # self.taskexec_repo -- las preconditions heredadas del packet
+        # base apuntan al repo equivocado. Se recalculan aquí contra el
+        # repo real de ESTE proyecto.
+        packet["preconditions"] = {
+            "git": {
+                "expected_branch": _git("branch", "--show-current", cwd=repo).stdout.strip(),
+                "expected_head": _git("rev-parse", "HEAD", cwd=repo).stdout.strip(),
+                "require_clean": True,
+            },
+            "external_resources": [],
+        }
         _write_yaml(self.tasks_dir / f"{project_id}_TASK.yaml", packet)
         return task_id
 

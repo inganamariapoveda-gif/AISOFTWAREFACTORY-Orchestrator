@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from . import evidence as evidence_mod
+from . import reconciliation as reconciliation_mod
 from . import sandbox as sandbox_mod
 from . import task_packet as task_packet_mod
 from . import test_runner as test_runner_mod
@@ -1147,6 +1148,24 @@ def cmd_run_task(args: argparse.Namespace) -> int:
         project_id=packet.project_id,
         orchestrator_repo_root=REPO_ROOT,
     )
+
+    # STATE-RECONCILIATION-001: precondiciones ANTES de tocar la DB o
+    # Claude. El Task Packet fue generado asumiendo una realidad técnica
+    # exacta (Git y, si se declaró, un recurso externo); si esa realidad ya
+    # no coincide, el motor bloquea aquí -- nunca corrige, nunca crea una
+    # tarea SQLite solo para registrar el bloqueo.
+    reconciliation_report = reconciliation_mod.reconcile_preconditions(
+        project_root, packet.preconditions
+    )
+    if reconciliation_report.classification != reconciliation_mod.CLASSIFICATION_MATCH:
+        _emit(
+            {
+                "status": "reconciliation_blocked",
+                **reconciliation_mod.report_to_public_dict(reconciliation_report),
+            }
+        )
+        return EXIT_BLOCKED_OR_ERROR
+
     before = evidence_mod.capture_snapshot(project_root, authorized_root=project_root)
     if not before.is_clean:
         # Sin escrituras en la DB: nada se registró y Claude no se invoca.

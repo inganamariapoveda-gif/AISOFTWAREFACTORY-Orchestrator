@@ -32,9 +32,11 @@ capacidad futura. La resolución de globs, si se añade, es una tarea
 propia y posterior.
 
 MOTOR != REGLAS: el esquema del Task Packet es CERRADO (los 13 campos de
-arriba, ni uno más). Cualquier clave desconocida en el YAML/dict de
-entrada se rechaza (fail closed) ANTES de construir el objeto. Por
-construcción, no existe ningún campo en el que un Task Packet pueda
+arriba, ni uno más -- salvo `preconditions`, añadido por
+STATE-RECONCILIATION-001: ver su propia sección más abajo). Cualquier
+clave desconocida en el YAML/dict de entrada se rechaza (fail closed)
+ANTES de construir el objeto. Por construcción, no existe ningún campo en
+el que un Task Packet pueda
 declarar niveles GREEN/YELLOW/RED, permisos globales, comandos
 permitidos, permisos de Claude, políticas del orquestador, bypass de
 Human Gate, ni configuración de agentes: esos controles pertenecen
@@ -263,10 +265,62 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
     "mandatory_tests",
     "stop_rules",
     "required_evidence",
+    "preconditions",
 )
 
 class TaskPacketError(Exception):
     """Task Packet ausente, inválido o inseguro. Falla cerrado."""
+
+
+# STATE-RECONCILIATION-001: `preconditions` declara HECHOS ESPERADOS sobre
+# la realidad técnica en la que este Task Packet fue generado (Git y, en
+# este MVP, la presencia/ausencia de UNA Windows Scheduled Task). Este
+# módulo SOLO valida forma y tipos -- nunca compara contra la realidad ni
+# decide severidad: eso es responsabilidad exclusiva de
+# `orchestrator.reconciliation`. Un Task Packet nunca declara su propia
+# clasificación de drift (MOTOR != REGLAS).
+_GIT_PRECONDITION_KEYS = frozenset({"expected_branch", "expected_head", "require_clean"})
+_EXTERNAL_RESOURCE_KEYS = frozenset({"type", "name", "expected_present"})
+_PRECONDITIONS_KEYS = frozenset({"git", "external_resources"})
+
+EXTERNAL_RESOURCE_TYPE_WINDOWS_SCHEDULED_TASK = "windows_scheduled_task"
+_KNOWN_EXTERNAL_RESOURCE_TYPES = frozenset({EXTERNAL_RESOURCE_TYPE_WINDOWS_SCHEDULED_TASK})
+
+# 40 caracteres hex (SHA-1, el formato de este repositorio) o 64 (SHA-256),
+# siempre en minúsculas -- misma convención que usa el resto del proyecto
+# para identificar un commit Git real.
+_GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+@dataclass(frozen=True)
+class GitPreconditions:
+    """Hechos Git esperados en el momento en que este Task Packet se
+    generó. `require_clean` es siempre True en este MVP (única semántica
+    de bloqueo implementada); se conserva como campo explícito -- en vez
+    de una constante implícita -- para que un incremento futuro pueda
+    declarar False sin romper el esquema, aunque hoy False se rechace en
+    la validación."""
+
+    expected_branch: str
+    expected_head: str
+    require_clean: bool
+
+
+@dataclass(frozen=True)
+class ExternalResourcePrecondition:
+    """Una expectativa sobre UN recurso externo al repositorio Git. En
+    este MVP, `type` solo puede ser
+    EXTERNAL_RESOURCE_TYPE_WINDOWS_SCHEDULED_TASK."""
+
+    type: str
+    name: str
+    expected_present: bool
+
+
+@dataclass(frozen=True)
+class Preconditions:
+    git: GitPreconditions
+    external_resources: tuple[ExternalResourcePrecondition, ...]
 
 
 @dataclass(frozen=True)
@@ -284,6 +338,7 @@ class TaskPacket:
     mandatory_tests: tuple[str, ...]
     stop_rules: tuple[str, ...]
     required_evidence: tuple[str, ...]
+    preconditions: Preconditions
 
 
 def _validate_identifier(value: Any, field_name: str) -> str:
@@ -387,6 +442,107 @@ def _validate_test_id_list(value: Any, field_name: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _validate_git_preconditions(value: Any) -> GitPreconditions:
+    if not isinstance(value, dict):
+        raise TaskPacketError("'preconditions.git' must be a mapping")
+    unknown = sorted(set(value.keys()) - _GIT_PRECONDITION_KEYS)
+    if unknown:
+        raise TaskPacketError(f"'preconditions.git' contains unknown field(s): {unknown}")
+    missing = sorted(_GIT_PRECONDITION_KEYS - set(value.keys()))
+    if missing:
+        raise TaskPacketError(f"'preconditions.git' is missing required field(s): {missing}")
+
+    expected_branch = value["expected_branch"]
+    if not isinstance(expected_branch, str) or not expected_branch:
+        raise TaskPacketError("'preconditions.git.expected_branch' must be a non-empty string")
+    if "\x00" in expected_branch:
+        raise TaskPacketError(
+            "'preconditions.git.expected_branch' must not contain NUL characters"
+        )
+
+    expected_head = value["expected_head"]
+    if not isinstance(expected_head, str) or not _GIT_SHA_RE.fullmatch(expected_head):
+        raise TaskPacketError(
+            "'preconditions.git.expected_head' must be a valid Git SHA "
+            "(40 or 64 lowercase hex characters)"
+        )
+
+    # require_clean=False no es un valor "aceptado pero ignorado": esta
+    # versión del motor SOLO sabe evaluar require_clean=True (Fase 3/6 del
+    # diseño). Aceptar False en silencio equivaldría a fingir soporte para
+    # una semántica que reconciliation.py no implementa todavía.
+    require_clean = value["require_clean"]
+    if not isinstance(require_clean, bool):
+        raise TaskPacketError("'preconditions.git.require_clean' must be a boolean")
+    if require_clean is not True:
+        raise TaskPacketError(
+            "'preconditions.git.require_clean' must be true in this MVP "
+            "(false is not supported yet)"
+        )
+
+    return GitPreconditions(
+        expected_branch=expected_branch,
+        expected_head=expected_head,
+        require_clean=require_clean,
+    )
+
+
+def _validate_external_resource_precondition(value: Any, idx: int) -> ExternalResourcePrecondition:
+    label = f"preconditions.external_resources[{idx}]"
+    if not isinstance(value, dict):
+        raise TaskPacketError(f"'{label}' must be a mapping")
+    unknown = sorted(set(value.keys()) - _EXTERNAL_RESOURCE_KEYS)
+    if unknown:
+        raise TaskPacketError(f"'{label}' contains unknown field(s): {unknown}")
+    missing = sorted(_EXTERNAL_RESOURCE_KEYS - set(value.keys()))
+    if missing:
+        raise TaskPacketError(f"'{label}' is missing required field(s): {missing}")
+
+    resource_type = value["type"]
+    if not isinstance(resource_type, str) or resource_type not in _KNOWN_EXTERNAL_RESOURCE_TYPES:
+        raise TaskPacketError(
+            f"'{label}.type' must be one of {sorted(_KNOWN_EXTERNAL_RESOURCE_TYPES)}, "
+            f"got {resource_type!r}"
+        )
+
+    name = value["name"]
+    if not isinstance(name, str) or not name:
+        raise TaskPacketError(f"'{label}.name' must be a non-empty string")
+    if "\x00" in name:
+        raise TaskPacketError(f"'{label}.name' must not contain NUL characters")
+
+    expected_present = value["expected_present"]
+    if not isinstance(expected_present, bool):
+        raise TaskPacketError(f"'{label}.expected_present' must be a boolean")
+
+    return ExternalResourcePrecondition(
+        type=resource_type, name=name, expected_present=expected_present
+    )
+
+
+def _validate_preconditions(value: Any) -> Preconditions:
+    if not isinstance(value, dict):
+        raise TaskPacketError("'preconditions' must be a mapping")
+    unknown = sorted(set(value.keys()) - _PRECONDITIONS_KEYS)
+    if unknown:
+        raise TaskPacketError(f"'preconditions' contains unknown field(s): {unknown}")
+    missing = sorted(_PRECONDITIONS_KEYS - set(value.keys()))
+    if missing:
+        raise TaskPacketError(f"'preconditions' is missing required field(s): {missing}")
+
+    git = _validate_git_preconditions(value["git"])
+
+    external_resources_raw = value["external_resources"]
+    if not isinstance(external_resources_raw, list):
+        raise TaskPacketError("'preconditions.external_resources' must be a list")
+    external_resources = tuple(
+        _validate_external_resource_precondition(item, idx)
+        for idx, item in enumerate(external_resources_raw)
+    )
+
+    return Preconditions(git=git, external_resources=external_resources)
+
+
 def parse_task_packet(data: Any) -> TaskPacket:
     """Valida un dict ya cargado (p. ej. por yaml.safe_load) y construye un
     TaskPacket inmutable. Falla cerrado ante cualquier estructura
@@ -430,6 +586,7 @@ def parse_task_packet(data: Any) -> TaskPacket:
         )
 
     mandatory_tests = _validate_test_id_list(data["mandatory_tests"], "mandatory_tests")
+    preconditions = _validate_preconditions(data["preconditions"])
 
     return TaskPacket(
         task_id=task_id,
@@ -445,6 +602,7 @@ def parse_task_packet(data: Any) -> TaskPacket:
         mandatory_tests=mandatory_tests,
         stop_rules=stop_rules,
         required_evidence=required_evidence,
+        preconditions=preconditions,
     )
 
 

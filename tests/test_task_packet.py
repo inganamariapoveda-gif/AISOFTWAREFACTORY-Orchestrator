@@ -27,6 +27,8 @@ from orchestrator.task_packet import (  # noqa: E402
     parse_task_packet,
 )
 
+_VALID_HEAD_SHA = "a" * 40
+
 
 def _extract_structured_json(instruction: str) -> dict:
     """Extrae y parsea el bloque JSON entre los marcadores BEGIN/END de
@@ -50,7 +52,19 @@ _REQUIRED_FIELDS = (
     "mandatory_tests",
     "stop_rules",
     "required_evidence",
+    "preconditions",
 )
+
+
+def _valid_preconditions() -> dict:
+    return {
+        "git": {
+            "expected_branch": "main",
+            "expected_head": _VALID_HEAD_SHA,
+            "require_clean": True,
+        },
+        "external_resources": [],
+    }
 
 
 def _valid_packet_data() -> dict:
@@ -68,6 +82,7 @@ def _valid_packet_data() -> dict:
         "mandatory_tests": ["unit"],
         "stop_rules": ["Unauthorized file modified"],
         "required_evidence": ["git_diff", "test_output"],
+        "preconditions": _valid_preconditions(),
     }
 
 
@@ -127,6 +142,12 @@ security_criteria: []
 mandatory_tests: ["unit"]
 stop_rules: []
 required_evidence: ["git_diff"]
+preconditions:
+  git:
+    expected_branch: main
+    expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    require_clean: true
+  external_resources: []
 """
         packet = load_task_packet_from_yaml_text(text)
         self.assertEqual(packet.task_id, "SAMPLE-001")
@@ -168,6 +189,178 @@ class RequiredFieldsTests(unittest.TestCase):
             load_task_packet_from_yaml_text("")
         with self.assertRaises(TaskPacketError):
             load_task_packet_from_yaml_text("# only a comment\n")
+
+
+# ================================================================
+# B2. PRECONDITIONS (STATE-RECONCILIATION-001)
+# ================================================================
+
+
+class PreconditionsValidationTests(unittest.TestCase):
+    """El Task Packet solo declara HECHOS ESPERADOS: aquí se prueba forma y
+    tipos, nunca comparación contra la realidad (eso vive en
+    orchestrator.reconciliation, con sus propias pruebas)."""
+
+    def _with_preconditions(self, preconditions) -> dict:
+        data = _valid_packet_data()
+        data["preconditions"] = preconditions
+        return data
+
+    def test_valid_preconditions_accepted(self) -> None:
+        # 1. preconditions válido aceptado.
+        packet = parse_task_packet(self._with_preconditions(_valid_preconditions()))
+        self.assertEqual(packet.preconditions.git.expected_branch, "main")
+        self.assertEqual(packet.preconditions.git.expected_head, _VALID_HEAD_SHA)
+        self.assertTrue(packet.preconditions.git.require_clean)
+        self.assertEqual(packet.preconditions.external_resources, ())
+
+    def test_preconditions_absent_rejected(self) -> None:
+        # 2. preconditions ausente rechazado (también cubierto por
+        # RequiredFieldsTests.test_each_required_field_missing_is_rejected).
+        data = _valid_packet_data()
+        del data["preconditions"]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(data)
+
+    def test_unknown_top_level_field_rejected(self) -> None:
+        # 3. campo desconocido rechazado (a nivel de preconditions).
+        preconditions = _valid_preconditions()
+        preconditions["extra"] = "x"
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_unknown_git_field_rejected(self) -> None:
+        preconditions = _valid_preconditions()
+        preconditions["git"]["extra"] = "x"
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_expected_branch_missing_rejected(self) -> None:
+        # 4. expected_branch ausente rechazado.
+        preconditions = _valid_preconditions()
+        del preconditions["git"]["expected_branch"]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_expected_head_missing_rejected(self) -> None:
+        # 5. expected_head ausente rechazado.
+        preconditions = _valid_preconditions()
+        del preconditions["git"]["expected_head"]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_expected_head_must_be_a_valid_git_sha(self) -> None:
+        preconditions = _valid_preconditions()
+        for bad in ("not-a-sha", "A" * 40, "a" * 39, "", 123):
+            with self.subTest(bad=bad):
+                preconditions["git"]["expected_head"] = bad
+                with self.assertRaises(TaskPacketError):
+                    parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_require_clean_not_true_rejected(self) -> None:
+        # 6. require_clean != true rechazado (tanto tipo incorrecto como
+        # el único valor booleano no soportado en este MVP).
+        for bad in (False, "true", 1, None):
+            with self.subTest(bad=bad):
+                preconditions = _valid_preconditions()
+                preconditions["git"]["require_clean"] = bad
+                with self.assertRaises(TaskPacketError):
+                    parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_external_resources_non_list_rejected(self) -> None:
+        # 7. external_resources no-list rechazado.
+        for bad in ({}, "windows_scheduled_task", None):
+            with self.subTest(bad=bad):
+                preconditions = _valid_preconditions()
+                preconditions["external_resources"] = bad
+                with self.assertRaises(TaskPacketError):
+                    parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_unknown_resource_type_rejected(self) -> None:
+        # 8. resource type desconocido rechazado.
+        preconditions = _valid_preconditions()
+        preconditions["external_resources"] = [
+            {"type": "linux_cron_job", "name": "x", "expected_present": True}
+        ]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_scheduled_task_missing_name_rejected(self) -> None:
+        # 9. scheduled task sin name rechazado.
+        preconditions = _valid_preconditions()
+        preconditions["external_resources"] = [
+            {"type": "windows_scheduled_task", "expected_present": True}
+        ]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_non_string_resource_types_raise_task_packet_error(self) -> None:
+        for value in ([], {}, 123, None, True):
+            with self.subTest(value=value):
+                preconditions = _valid_preconditions()
+                preconditions["external_resources"] = [
+                    {"type": value, "name": "SomeTask", "expected_present": True}
+                ]
+                with self.assertRaises(TaskPacketError):
+                    parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_scheduled_task_empty_name_rejected(self) -> None:
+        preconditions = _valid_preconditions()
+        preconditions["external_resources"] = [
+            {"type": "windows_scheduled_task", "name": "", "expected_present": True}
+        ]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_expected_present_not_boolean_rejected(self) -> None:
+        # 10. expected_present no boolean rechazado.
+        for bad in ("true", 1, None, "false"):
+            with self.subTest(bad=bad):
+                preconditions = _valid_preconditions()
+                preconditions["external_resources"] = [
+                    {"type": "windows_scheduled_task", "name": "SomeTask", "expected_present": bad}
+                ]
+                with self.assertRaises(TaskPacketError):
+                    parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_unknown_resource_field_rejected(self) -> None:
+        preconditions = _valid_preconditions()
+        preconditions["external_resources"] = [
+            {
+                "type": "windows_scheduled_task",
+                "name": "SomeTask",
+                "expected_present": True,
+                "extra": "x",
+            }
+        ]
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(self._with_preconditions(preconditions))
+
+    def test_valid_scheduled_task_resource_accepted(self) -> None:
+        preconditions = _valid_preconditions()
+        preconditions["external_resources"] = [
+            {
+                "type": "windows_scheduled_task",
+                "name": "AISOFTWAREFACTORY-Orchestrator-ResumeDue",
+                "expected_present": True,
+            }
+        ]
+        packet = parse_task_packet(self._with_preconditions(preconditions))
+        self.assertEqual(len(packet.preconditions.external_resources), 1)
+        resource = packet.preconditions.external_resources[0]
+        self.assertEqual(resource.type, "windows_scheduled_task")
+        self.assertEqual(resource.name, "AISOFTWAREFACTORY-Orchestrator-ResumeDue")
+        self.assertTrue(resource.expected_present)
+
+    def test_preconditions_never_reach_the_developer_instruction(self) -> None:
+        # El Task Packet declara hechos esperados para RECONCILIACIÓN del
+        # motor; no es contenido de trabajo para el Developer, y no debe
+        # filtrarse a su prompt (que sigue teniendo exactamente 13 campos).
+        packet = parse_task_packet(_valid_packet_data())
+        instruction = build_developer_instruction(packet)
+        parsed = _extract_structured_json(instruction)
+        self.assertNotIn("PRECONDITIONS", parsed)
+        self.assertNotIn(_VALID_HEAD_SHA, instruction)
 
 
 # ================================================================
@@ -661,6 +854,12 @@ security_criteria: []
 mandatory_tests: ["unit"]
 stop_rules: []
 required_evidence: ["git_diff"]
+preconditions:
+  git:
+    expected_branch: main
+    expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    require_clean: true
+  external_resources: []
 """
         packet = load_task_packet_from_yaml_text(text)
         self.assertEqual(packet.task_id, "SAMPLE-001")
