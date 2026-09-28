@@ -852,6 +852,22 @@ def cmd_task_execution_probe(args: argparse.Namespace) -> int:
     project_rules = _require_project_rules(packet.project_id)
     developer_config = config.agents.get("agents", {}).get("developer", {})
 
+    project_root = resolve_project_root(
+        project_rules,
+        project_id=packet.project_id,
+        orchestrator_repo_root=REPO_ROOT,
+    )
+    report = reconciliation_mod.reconcile_preconditions(project_root, packet.preconditions)
+    if report.classification != reconciliation_mod.CLASSIFICATION_MATCH:
+        _emit({
+            "status": "reconciliation_blocked",
+            "state": STATE_BLOCKED,
+            "developer_completed": False,
+            "commit_performed": False,
+            **reconciliation_mod.report_to_public_dict(report),
+        })
+        return EXIT_BLOCKED_OR_ERROR
+
     result = execute_task_packet(
         packet,
         project_rules=project_rules,

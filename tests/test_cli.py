@@ -1012,6 +1012,96 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         self.assertEqual(head_before, head_after)
 
 
+class TaskExecutionProbeReconciliationTests(TaskExecutionProbeTestCase):
+    def _assert_blocked(self, *, git_changes=None, resource_observed="unused", dirty=False):
+        data = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        data["preconditions"]["git"].update(git_changes or {})
+        if resource_observed != "unused":
+            data["preconditions"]["external_resources"] = [
+                {"type": "windows_scheduled_task", "name": "SampleTask", "expected_present": True}
+            ]
+        _write_yaml(self.taskexec_packet_path, data)
+        if dirty:
+            (self.taskexec_repo / "dirty.txt").write_text("dirty", encoding="utf-8")
+        before = {
+            p.relative_to(self.root): p.read_bytes()
+            for p in self.root.rglob("*") if p.is_file()
+        }
+        developer = mock.MagicMock(side_effect=AssertionError("Developer must not run"))
+        with self.patched_subprocess(developer=developer), \
+            mock.patch.object(app, "Store") as store, \
+            mock.patch.object(
+                app.reconciliation_mod, "_query_windows_scheduled_task_presence",
+                return_value=resource_observed,
+            ) as query:
+            rc, stdout = self.run_task_execution_probe()
+        self.assertEqual(rc, 1)
+        output = json.loads(stdout)
+        self.assertEqual(output["status"], "reconciliation_blocked")
+        self.assertEqual(output["classification"], "UNKNOWN" if resource_observed is None else "DRIFT_MATERIAL")
+        self.assertEqual(developer.call_count, 0)
+        store.assert_not_called()
+        if resource_observed == "unused":
+            query.assert_not_called()
+        else:
+            query.assert_called_once_with("SampleTask")
+        after = {
+            p.relative_to(self.root): p.read_bytes()
+            for p in self.root.rglob("*") if p.is_file()
+        }
+        self.assertEqual(before, after)
+        for forbidden in ("stdout", "stderr", "Traceback"):
+            self.assertNotIn(forbidden, stdout)
+
+    def test_match_reaches_developer_without_store(self):
+        developer = mock.MagicMock(side_effect=self._developer_writes_allowed_only)
+        test = mock.MagicMock(side_effect=self._test_passes)
+        with self.patched_subprocess(developer=developer, test=test), \
+            mock.patch.object(app, "Store") as store:
+            rc, stdout = self.run_task_execution_probe()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(stdout)["state"], "HUMAN_GATE")
+        developer.assert_called_once()
+        store.assert_not_called()
+
+    def test_branch_mismatch_blocks(self):
+        self._assert_blocked(git_changes={"expected_branch": "wrong-branch"})
+
+    def test_head_mismatch_blocks(self):
+        self._assert_blocked(git_changes={"expected_head": "b" * 40})
+
+    def test_dirty_tree_blocks(self):
+        self._assert_blocked(dirty=True)
+
+    def test_external_drift_blocks(self):
+        self._assert_blocked(resource_observed=False)
+
+    def test_external_unknown_blocks(self):
+        self._assert_blocked(resource_observed=None)
+
+
+class RealSampleTaskPacketTests(unittest.TestCase):
+    def test_real_sample_parses(self):
+        packet = task_packet_mod.load_task_packet_from_yaml_file(REPO_ROOT / "tasks/SAMPLE_TASK.yaml")
+        self.assertEqual(packet.task_id, "SAMPLE-001")
+        self.assertEqual(packet.preconditions.git.expected_branch, "fictitious-sample-only")
+        self.assertEqual(packet.preconditions.external_resources, ())
+
+    def test_probe_uses_real_sample_without_path_patch(self):
+        self.assertEqual(app.SAMPLE_TASK_PACKET_PATH, REPO_ROOT / "tasks/SAMPLE_TASK.yaml")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = app.main(["task-packet-probe"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(stdout.getvalue())["valid"])
+
+    def test_real_sample_without_preconditions_is_rejected(self):
+        data = yaml.safe_load((REPO_ROOT / "tasks/SAMPLE_TASK.yaml").read_text(encoding="utf-8"))
+        del data["preconditions"]
+        with self.assertRaises(TaskPacketError):
+            task_packet_mod.parse_task_packet(data)
+
+
 class TaskExecutionProbeSuccessTests(TaskExecutionProbeTestCase):
     def test_success_path_reaches_human_gate_without_commit(self) -> None:
         head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()

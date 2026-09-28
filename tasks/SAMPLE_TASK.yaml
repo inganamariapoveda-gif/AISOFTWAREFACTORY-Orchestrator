@@ -29,3 +29,11 @@ stop_rules:
 required_evidence:
   - git_diff
   - test_output
+# Solo demostracion de esquema/probe: valores ficticios, no representan
+# el estado de este repositorio ni autorizan una ejecucion real.
+preconditions:
+  git:
+    expected_branch: fictitious-sample-only
+    expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    require_clean: true
+  external_resources: []
