@@ -137,6 +137,7 @@ def _require_true(data: dict[str, Any], dotted_path: str, path: Path) -> None:
 
 
 def _validate_policies(data: dict[str, Any], path: Path) -> None:
+    validate_resource_budget(data)
     _require_true(data, "prohibitions.production", path)
     _require_true(data, "prohibitions.git_push", path)
     _require_true(data, "prohibitions.git_merge", path)
@@ -164,6 +165,49 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
             f"'classification.on_unclassified' must be {REQUIRED_ON_UNCLASSIFIED!r} "
             f"in {path}"
         )
+
+
+RESOURCE_LIMIT_KEYS = frozenset({
+    "max_builder_invocations", "max_verifier_invocations",
+    "max_correction_attempts", "max_total_model_invocations",
+})
+
+
+def validate_resource_budget(policies: dict[str, Any]) -> dict[str, Any]:
+    """Closed policy schema; numeric limits belong exclusively to YAML."""
+    if not isinstance(policies, dict):
+        raise ConfigError("policies must be a mapping")
+    block = policies.get("resource_budget")
+    if not isinstance(block, dict) or set(block) != {
+        "default_profile", "exhaustion_behavior", "profiles"
+    }:
+        raise ConfigError("invalid resource_budget keys")
+    if block["exhaustion_behavior"] != "BLOCKED":
+        raise ConfigError("unsupported resource budget exhaustion behavior")
+    profiles = block["profiles"]
+    if not isinstance(profiles, dict) or not profiles:
+        raise ConfigError("invalid resource budget profiles")
+    if any(not isinstance(name, str) or not name.strip() for name in profiles):
+        raise ConfigError("resource profile names must be non-empty strings")
+    default_profile = block["default_profile"]
+    if not isinstance(default_profile, str) or default_profile not in profiles:
+        raise ConfigError("default_profile must reference a configured profile")
+    attempts = policies.get("attempts")
+    if not isinstance(attempts, dict):
+        raise ConfigError("attempts must be a mapping")
+    ceiling = attempts.get("max_correction_attempts")
+    if type(ceiling) is not int or ceiling < 1:
+        raise ConfigError("invalid global correction ceiling")
+    for limits in profiles.values():
+        if not isinstance(limits, dict) or set(limits) != RESOURCE_LIMIT_KEYS:
+            raise ConfigError("invalid resource profile keys")
+        if any(type(value) is not int or value < 1 for value in limits.values()):
+            raise ConfigError("resource limits must be positive integers")
+        if limits["max_correction_attempts"] > ceiling:
+            raise ConfigError("profile correction limit exceeds global ceiling")
+        if max(limits["max_builder_invocations"], limits["max_verifier_invocations"]) > limits["max_total_model_invocations"]:
+            raise ConfigError("role limit exceeds total model limit")
+    return block
 
 
 def _validate_agents(data: dict[str, Any], path: Path) -> None:

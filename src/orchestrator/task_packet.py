@@ -339,6 +339,7 @@ class TaskPacket:
     stop_rules: tuple[str, ...]
     required_evidence: tuple[str, ...]
     preconditions: Preconditions
+    resource_profile: str
 
 
 def _validate_identifier(value: Any, field_name: str) -> str:
@@ -543,7 +544,7 @@ def _validate_preconditions(value: Any) -> Preconditions:
     return Preconditions(git=git, external_resources=external_resources)
 
 
-def parse_task_packet(data: Any) -> TaskPacket:
+def parse_task_packet(data: Any, *, policies: dict[str, Any] | None = None) -> TaskPacket:
     """Valida un dict ya cargado (p. ej. por yaml.safe_load) y construye un
     TaskPacket inmutable. Falla cerrado ante cualquier estructura
     inesperada: nunca intenta adivinar o completar campos ausentes."""
@@ -552,7 +553,7 @@ def parse_task_packet(data: Any) -> TaskPacket:
     if not data:
         raise TaskPacketError("task packet must not be empty")
 
-    unknown = sorted(set(data.keys()) - set(_REQUIRED_FIELDS))
+    unknown = sorted(set(data.keys()) - set(_REQUIRED_FIELDS) - {"resource_profile"})
     if unknown:
         raise TaskPacketError(f"task packet contains unknown field(s): {unknown}")
 
@@ -587,6 +588,16 @@ def parse_task_packet(data: Any) -> TaskPacket:
 
     mandatory_tests = _validate_test_id_list(data["mandatory_tests"], "mandatory_tests")
     preconditions = _validate_preconditions(data["preconditions"])
+    from .config_loader import load_core_config, validate_resource_budget
+
+    # Standalone callers use repository governance; operational callers pass
+    # their already-loaded active policy, including alternate configuration roots.
+    if policies is None:
+        policies = load_core_config(Path(__file__).resolve().parents[2] / "config").policies
+    budget = validate_resource_budget(policies)
+    resource_profile = data.get("resource_profile", budget["default_profile"])
+    if not isinstance(resource_profile, str) or resource_profile not in budget["profiles"]:
+        raise TaskPacketError("invalid resource_profile")
 
     return TaskPacket(
         task_id=task_id,
@@ -603,10 +614,11 @@ def parse_task_packet(data: Any) -> TaskPacket:
         stop_rules=stop_rules,
         required_evidence=required_evidence,
         preconditions=preconditions,
+        resource_profile=resource_profile,
     )
 
 
-def load_task_packet_from_yaml_text(text: str) -> TaskPacket:
+def load_task_packet_from_yaml_text(text: str, *, policies: dict[str, Any] | None = None) -> TaskPacket:
     """Carga un Task Packet desde texto YAML mediante `StrictSafeLoader`
     (CORRECTION-001): hereda exclusivamente de yaml.SafeLoader (nunca
     yaml.Loader/yaml.FullLoader/yaml.UnsafeLoader ni ningún constructor
@@ -620,10 +632,10 @@ def load_task_packet_from_yaml_text(text: str) -> TaskPacket:
         raise TaskPacketError(f"invalid YAML: {exc}") from exc
     if data is None:
         raise TaskPacketError("task packet YAML document must not be empty")
-    return parse_task_packet(data)
+    return parse_task_packet(data, policies=policies)
 
 
-def load_task_packet_from_yaml_file(path: Path | str) -> TaskPacket:
+def load_task_packet_from_yaml_file(path: Path | str, *, policies: dict[str, Any] | None = None) -> TaskPacket:
     path = Path(path)
     if not path.is_file():
         raise TaskPacketError(f"task packet file not found: {path}")
@@ -631,7 +643,7 @@ def load_task_packet_from_yaml_file(path: Path | str) -> TaskPacket:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise TaskPacketError(f"cannot read task packet file {path}: {exc}") from exc
-    return load_task_packet_from_yaml_text(text)
+    return load_task_packet_from_yaml_text(text, policies=policies)
 
 
 # Reglas fijas del motor: constantes, nunca derivadas del Task Packet.
@@ -675,6 +687,7 @@ def _packet_to_json_dict(packet: TaskPacket) -> dict[str, Any]:
     return {
         "TASK_ID": packet.task_id,
         "PROJECT_ID": packet.project_id,
+        "RESOURCE_PROFILE": packet.resource_profile,
         "OBJECTIVE": packet.objective,
         "SCOPE": list(packet.scope),
         "OUT_OF_SCOPE": list(packet.out_of_scope),

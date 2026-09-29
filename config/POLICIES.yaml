@@ -24,3 +24,24 @@ classification:
 # Ante ambigüedad o contradicción entre reglas, el sistema detiene la
 # ejecución en vez de continuar con un comportamiento permisivo (§10).
 fail_closed: true
+
+# Operational runs only; manual stateless probes retain their own limits.
+resource_budget:
+  default_profile: standard
+  exhaustion_behavior: BLOCKED
+  profiles:
+    economy:
+      max_builder_invocations: 2
+      max_verifier_invocations: 1
+      max_correction_attempts: 1
+      max_total_model_invocations: 3
+    standard:
+      max_builder_invocations: 3
+      max_verifier_invocations: 2
+      max_correction_attempts: 2
+      max_total_model_invocations: 5
+    high_assurance:
+      max_builder_invocations: 4
+      max_verifier_invocations: 3
+      max_correction_attempts: 3
+      max_total_model_invocations: 7

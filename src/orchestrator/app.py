@@ -31,6 +31,7 @@ from .adapters.claude_code import (
     run_developer_task,
     run_handshake,
     run_write_probe,
+    _validate_task_execution_config,
 )
 from .adapters.slack_notifier import SlackWebhookNotifier
 from .config_loader import (
@@ -436,8 +437,8 @@ def cmd_task_packet_probe(args: argparse.Namespace) -> int:
     Code, NUNCA ejecuta comandos/tests del proyecto, NUNCA modifica
     ningún archivo: es exclusivamente carga + validación + construcción
     determinista de texto en memoria."""
-    _require_core_config()
-    packet = task_packet_mod.load_task_packet_from_yaml_file(SAMPLE_TASK_PACKET_PATH)
+    config = _require_core_config()
+    packet = task_packet_mod.load_task_packet_from_yaml_file(SAMPLE_TASK_PACKET_PATH, policies=config.policies)
 
     instruction_1 = task_packet_mod.build_developer_instruction(packet)
     instruction_2 = task_packet_mod.build_developer_instruction(packet)
@@ -522,6 +523,8 @@ def execute_task_packet(
     before: evidence_mod.GitEvidenceSnapshot | None = None,
     resume: bool = False,
     capacity_hook: Callable[[CapacityFailure], dict[str, Any] | None] | None = None,
+    budget_store: Store | None = None,
+    resource_policies: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """TASK-EXECUTION-002: compone el flujo mínimo seguro --
 
@@ -615,6 +618,29 @@ def execute_task_packet(
     # 7-8. developer instruction determinista (13 campos + gobernanza fija +
     # role boundary fija del motor) + adaptador genérico de Claude.
     instruction = _build_developer_execution_prompt(packet)
+    run_id = None
+    if budget_store is not None:
+        # Reuse the runner's exact validators without executing a command.
+        try:
+            _validate_task_execution_config(developer_config)
+            for test_id in packet.mandatory_tests:
+                test_runner_mod._validate_test_id(test_id)
+                if test_id not in permissions["allowed_commands"] or test_id not in project_rules["commands"]:
+                    raise test_runner_mod.TestRunnerError("mandatory command is not authorized")
+                test_runner_mod._validate_resolved_argv(project_rules["commands"][test_id], test_id)
+        except (DeveloperExecutionError, test_runner_mod.TestRunnerError):
+            return _blocked("local model execution preflight failed")
+        try:
+            run_id = budget_store.reserve_agent_run(
+                packet.task_id, role="builder", agent="developer",
+                provider=developer_config.get("provider", "claude_code_cli"),
+                phase="capacity_resume" if resume else "implementation",
+                resource_profile=packet.resource_profile, policies=resource_policies,
+            )
+        except (StoreError, ConfigError):
+            return _blocked("resource budget reservation unavailable", resource_budget_reason="resource budget reservation unavailable")
+        if run_id is None:
+            return _blocked("resource budget exhausted", resource_budget_reason="resource budget exhausted")
     try:
         run_developer_task(
             developer_config=developer_config,
@@ -624,6 +650,8 @@ def execute_task_packet(
             resume=resume,
         )
     except DeveloperExecutionError as exc:
+        if run_id is not None:
+            budget_store.complete_agent_run(run_id, state="FAILED")
         # TASK-EXECUTION-004: Claude fue REALMENTE invocado y falló
         # (DeveloperExecutionError). Nunca asumir que no hubo
         # modificaciones: run_developer_task puede fallar DESPUÉS de que
@@ -700,6 +728,9 @@ def execute_task_packet(
                 reason = waiting_fields.pop("reason")
                 blocked_fields.update(waiting_fields)
         return _blocked(reason, **blocked_fields)
+
+    if run_id is not None:
+        budget_store.complete_agent_run(run_id, state="SUCCEEDED")
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
     # (HEAD unchanged, scope, forbidden_files). Debe pasar ANTES de
@@ -848,7 +879,7 @@ def cmd_task_execution_probe(args: argparse.Namespace) -> int:
     pruebas)."""
     config = _require_core_config()
     packet_path = _ensure_within_repo(Path(args.task_packet_path))
-    packet = task_packet_mod.load_task_packet_from_yaml_file(packet_path)
+    packet = task_packet_mod.load_task_packet_from_yaml_file(packet_path, policies=config.policies)
     project_rules = _require_project_rules(packet.project_id)
     developer_config = config.agents.get("agents", {}).get("developer", {})
 
@@ -917,7 +948,7 @@ def _file_sha256(path: Path) -> str:
         raise ConfigError(f"cannot read {path.name}: {type(exc).__name__}") from exc
 
 
-def _load_packet_with_identity(packet_path: Path) -> tuple[TaskPacket, str]:
+def _load_packet_with_identity(packet_path: Path, *, policies: dict[str, Any]) -> tuple[TaskPacket, str]:
     """Lee los bytes del Task Packet UNA sola vez, calcula su SHA-256 y
     parsea EXACTAMENTE esos mismos bytes (sin segunda lectura)."""
     try:
@@ -928,7 +959,7 @@ def _load_packet_with_identity(packet_path: Path) -> tuple[TaskPacket, str]:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise TaskPacketError("task packet file is not valid UTF-8") from exc
-    return task_packet_mod.load_task_packet_from_yaml_text(text), _sha256_hex(data)
+    return task_packet_mod.load_task_packet_from_yaml_text(text, policies=policies), _sha256_hex(data)
 
 
 def _load_project_rules_with_identity(project_id: str) -> tuple[dict, str]:
@@ -1153,7 +1184,7 @@ def cmd_run_task(args: argparse.Namespace) -> int:
     WAITING_FOR_CLAUDE_CAPACITY 10."""
     config, permissions_sha = _load_core_config_with_identity()
     packet_path = _ensure_within_repo(Path(args.task_packet_path))
-    packet, packet_sha = _load_packet_with_identity(packet_path)
+    packet, packet_sha = _load_packet_with_identity(packet_path, policies=config.policies)
     relative_path = _relative_packet_path(packet_path)
     project_rules, rules_sha = _load_project_rules_with_identity(packet.project_id)
     developer_config = config.agents.get("agents", {}).get("developer", {})
@@ -1221,6 +1252,8 @@ def cmd_run_task(args: argparse.Namespace) -> int:
                 mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
                 before=before,
                 capacity_hook=hook,
+                budget_store=store,
+                resource_policies=config.policies,
             )
         except Exception:
             _block_developing_best_effort(store, packet.task_id)
@@ -1311,7 +1344,7 @@ def _finish_fresh_task(store: Store, task_id: str, result: dict[str, Any]) -> in
         return EXIT_HUMAN_GATE
     if state == STATE_WAITING_FOR_CLAUDE_CAPACITY:
         return EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la suspensión
-    store.transition_task(task_id, STATE_BLOCKED, _REASON_PIPELINE_BLOCKED, PERSISTED_ACTOR)
+    store.transition_task(task_id, STATE_BLOCKED, result.get("resource_budget_reason", _REASON_PIPELINE_BLOCKED), PERSISTED_ACTOR)
     return EXIT_BLOCKED_OR_ERROR
 
 
@@ -1426,7 +1459,7 @@ def _execute_claimed_resume(
     if permissions_sha != suspension["permissions_sha256"]:
         raise _ResumeBlocked(_REASON_IDENTITY_CHANGED)
     packet_path = _resolve_persisted_packet_path(suspension["task_packet_path"])
-    packet, packet_sha = _load_packet_with_identity(packet_path)
+    packet, packet_sha = _load_packet_with_identity(packet_path, policies=config.policies)
     if (
         packet_sha != suspension["task_packet_sha256"]
         or packet.task_id != task_id
@@ -1495,6 +1528,8 @@ def _execute_claimed_resume(
         before=before,
         resume=True,
         capacity_hook=hook,
+        budget_store=store,
+        resource_policies=config.policies,
     )
 
 
@@ -1547,7 +1582,7 @@ def _run_claimed_resume(
         exit_code = EXIT_WAITING_FOR_CAPACITY  # el hook ya persistió la nueva suspensión
     else:
         store.block_claimed_resume(
-            task_id, reason=_REASON_PIPELINE_BLOCKED, actor=PERSISTED_ACTOR
+            task_id, reason=result.get("resource_budget_reason", _REASON_PIPELINE_BLOCKED), actor=PERSISTED_ACTOR
         )
         exit_code = EXIT_BLOCKED_OR_ERROR
     return exit_code, result

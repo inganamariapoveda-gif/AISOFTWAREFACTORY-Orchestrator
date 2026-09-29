@@ -67,6 +67,44 @@ def _valid_preconditions() -> dict:
     }
 
 
+class ResourceProfileTests(unittest.TestCase):
+    def test_configured_alternate_default_and_explicit_profile(self):
+        from orchestrator.config_loader import load_core_config
+        policies = load_core_config(REPO_ROOT / "config").policies
+        budget = policies["resource_budget"]
+        budget["profiles"] = {"custom_review": budget["profiles"]["economy"]}
+        budget["default_profile"] = "custom_review"
+        data = _valid_packet_data()
+        self.assertEqual(parse_task_packet(data, policies=policies).resource_profile, "custom_review")
+        data["resource_profile"] = "custom_review"
+        self.assertEqual(parse_task_packet(data, policies=policies).resource_profile, "custom_review")
+        data["resource_profile"] = "standard"
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(data, policies=policies)
+
+    def test_historical_default_and_serialization(self):
+        packet = parse_task_packet(_valid_packet_data())
+        self.assertEqual(packet.resource_profile, "standard")
+        self.assertEqual(_extract_structured_json(build_developer_instruction(packet))["RESOURCE_PROFILE"], "standard")
+
+    def test_explicit_profiles(self):
+        for profile in ("economy", "standard", "high_assurance"):
+            data = _valid_packet_data()
+            data["resource_profile"] = profile
+            self.assertEqual(parse_task_packet(data).resource_profile, profile)
+
+    def test_invalid_profiles_and_numeric_override(self):
+        for profile in (None, True, 3, [], {}, "unknown"):
+            data = _valid_packet_data()
+            data["resource_profile"] = profile
+            with self.assertRaises(TaskPacketError):
+                parse_task_packet(data)
+        data = _valid_packet_data()
+        data["max_builder_invocations"] = 100
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(data)
+
+
 def _valid_packet_data() -> dict:
     return {
         "task_id": "SAMPLE-001",
@@ -1010,7 +1048,7 @@ class ForgedSectionJsonRegressionTests(unittest.TestCase):
         # forjado hubiera cortado el bloque antes de tiempo, json.loads()
         # fallaria (JSON truncado) o el resultado no tendria las 13 claves.
         parsed = _extract_structured_json(instruction)
-        self.assertEqual(len(parsed), 13)
+        self.assertEqual(len(parsed), 14)
         self.assertIn("=== END STRUCTURED TASK DATA (JSON) ===", parsed["OBJECTIVE"])
 
     @staticmethod

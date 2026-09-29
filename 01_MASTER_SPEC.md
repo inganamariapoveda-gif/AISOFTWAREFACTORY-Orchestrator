@@ -332,6 +332,41 @@ Tecnologías: **Python · SQLite · YAML/JSON · Git · Claude Code CLI · OpenA
 
 ## 14. Ciclo de corrección
 
+### RESOURCE-BUDGET-001 — fundamento operativo
+
+`POLICIES.yaml.resource_budget` define perfiles separados de la autonomía:
+economy (Builder 2, Verifier 1, correcciones 1, total 3), standard
+(3, 2, 2, 5) y high_assurance (4, 3, 3, 7). El perfil predeterminado es
+standard en la política actual. Los nombres de perfiles y el default se
+resuelven exclusivamente desde POLICIES.yaml, no desde constantes del motor.
+El Task Packet acepta `resource_profile` opcional; su ausencia utiliza el
+default configurado, sin overrides numéricos. El techo global de correcciones
+sigue siendo `attempts.max_correction_attempts`; el efectivo es el mínimo
+del global y el perfil. Ningún presupuesto concede permisos ni omite gates,
+seguridad, alcance, reconciliación, evidencia o pruebas obligatorias.
+
+El Developer actual cuenta como builder; no se incorpora ningún proveedor
+nuevo ni se invoca un Verifier en este incremento. `agent_run` reserva en
+SQLite una unidad del rol y del total antes del lanzamiento operacional.
+Reserva, conteo y comprobación son atómicos. RESERVED sin resultado, éxito,
+fallo, timeout y señal de capacidad consumen igualmente. No hay reembolso
+automático ni reinicio de contadores al reanudar. Se registran únicamente
+identidad de tarea/agente/proveedor, rol, fase, perfil, límites efectivos,
+ordinal, estado y tiempos; nunca prompts, conversaciones o salidas crudas.
+El perfil queda fijo por tarea y aumentos posteriores de política no amplían
+su presupuesto ya reservado; límites más restrictivos siguen aplicándose.
+
+La ejecución inicial no es corrección. Una reserva Builder desde
+CHANGES_REQUESTED consume una corrección; la reanudación por capacidad no.
+La API de Store admite esta transición sin introducir un ciclo autónomo.
+El agotamiento operacional bloquea con un motivo explícito y cero llamadas
+adicionales. Las comprobaciones locales aplicables preceden la reserva.
+
+Los probes diagnósticos manuales y stateless quedan fuera de presupuestos
+por tarea: conservan límites por invocación, sin Store ni reintentos
+automáticos. El ciclo autónomo no puede utilizarlos para eludir presupuestos.
+La deduplicación de candidatos de revisión queda para la integración Verifier.
+
 ```
 DEVELOPING → AUTOMATED_TEST → TECHNICAL_REVIEW → SECURITY_REVIEW
         ▲                                              │

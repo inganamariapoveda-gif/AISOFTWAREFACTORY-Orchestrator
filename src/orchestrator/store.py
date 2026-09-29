@@ -52,6 +52,22 @@ CREATE TABLE IF NOT EXISTS status_event (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_run (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES task(id),
+    role TEXT NOT NULL CHECK (role IN ('builder', 'verifier')),
+    agent TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('implementation', 'correction', 'capacity_resume', 'review')),
+    resource_profile TEXT NOT NULL,
+    limits_json TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('RESERVED', 'SUCCEEDED', 'FAILED')),
+    reserved_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(task_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS task_suspension (
     task_id TEXT NOT NULL PRIMARY KEY REFERENCES task(id),
     task_packet_path TEXT NOT NULL,
@@ -307,7 +323,85 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 
 
 class Store:
-    """Wrapper sqlite3 con el subconjunto de persistencia de BOOTSTRAP."""
+    """SQLite persistence and transactional operational resource accounting."""
+
+    def list_agent_runs(self, task_id: str) -> list[dict[str, Any]]:
+        validate_id(task_id, "task_id")
+        cursor = self._conn.execute(
+            "SELECT * FROM agent_run WHERE task_id = ? ORDER BY ordinal", (task_id,)
+        )
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+    def reserve_agent_run(
+        self, task_id: str, *, role: str, agent: str, provider: str,
+        phase: str, resource_profile: str, policies: dict[str, Any],
+    ) -> int | None:
+        """Atomic durable consumption. None means exhausted; never refund runs.
+
+        A task retains its initial profile and cannot gain budget from a later
+        policy increase. More restrictive current limits still apply.
+        """
+        from .config_loader import validate_resource_budget
+
+        block = validate_resource_budget(policies)
+        validate_id(task_id, "task_id")
+        validate_id(agent, "agent")
+        validate_id(provider, "provider")
+        if role not in {"builder", "verifier"}:
+            raise StoreError("invalid resource role")
+        if phase not in ({"implementation", "correction", "capacity_resume"} if role == "builder" else {"review"}):
+            raise StoreError("invalid resource phase")
+        if resource_profile not in block["profiles"]:
+            raise StoreError("invalid resource profile")
+        limits = dict(block["profiles"][resource_profile])
+        limits["max_correction_attempts"] = min(
+            limits["max_correction_attempts"], policies["attempts"]["max_correction_attempts"]
+        )
+        with self._write_transaction():
+            task = self.get_task(task_id)
+            if task is None:
+                raise StoreError("resource task not found")
+            expected = {"CHANGES_REQUESTED"} if phase == "correction" else (
+                {"DEVELOPING"} if role == "builder" else {"TECHNICAL_REVIEW", "SECURITY_REVIEW"}
+            )
+            if task["status"] not in expected:
+                raise StoreError("invalid task state for resource reservation")
+            runs = self.list_agent_runs(task_id)
+            for run in runs:
+                if run["resource_profile"] != resource_profile:
+                    raise StoreError("resource profile cannot change within a task")
+                previous = json.loads(run["limits_json"])
+                limits = {key: min(value, previous[key]) for key, value in limits.items()}
+            role_count = sum(run["role"] == role for run in runs)
+            if (role_count >= limits[f"max_{role}_invocations"]
+                or len(runs) >= limits["max_total_model_invocations"]
+                or (phase == "correction" and task["attempt_count"] >= limits["max_correction_attempts"])):
+                if phase == "correction":
+                    self._transition_locked(task_id, "CHANGES_REQUESTED", "BLOCKED", "resource budget exhausted", "orchestrator")
+                return None
+            now = _utcnow()
+            cursor = self._conn.execute(
+                "INSERT INTO agent_run (task_id, role, agent, provider, phase, resource_profile, "
+                "limits_json, ordinal, state, reserved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED', ?)",
+                (task_id, role, agent, provider, phase, resource_profile,
+                 json.dumps(limits, sort_keys=True), len(runs) + 1, now),
+            )
+            if phase == "correction":
+                self._conn.execute("UPDATE task SET attempt_count = attempt_count + 1 WHERE id = ?", (task_id,))
+                self._transition_locked(task_id, "CHANGES_REQUESTED", "DEVELOPING", "authorized correction reserved", "orchestrator")
+            return cursor.lastrowid
+
+    def complete_agent_run(self, run_id: int, *, state: str) -> None:
+        if state not in {"SUCCEEDED", "FAILED"}:
+            raise StoreError("invalid agent run result")
+        with self._write_transaction():
+            cursor = self._conn.execute(
+                "UPDATE agent_run SET state = ?, completed_at = ? WHERE id = ? AND state = 'RESERVED'",
+                (state, _utcnow(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("agent run is absent or already completed")
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)

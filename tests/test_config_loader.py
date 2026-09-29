@@ -40,7 +40,71 @@ def _baseline_policies() -> dict:
             "on_unclassified": "BLOCKED",
         },
         "fail_closed": True,
+        "resource_budget": yaml.safe_load((CONFIG_DIR / "POLICIES.yaml").read_text(encoding="utf-8"))["resource_budget"],
     }
+
+
+class ResourceBudgetConfigTests(unittest.TestCase):
+    def test_alternate_profiles_and_default_from_yaml(self):
+        policies = _baseline_policies()
+        budget = policies["resource_budget"]
+        budget["profiles"] = {"custom_review": budget["profiles"]["economy"]}
+        budget["default_profile"] = "custom_review"
+        with tempfile.TemporaryDirectory() as directory:
+            _write_core_config(Path(directory), policies=policies)
+            loaded = load_core_config(Path(directory)).policies["resource_budget"]
+        self.assertEqual(loaded["default_profile"], "custom_review")
+        self.assertEqual(set(loaded["profiles"]), {"custom_review"})
+
+    def test_malformed_attempts_raise_config_error(self):
+        from orchestrator.config_loader import validate_resource_budget
+        for attempts in (None, [], "invalid", 3, True):
+            with self.subTest(attempts=attempts), tempfile.TemporaryDirectory() as directory:
+                policies = _baseline_policies()
+                policies["attempts"] = attempts
+                with self.assertRaises(ConfigError):
+                    validate_resource_budget(policies)
+                _write_core_config(Path(directory), policies=policies)
+                with self.assertRaises(ConfigError):
+                    load_core_config(Path(directory))
+
+    def test_invalid_profile_mapping_and_default(self):
+        from orchestrator.config_loader import validate_resource_budget
+        for profiles, default in (({}, "x"), ([], "x"), ({1: {}}, 1), ({"": {}}, ""), ({"x": {}}, [])):
+            policies = _baseline_policies()
+            policies["resource_budget"].update(profiles=profiles, default_profile=default)
+            with self.subTest(profiles=profiles), self.assertRaises(ConfigError):
+                validate_resource_budget(policies)
+
+    def test_profiles_and_default(self):
+        from orchestrator.config_loader import validate_resource_budget
+        block = validate_resource_budget(_baseline_policies())
+        self.assertEqual(block["default_profile"], "standard")
+        self.assertEqual(set(block["profiles"]), {"economy", "standard", "high_assurance"})
+        self.assertEqual([block["profiles"][p]["max_builder_invocations"] for p in ("economy", "standard", "high_assurance")], [2, 3, 4])
+
+    def test_invalid_policies_fail_closed(self):
+        from orchestrator.config_loader import validate_resource_budget
+        import copy
+        baseline = _baseline_policies()
+        mutations = [
+            lambda p: p.pop("resource_budget"),
+            lambda p: p["resource_budget"].update(extra=True),
+            lambda p: p["resource_budget"].update(default_profile="unknown"),
+            lambda p: p["resource_budget"].update(exhaustion_behavior="CONTINUE"),
+            lambda p: p["resource_budget"]["profiles"].update(unknown={}),
+            lambda p: p["resource_budget"]["profiles"]["standard"].update(extra=1),
+            lambda p: p["resource_budget"]["profiles"]["standard"].update(max_correction_attempts=4),
+            lambda p: p["resource_budget"]["profiles"]["standard"].update(max_total_model_invocations=1),
+        ]
+        for value in (0, -1, True, "3", None, 1.5):
+            mutations.append(lambda p, v=value: p["resource_budget"]["profiles"]["standard"].update(max_builder_invocations=v))
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                data = copy.deepcopy(baseline)
+                mutate(data)
+                with self.assertRaises(ConfigError):
+                    validate_resource_budget(data)
 
 
 def _baseline_agents() -> dict:

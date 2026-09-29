@@ -33,6 +33,120 @@ class StoreTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class ResourceBudgetStoreTests(StoreTestCase):
+    def test_profile_correction_ceiling_isolated_from_invocation_limits(self):
+        limits = self.policies["resource_budget"]["profiles"]["standard"]
+        limits.update(max_builder_invocations=10, max_total_model_invocations=12, max_correction_attempts=2)
+        self.assertGreater(self.policies["attempts"]["max_correction_attempts"], limits["max_correction_attempts"])
+        self.reserve()
+        self.assertEqual(self.store.get_task("T-1")["attempt_count"], 0)
+        for count in (1, 2):
+            self.store.transition_task("T-1", "AUTOMATED_TEST", "test", "test")
+            self.store.transition_task("T-1", "CHANGES_REQUESTED", "test", "test")
+            self.assertIsNotNone(self.reserve(phase="correction"))
+            self.assertEqual(self.store.get_task("T-1")["attempt_count"], count)
+        self.store.transition_task("T-1", "AUTOMATED_TEST", "test", "test")
+        self.store.transition_task("T-1", "CHANGES_REQUESTED", "test", "test")
+        before = self.store.list_agent_runs("T-1")
+        self.assertLess(len(before), limits["max_builder_invocations"])
+        self.assertLess(len(before), limits["max_total_model_invocations"])
+        self.assertIsNone(self.reserve(phase="correction"))
+        self.assertEqual(self.store.list_agent_runs("T-1"), before)
+        self.assertEqual(self.store.get_task("T-1")["status"], "BLOCKED")
+        event = self.store.get_history("T-1")[-1]
+        self.assertEqual((event["from_status"], event["to_status"]), ("CHANGES_REQUESTED", "BLOCKED"))
+        self.assertEqual(event["reason"], "resource budget exhausted")
+
+    def setUp(self):
+        super().setUp()
+        import yaml
+        self.policies = yaml.safe_load((REPO_ROOT / "config/POLICIES.yaml").read_text(encoding="utf-8"))
+        self.store.register_project("SAMPLE", "Sample", ".", "ref")
+        self.store.create_task("T-1", "SAMPLE", "Title", "Need")
+        self.store.transition_task("T-1", "SPECIFICATION", "test", "test")
+        self.store.transition_task("T-1", "DEVELOPING", "test", "test")
+
+    def reserve(self, store=None, role="builder", phase=None):
+        return (store or self.store).reserve_agent_run(
+            "T-1", role=role, agent="developer" if role == "builder" else "verifier",
+            provider="test_provider", phase=phase or ("implementation" if role == "builder" else "review"),
+            resource_profile="standard", policies=self.policies,
+        )
+
+    def review_state(self):
+        self.store.transition_task("T-1", "AUTOMATED_TEST", "test", "test")
+        self.store.transition_task("T-1", "TECHNICAL_REVIEW", "test", "test")
+
+    def test_builder_reserved_success_failure_and_restart_count(self):
+        first = self.reserve()
+        second = self.reserve()
+        self.store.complete_agent_run(second, state="SUCCEEDED")
+        third = self.reserve()
+        self.store.complete_agent_run(third, state="FAILED")
+        with Store(Path(self._tmp.name) / "test.db") as reopened:
+            self.assertIsNone(self.reserve(reopened))
+            runs = reopened.list_agent_runs("T-1")
+        self.assertEqual([r["state"] for r in runs], ["RESERVED", "SUCCEEDED", "FAILED"])
+        self.assertEqual([r["ordinal"] for r in runs], [1, 2, 3])
+        self.assertTrue(all(r["task_id"] == "T-1" and r["role"] == "builder" for r in runs))
+        self.assertFalse(set(runs[0]) & {"prompt", "stdout", "stderr", "result", "conversation"})
+        self.assertIsNotNone(first)
+
+    def test_verifier_limit(self):
+        self.review_state()
+        self.assertIsNotNone(self.reserve(role="verifier"))
+        self.assertIsNotNone(self.reserve(role="verifier"))
+        self.assertIsNone(self.reserve(role="verifier"))
+
+    def test_total_limit_independent(self):
+        self.policies["resource_budget"]["profiles"]["standard"]["max_total_model_invocations"] = 3
+        self.reserve()
+        self.reserve()
+        self.review_state()
+        self.assertIsNotNone(self.reserve(role="verifier"))
+        self.assertIsNone(self.reserve(role="verifier"))
+
+    def test_concurrent_reservations_are_bounded(self):
+        barrier = threading.Barrier(5)
+        outcomes, errors = [], []
+        def worker():
+            try:
+                with Store(Path(self._tmp.name) / "test.db") as other:
+                    barrier.wait(timeout=10)
+                    outcomes.append(self.reserve(other))
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        workers = [threading.Thread(target=worker) for _ in range(5)]
+        for worker_thread in workers:
+            worker_thread.start()
+        for worker_thread in workers:
+            worker_thread.join(timeout=15)
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(value is not None for value in outcomes), 3)
+        self.assertEqual(len(self.store.list_agent_runs("T-1")), 3)
+
+    def test_policy_increase_cannot_refill_and_profile_cannot_change(self):
+        for _ in range(3):
+            self.reserve()
+        self.policies["resource_budget"]["profiles"]["standard"]["max_builder_invocations"] = 4
+        self.assertIsNone(self.reserve())
+        with self.assertRaises(StoreError):
+            self.store.reserve_agent_run("T-1", role="builder", agent="developer", provider="test",
+                phase="implementation", resource_profile="high_assurance", policies=self.policies)
+
+    def test_corrections_and_capacity_are_separate(self):
+        self.reserve()
+        self.assertEqual(self.store.get_task("T-1")["attempt_count"], 0)
+        for _ in range(2):
+            self.store.transition_task("T-1", "AUTOMATED_TEST", "test", "test")
+            self.store.transition_task("T-1", "CHANGES_REQUESTED", "test", "test")
+            self.assertIsNotNone(self.reserve(phase="correction"))
+        self.assertEqual(self.store.get_task("T-1")["attempt_count"], 2)
+        self.store.transition_task("T-1", "AUTOMATED_TEST", "test", "test")
+        self.store.transition_task("T-1", "CHANGES_REQUESTED", "test", "test")
+        self.assertIsNone(self.reserve(phase="correction"))
+
+
 class ProjectAndTaskCreationTests(StoreTestCase):
     def test_create_project_and_task(self) -> None:
         self.store.register_project("SAMPLE", "Sample", "./projects/SAMPLE", "ref")

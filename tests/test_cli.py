@@ -71,6 +71,7 @@ def _valid_core_config() -> dict[str, dict]:
                 "on_unclassified": "BLOCKED",
             },
             "fail_closed": True,
+            "resource_budget": yaml.safe_load((REPO_ROOT / "config/POLICIES.yaml").read_text(encoding="utf-8"))["resource_budget"],
         },
         "AGENTS.yaml": {
             "version": 1,
@@ -2603,6 +2604,88 @@ class PersistedExecutionTestCase(TaskExecutionProbeTestCase):
         )
 
 
+class ResourceBudgetFlowTests(PersistedExecutionTestCase):
+    def test_active_configured_default_survives_run_and_resume(self):
+        path = self.config_dir / "POLICIES.yaml"
+        policies = yaml.safe_load(path.read_text(encoding="utf-8"))
+        budget = policies["resource_budget"]
+        budget["profiles"] = {"custom_review": budget["profiles"]["standard"]}
+        budget["default_profile"] = "custom_review"
+        _write_yaml(path, policies)
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        rc, result, _ = self.resume(developer=self.developer_completes())
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        self.assertEqual([run["resource_profile"] for run in self.runs()], ["custom_review", "custom_review"])
+
+    def runs(self):
+        with Store(self.db_path) as store:
+            return store.list_agent_runs(TASK_ID)
+
+    def test_reservation_precedes_single_launch_and_success(self):
+        def inspect_reservation():
+            runs = self.runs()
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["state"], "RESERVED")
+        developer = self.developer_completes(on_run=inspect_reservation)
+        rc, result, _ = self.run_task(developer=developer)
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        developer.assert_called_once()
+        self.assertEqual(self.runs()[0]["state"], "SUCCEEDED")
+        self.assertEqual(self.task()["attempt_count"], 0)
+
+    def test_capacity_restart_exhaustion_blocks_fourth_launch(self):
+        self.suspend_with_partial()
+        for _ in range(2):
+            self.clock.advance(1800)
+            rc, _, _ = self.resume(developer=self.developer_capacity())
+            self.assertEqual(rc, 10)
+        self.assertEqual(len(self.runs()), 3)
+        self.assertEqual(self.task()["attempt_count"], 0)
+        self.clock.advance(1800)
+        developer = self.never_called()
+        rc, result, _ = self.resume(developer=developer)
+        developer.assert_not_called()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(result["reason"], "resource budget exhausted")
+        self.assertEqual(self.history()[-1]["reason"], "resource budget exhausted")
+        self.assertEqual(len(self.runs()), 3)
+
+    def test_timeout_consumes_reserved_unit(self):
+        developer = mock.MagicMock(side_effect=subprocess.TimeoutExpired("claude", 90))
+        rc, result, _ = self.run_task(developer=developer)
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual([r["state"] for r in self.runs()], ["FAILED"])
+
+    def test_invalid_command_preflight_zero_calls_and_reservations(self):
+        data = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        data["mandatory_tests"] = ["unknown"]
+        _write_yaml(self.taskexec_packet_path, data)
+        developer = self.never_called()
+        rc, result, _ = self.run_task(developer=developer)
+        developer.assert_not_called()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(self.runs(), [])
+
+    def test_invalid_resource_configuration_zero_calls(self):
+        path = self.config_dir / "POLICIES.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["resource_budget"]["profiles"]["standard"]["max_builder_invocations"] = 0
+        _write_yaml(path, data)
+        developer = self.never_called()
+        rc, _, _ = self.run_task(developer=developer)
+        developer.assert_not_called()
+        self.assertNotEqual(rc, 0)
+
+    def test_uncertain_result_keeps_reservation(self):
+        developer = mock.MagicMock(side_effect=RuntimeError("simulated interruption"))
+        try:
+            self.run_task(developer=developer)
+        except RuntimeError:
+            pass
+        self.assertEqual([r["state"] for r in self.runs()], ["RESERVED"])
+
+
 class PersistedStartTests(PersistedExecutionTestCase):
     def test_run_task_success_persists_the_full_state_chain(self) -> None:
         head_before = self.head()
@@ -3583,7 +3666,8 @@ class PersistedResumeTests(PersistedExecutionTestCase):
     def test_repeated_resumes_keep_the_original_baseline(self) -> None:
         self.suspend_with_partial()
         baseline = self.suspension()["baseline_head_sha"]
-        for round_number in range(2, 5):
+        # Standard permits three Builder launches including the initial one.
+        for round_number in range(2, 4):
             self.clock.advance(1800)
             rc, result, _test = self.resume(
                 developer=self.developer_capacity(edits={"allowed.txt": f"PARTIAL-{round_number}"})
@@ -3591,6 +3675,12 @@ class PersistedResumeTests(PersistedExecutionTestCase):
             self.assertEqual(rc, 10)
             self.assertEqual(result["capacity_wait_count"], round_number)
             self.assertEqual(self.suspension()["baseline_head_sha"], baseline)
+        self.clock.advance(1800)
+        developer = self.never_called()
+        rc, result, _ = self.resume(developer=developer)
+        developer.assert_not_called()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(result["reason"], "resource budget exhausted")
 
     # ---- límites ----
 
@@ -3723,7 +3813,7 @@ class PersistedResumeTests(PersistedExecutionTestCase):
 
     def test_started_at_is_never_restarted_by_later_suspensions(self) -> None:
         first = self.suspend_with_partial()
-        for _ in range(3):
+        for _ in range(2):
             self.clock.advance(1800)
             self.resume(developer=self.developer_capacity(edits={"allowed.txt": "X"}))
         self.assertEqual(
