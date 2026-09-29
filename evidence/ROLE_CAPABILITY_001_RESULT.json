@@ -1,0 +1,104 @@
+{
+  "task_id": "ROLE-CAPABILITY-001",
+  "final_state": "TECH_APPROVED",
+  "implementation_result": "PASS",
+  "correction_attempts_used": 1,
+  "implementation_commit": "b28ac72626db8165008bfa5df3179a213c2310df",
+  "architecture": {
+    "roles": ["director", "builder", "verifier"],
+    "current_builder_agent": "developer",
+    "current_builder_role": "builder",
+    "current_builder_provider": "claude_code_cli",
+    "current_builder_adapter": "claude_code_cli",
+    "role_agent_identity_separated": true,
+    "role_provider_separated": true,
+    "role_adapter_separated": true,
+    "role_capability_separated": true,
+    "dynamic_adapter_imports": false,
+    "new_provider_integrated": false
+  },
+  "builder_resolution": {
+    "exactly_one_enabled_required": true,
+    "zero_enabled_denied": true,
+    "disabled_denied": true,
+    "ambiguous_denied": true,
+    "incompatible_provider_adapter_denied": true
+  },
+  "capability_policy": {
+    "builder_required_capability": "implement_authorized_changes",
+    "role_alone_grants_authority": false,
+    "existing_scope_project_global_restrictions_remain_required": true
+  },
+  "resource_budget": {
+    "existing_ledger_reused": true,
+    "schema_changed": false,
+    "resolved_agent_identity_recorded": true,
+    "resolved_provider_recorded": true
+  },
+  "probes": {
+    "governed_builder_resolution": true,
+    "operational_budgeted": false,
+    "store_persistence": false,
+    "automatic_capacity_retry": false,
+    "handshake_read_only": true,
+    "handshake_requires_write_capability": false,
+    "write_capability_required_for_write_capable_probes": true
+  },
+  "director": {"enabled": false},
+  "verifier": {
+    "operational": false,
+    "runs_created": false,
+    "fake_review_evidence": false
+  },
+  "initial_implementation": {
+    "reported_result": "INCONCLUSIVE",
+    "focused": {"total": 23, "passed": 23},
+    "affected_regression_1": {"total": 125, "passed": 125},
+    "affected_regression_2": {"total": 128, "passed": 127, "failed": 1},
+    "isolated_anomaly_rerun": {"total": 1, "passed": 1},
+    "full_regression_run": false,
+    "stop_reason": "environmental degradation; anomaly cause not established"
+  },
+  "tests": {
+    "correction_focused": {"total": 18, "passed": 18, "duration_seconds": 14.672, "exit_code": 0},
+    "correction_affected_1": {"total": 84, "passed": 84, "duration_seconds": 108.253, "exit_code": 0},
+    "correction_affected_2": {"total": 46, "passed": 46, "duration_seconds": 134.883, "exit_code": 0},
+    "full_regression": {
+      "total": 985,
+      "passed": 985,
+      "failed": 0,
+      "errors": 0,
+      "skips_reported": 0,
+      "duration_seconds": 1078.395,
+      "exit_code": 0,
+      "executions_in_correction": 1
+    },
+    "independent_review": {
+      "total": 65,
+      "passed": 65,
+      "failed": 0,
+      "errors": 0,
+      "exit_code": 0,
+      "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+      "provenance": "Director-provided CLOSE-AND-COMMIT-001 authorization"
+    },
+    "rerun_during_closure": false
+  },
+  "environmental_anomaly": {
+    "test": "ResumeDueNoOpTests.test_no_due_task_never_loads_configuration",
+    "reproduced": false,
+    "cause_established": false,
+    "relation_to_change": "NO_EVIDENCE_OF_RELATION",
+    "relation_assessment_source": "independent review reported in closure authorization"
+  },
+  "accepted_nonblocking_observations": ["RC-OBS-1", "RC-OBS-2", "RC-OBS-3"],
+  "accepted_observation_details": {
+    "RC-OBS-1": "Invalid, disabled or ambiguous Builder while WAITING can fail capacity resume closed while leaving the task WAITING; zero model calls; operator/config correction may be required.",
+    "RC-OBS-2": "Missing Builder capability on fresh run can create and then BLOCK the task, while other Builder-resolution denials may prevent task creation; zero model calls and zero agent_run reservations.",
+    "RC-OBS-3": "Handshake tests do not explicitly cover every alternate/zero-builder and no-write-capability case; behavior verified by independent code inspection; coverage gap only."
+  },
+  "human_gate": {
+    "required": false,
+    "reason": "internal role/capability governance foundation only"
+  }
+}
