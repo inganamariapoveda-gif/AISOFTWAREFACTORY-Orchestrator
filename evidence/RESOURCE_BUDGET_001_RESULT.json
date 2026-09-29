@@ -1,0 +1,83 @@
+{
+  "task_id": "RESOURCE-BUDGET-001",
+  "final_state": "TECH_APPROVED",
+  "implementation_result": "PASS",
+  "correction_attempts_used": 1,
+  "implementation_commit": "85a6bf9103b728545b419495f578b468631a4db4",
+  "resource_profiles": {
+    "default": "standard",
+    "economy": {"builder": 2, "verifier": 1, "corrections": 1, "total": 3},
+    "standard": {"builder": 3, "verifier": 2, "corrections": 2, "total": 5},
+    "high_assurance": {"builder": 4, "verifier": 3, "corrections": 3, "total": 7}
+  },
+  "motor_rules_separation": {
+    "result": "PASS",
+    "profile_names_from_policy": true,
+    "default_profile_from_policy": true
+  },
+  "persistence": {
+    "backend": "existing_sqlite",
+    "ledger": "agent_run",
+    "reservation_before_launch": true,
+    "uncertain_reservation_consumed": true,
+    "survives_restart": true
+  },
+  "functional_result": {
+    "optional_task_packet_resource_profile": true,
+    "missing_profile_uses_configured_default": true,
+    "builder_and_total_invocation_budgets": true,
+    "verifier_budget_foundation": true,
+    "correction_budget_foundation": true,
+    "capacity_resume_preserves_consumption": true,
+    "exhaustion_fails_closed": true,
+    "prompt_or_raw_model_output_stored": false,
+    "manual_probes_outside_operational_accounting": true,
+    "codex_builder_integrated": false,
+    "claude_verifier_integrated": false
+  },
+  "initial_tests": {
+    "targeted": {"total": 305, "passed": 305},
+    "affected_regression_after_bounded_correction": {"total": 77, "passed": 77},
+    "full_regression": {
+      "total": 938,
+      "passed": 938,
+      "failed": 0,
+      "errors": 0,
+      "duration_seconds": 374.735,
+      "exit_code": 0
+    }
+  },
+  "correction_001": {
+    "focused": {"total": 23, "passed": 23},
+    "affected_regression": {"total": 351, "passed": 351},
+    "full_regression": {
+      "total": 944,
+      "passed": 944,
+      "failed": 0,
+      "errors": 0,
+      "duration_seconds": 695.763,
+      "exit_code": 0
+    }
+  },
+  "independent_review_initial": {
+    "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+    "tests": {"total": 171, "passed": 171}
+  },
+  "independent_review_correction": {
+    "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+    "tests": {"total": 61, "passed": 61}
+  },
+  "resolved_findings": ["OBS-6", "L-1", "L-3"],
+  "accepted_nonblocking_observations": ["OBS-C1"],
+  "accepted_observation_details": {
+    "OBS-C1": "Standalone parser fallback loads canonical repository governance; operational callers pass active policy; fails closed without violating MOTOR != RULES."
+  },
+  "deferred_findings": [
+    "L-2", "L-4", "OBS-1", "OBS-2", "OBS-3", "OBS-4", "OBS-5", "OBS-8",
+    "OBS-7-remaining-coverage-gaps"
+  ],
+  "human_gate": {
+    "required": false,
+    "reason": "internal orchestration resource-governance foundation only"
+  }
+}
