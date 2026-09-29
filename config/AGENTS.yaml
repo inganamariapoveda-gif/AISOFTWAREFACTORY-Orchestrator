@@ -25,8 +25,9 @@ agents:
     enabled: false
 
   developer:
-    role: "developer"
+    role: "builder"
     provider: "claude_code_cli"
+    adapter: "claude_code_cli"
     port: "DeveloperPort"
     enabled: true
     # Nombre de ejecutable a resolver vía shutil.which(); nunca una ruta

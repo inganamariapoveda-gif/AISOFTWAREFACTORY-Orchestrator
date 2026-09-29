@@ -77,7 +77,7 @@ def _valid_core_config() -> dict[str, dict]:
             "version": 1,
             "agents": {
                 "director": {"role": "director", "enabled": False},
-                "developer": {"role": "developer", "enabled": False},
+                "developer": {"role": "builder", "provider": "claude_code_cli", "adapter": "claude_code_cli", "enabled": False},
             },
         },
         "GATES.yaml": {
@@ -103,6 +103,7 @@ def _valid_core_config() -> dict[str, dict]:
                 "secret_files": True,
             },
             "allowed_commands": [],
+            "role_capabilities": {"builder": ["implement_authorized_changes"]},
         },
     }
 
@@ -242,7 +243,7 @@ class CliFixtureTestCase(unittest.TestCase):
         (o el override indicado) reescribiendo AGENTS.yaml de la fixture."""
         data = yaml.safe_load((self.config_dir / "AGENTS.yaml").read_text(encoding="utf-8"))
         developer = {
-            "role": "developer",
+            "role": "builder", "provider": "claude_code_cli", "adapter": "claude_code_cli",
             "enabled": True,
             "executable": "claude",
             "output_format": "json",
@@ -281,7 +282,7 @@ class CliFixtureTestCase(unittest.TestCase):
             "timeout_seconds": 90,
         }
         developer = {
-            "role": "developer",
+            "role": "builder", "provider": "claude_code_cli", "adapter": "claude_code_cli",
             "enabled": True,
             "executable": "claude",
             "output_format": "json",
@@ -5597,3 +5598,235 @@ class PersistedStaticSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoleCapabilityFlowTests(PersistedExecutionTestCase):
+    def mutate_agents(self, mutation):
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        mutation(data["agents"])
+        _write_yaml(path, data)
+
+    def remove_capability(self):
+        path = self.config_dir / "PERMISSIONS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["role_capabilities"]["builder"] = []
+        _write_yaml(path, data)
+
+    def runs(self):
+        with Store(self.db_path) as store:
+            return store.list_agent_runs(TASK_ID)
+
+    def assert_denied(self):
+        developer = self.never_called()
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, _, tests = self.run_task(developer=developer)
+        self.assertNotEqual(rc, 0)
+        developer.assert_not_called()
+        tests.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(self.runs(), [])
+
+    def test_current_route_identity_and_human_gate(self):
+        developer = self.developer_completes()
+        rc, result, _ = self.run_task(developer=developer)
+        self.assertEqual((rc, result["state"], result["human_gate"]),
+                         (0, "HUMAN_GATE", "HUMAN_FUNCTIONAL_TEST"))
+        developer.assert_called_once()
+        run = self.runs()[0]
+        self.assertEqual((run["role"], run["agent"], run["provider"]),
+                         ("builder", "developer", "claude_code_cli"))
+
+    def test_alternate_identity_persists_across_capacity_resume(self):
+        self.mutate_agents(lambda agents: agents.update(alternate=agents.pop("developer")))
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        rc, result, _ = self.resume(developer=self.developer_completes())
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        self.assertEqual([(r["agent"], r["provider"]) for r in self.runs()],
+                         [("alternate", "claude_code_cli"), ("alternate", "claude_code_cli")])
+        self.assertEqual([r["phase"] for r in self.runs()], ["implementation", "capacity_resume"])
+
+    def test_missing_capability_zero_calls_zero_reservations(self):
+        self.remove_capability()
+        self.assert_denied()
+
+    def test_disabled_builder_zero_calls_zero_reservations(self):
+        self.mutate_agents(lambda agents: agents["developer"].update(enabled=False))
+        self.assert_denied()
+
+    def test_ambiguous_builder_zero_calls_zero_reservations(self):
+        self.mutate_agents(lambda agents: agents.update(second=dict(agents["developer"])))
+        self.assert_denied()
+
+    def test_provider_adapter_mismatch_zero_calls_zero_reservations(self):
+        self.mutate_agents(lambda agents: agents["developer"].update(provider="openai_api"))
+        self.assert_denied()
+
+    def test_resume_changed_identity_cannot_launch_or_reserve(self):
+        self.suspend_with_partial()
+        self.mutate_agents(lambda agents: agents.update(alternate=agents.pop("developer")))
+        self.clock.advance(1800)
+        developer = self.never_called()
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, result, _ = self.resume(developer=developer)
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        developer.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_resume_changed_provider_cannot_launch_or_reserve(self):
+        self.suspend_with_partial()
+        self.mutate_agents(lambda agents: agents["developer"].update(provider="openai_api"))
+        self.clock.advance(1800)
+        developer = self.never_called()
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, _, _ = self.resume(developer=developer)
+        self.assertNotEqual(rc, 0)
+        developer.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_resume_requires_current_capability(self):
+        self.suspend_with_partial()
+        self.remove_capability()
+        self.clock.advance(1800)
+        developer = self.never_called()
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, _, _ = self.resume(developer=developer)
+        self.assertNotEqual(rc, 0)
+        developer.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_capability_does_not_authorize_unknown_command(self):
+        data = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
+        data["mandatory_tests"] = ["unknown"]
+        _write_yaml(self.taskexec_packet_path, data)
+        self.assert_denied()
+
+    def test_capability_does_not_authorize_governance_changes(self):
+        def mutate():
+            (self.taskexec_repo / "AGENTS.md").write_text("unauthorized", encoding="utf-8")
+        rc, result, tests = self.run_task(developer=self.developer_completes(on_run=mutate))
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertIn("AGENTS.md", result["out_of_scope_paths"])
+        tests.assert_not_called()
+
+
+class ProbeGovernanceChecks:
+    """Same governance denials for both stateless write-capable probes."""
+    def change_roster(self, mutate):
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        mutate(data["agents"])
+        _write_yaml(path, data)
+
+    def invoke_probe(self, developer):
+        output = io.StringIO()
+        with mock.patch.object(app, "Store") as store, \
+                mock.patch.object(Store, "reserve_agent_run") as reserve, \
+                self.patched_subprocess(developer=developer, test=mock.MagicMock(side_effect=self._test_passes)), \
+                contextlib.redirect_stdout(output):
+            argv = [self.probe_command]
+            if self.probe_command == "task-execution-probe":
+                argv.append(str(self.taskexec_packet_path))
+            rc = self.run_cli(*argv)
+        store.assert_not_called()
+        reserve.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+        self.assertEqual(_sandbox_dirs(self.root), [])
+        return rc, output.getvalue()
+
+    def model_success(self, args, **kwargs):
+        if self.probe_command == "task-execution-probe":
+            return self._developer_writes_allowed_only(args, **kwargs)
+        (Path(kwargs["cwd"]) / WRITE_PROBE_TARGET_FILENAME).write_text(
+            WRITE_PROBE_AFTER_CONTENT, encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": EXPECTED_WRITE_RESULT, "session_id": "mock", "num_turns": 1,
+            "duration_ms": 1,
+        }), "")
+
+    def assert_probe_denied(self):
+        developer = mock.MagicMock(side_effect=AssertionError("model must not run"))
+        rc, _ = self.invoke_probe(developer)
+        self.assertNotEqual(rc, 0)
+        developer.assert_not_called()
+
+    def test_current_builder_success_bounded_and_stateless(self):
+        developer = mock.MagicMock(side_effect=self.model_success)
+        rc, output = self.invoke_probe(developer)
+        self.assertEqual(rc, 0, output)
+        developer.assert_called_once()
+        argv = developer.call_args.args[0]
+        turns = "8" if self.probe_command == "task-execution-probe" else "3"
+        self.assertEqual(argv[argv.index("--max-turns") + 1], turns)
+        self.assertIn("--restricted", argv)
+        self.assertFalse(developer.call_args.kwargs["shell"])
+        self.assertEqual(developer.call_args.kwargs["timeout"], 90)
+
+    def test_alternate_identity_without_developer_entry(self):
+        self.change_roster(lambda roster: roster.update(other_builder=roster.pop("developer")))
+        developer = mock.MagicMock(side_effect=self.model_success)
+        rc, output = self.invoke_probe(developer)
+        self.assertEqual(rc, 0, output)
+        developer.assert_called_once()
+
+    def test_disabled_builder_cannot_reach_adapter(self):
+        self.change_roster(lambda roster: roster["developer"].update(enabled=False))
+        self.assert_probe_denied()
+
+    def test_zero_builders_cannot_reach_adapter(self):
+        self.change_roster(lambda roster: roster.pop("developer"))
+        self.assert_probe_denied()
+
+    def test_ambiguous_builders_cannot_reach_adapter(self):
+        self.change_roster(lambda roster: roster.update(other_builder=dict(roster["developer"])))
+        self.assert_probe_denied()
+
+    def test_provider_mismatch_cannot_reach_adapter(self):
+        self.change_roster(lambda roster: roster["developer"].update(provider="openai_api"))
+        self.assert_probe_denied()
+
+    def test_unsupported_adapter_cannot_reach_model(self):
+        self.change_roster(lambda roster: roster["developer"].update(adapter="os.system"))
+        self.assert_probe_denied()
+
+    def test_missing_capability_cannot_reach_adapter(self):
+        path = self.config_dir / "PERMISSIONS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["role_capabilities"]["builder"] = []
+        _write_yaml(path, data)
+        self.assert_probe_denied()
+
+
+class WriteProbeGovernanceTests(ProbeGovernanceChecks, TaskExecutionProbeTestCase):
+    probe_command = "developer-write-probe"
+
+
+class TaskProbeGovernanceTests(ProbeGovernanceChecks, TaskExecutionProbeTestCase):
+    probe_command = "task-execution-probe"
+
+    def test_reconciliation_drift_precedes_builder_resolution(self):
+        (self.taskexec_repo / "allowed.txt").write_text("DRIFT", encoding="utf-8")
+        developer = mock.MagicMock(side_effect=AssertionError("model must not run"))
+        with mock.patch.object(app, "resolve_builder", side_effect=AssertionError("must reconcile first")) as resolve:
+            rc, output = self.invoke_probe(developer)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(json.loads(output)["status"], "reconciliation_blocked")
+        resolve.assert_not_called()
+        developer.assert_not_called()
+
+
+class HandshakeGovernanceTests(CliFixtureTestCase):
+    def test_ambiguous_builder_cannot_use_literal_developer(self):
+        self.enable_developer()
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["other"] = dict(data["agents"]["developer"])
+        _write_yaml(path, data)
+        with mock.patch.object(app, "run_handshake") as adapter:
+            self.assertNotEqual(self.run_cli("developer-probe"), 0)
+        adapter.assert_not_called()

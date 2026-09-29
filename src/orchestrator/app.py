@@ -42,6 +42,8 @@ from .config_loader import (
     load_notifications_config,
     load_project_rules,
     resolve_project_root,
+    resolve_builder,
+    require_builder_capability,
 )
 from .evidence import EvidenceError
 from .notifications import (
@@ -285,10 +287,7 @@ def cmd_developer_probe(args: argparse.Namespace) -> int:
     cwd y authorized_root quedan fijos en REPO_ROOT: en este incremento la
     ejecución se limita exclusivamente a este repositorio."""
     config = _require_core_config()
-    developer_config = config.agents.get("agents", {}).get("developer", {})
-    if developer_config.get("enabled") is not True:
-        print("error: developer is not enabled in AGENTS.yaml", file=sys.stderr)
-        return 1
+    developer_config = resolve_builder(config.agents)[1]
 
     result = run_handshake(
         developer_config=developer_config,
@@ -317,7 +316,8 @@ def cmd_developer_write_probe(args: argparse.Namespace) -> int:
     nunca AIP, FOA, projects/SAMPLE, src/, tests/ ni config/. Se elimina
     siempre al finalizar (éxito o fallo controlado), vía finally."""
     config = _require_core_config()
-    developer_config = config.agents.get("agents", {}).get("developer", {})
+    developer_config = resolve_builder(config.agents)[1]
+    require_builder_capability(config.permissions)
     write_probe_config = developer_config.get("write_probe", {})
     if write_probe_config.get("enabled") is not True:
         print("error: write_probe is not enabled in AGENTS.yaml", file=sys.stderr)
@@ -525,6 +525,7 @@ def execute_task_packet(
     capacity_hook: Callable[[CapacityFailure], dict[str, Any] | None] | None = None,
     budget_store: Store | None = None,
     resource_policies: dict[str, Any] | None = None,
+    agent_roster: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """TASK-EXECUTION-002: compone el flujo mínimo seguro --
 
@@ -585,6 +586,20 @@ def execute_task_packet(
         base.update(overrides)
         return base
 
+    try:
+        agent_id, resolved_config = resolve_builder(agent_roster or {})
+        require_builder_capability(permissions)
+        if resolved_config != developer_config:
+            raise ConfigError("Builder assignment mismatch")
+        if resume and budget_store is not None:
+            prior = [run for run in budget_store.list_agent_runs(packet.task_id)
+                     if run["role"] == "builder"]
+            if not prior or any(run["agent"] != agent_id or
+                                run["provider"] != resolved_config["provider"] for run in prior):
+                raise ConfigError("Builder identity changed")
+    except ConfigError:
+        return _blocked("Builder assignment or capability is not authorized")
+
     # 2-4. project authorization + project root resolution (D-EXEC-003):
     # repo_path viene EXCLUSIVAMENTE de PROJECT_RULES, nunca del Task Packet.
     try:
@@ -632,8 +647,8 @@ def execute_task_packet(
             return _blocked("local model execution preflight failed")
         try:
             run_id = budget_store.reserve_agent_run(
-                packet.task_id, role="builder", agent="developer",
-                provider=developer_config.get("provider", "claude_code_cli"),
+                packet.task_id, role=resolved_config["role"], agent=agent_id,
+                provider=resolved_config["provider"],
                 phase="capacity_resume" if resume else "implementation",
                 resource_profile=packet.resource_profile, policies=resource_policies,
             )
@@ -881,7 +896,6 @@ def cmd_task_execution_probe(args: argparse.Namespace) -> int:
     packet_path = _ensure_within_repo(Path(args.task_packet_path))
     packet = task_packet_mod.load_task_packet_from_yaml_file(packet_path, policies=config.policies)
     project_rules = _require_project_rules(packet.project_id)
-    developer_config = config.agents.get("agents", {}).get("developer", {})
 
     project_root = resolve_project_root(
         project_rules,
@@ -899,11 +913,14 @@ def cmd_task_execution_probe(args: argparse.Namespace) -> int:
         })
         return EXIT_BLOCKED_OR_ERROR
 
+    developer_config = resolve_builder(config.agents)[1]
+    require_builder_capability(config.permissions)
     result = execute_task_packet(
         packet,
         project_rules=project_rules,
         developer_config=developer_config,
         permissions=config.permissions,
+        agent_roster=config.agents,
         orchestrator_repo_root=REPO_ROOT,
         mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
     )
@@ -1017,7 +1034,7 @@ def _resolve_persisted_packet_path(relative: str) -> Path:
 def _capacity_wait_config(config: OrchestratorConfig) -> dict[str, Any] | None:
     """Bloque developer.capacity_wait de la config ACTUAL (None = ausente =
     espera automática desactivada)."""
-    developer = config.agents.get("agents", {}).get("developer", {})
+    developer = resolve_builder(config.agents)[1]
     block = developer.get("capacity_wait")
     return block if isinstance(block, dict) else None
 
@@ -1187,7 +1204,7 @@ def cmd_run_task(args: argparse.Namespace) -> int:
     packet, packet_sha = _load_packet_with_identity(packet_path, policies=config.policies)
     relative_path = _relative_packet_path(packet_path)
     project_rules, rules_sha = _load_project_rules_with_identity(packet.project_id)
-    developer_config = config.agents.get("agents", {}).get("developer", {})
+    developer_config = resolve_builder(config.agents)[1]
     db_path = _ensure_within_repo(Path(args.db_path))
 
     project_root = resolve_project_root(
@@ -1248,6 +1265,7 @@ def cmd_run_task(args: argparse.Namespace) -> int:
                 project_rules=project_rules,
                 developer_config=developer_config,
                 permissions=config.permissions,
+                agent_roster=config.agents,
                 orchestrator_repo_root=REPO_ROOT,
                 mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
                 before=before,
@@ -1521,8 +1539,9 @@ def _execute_claimed_resume(
     return execute_task_packet(
         packet,
         project_rules=project_rules,
-        developer_config=config.agents.get("agents", {}).get("developer", {}),
+        developer_config=resolve_builder(config.agents)[1],
         permissions=config.permissions,
+        agent_roster=config.agents,
         orchestrator_repo_root=REPO_ROOT,
         mandatory_test_timeout=MANDATORY_TEST_TIMEOUT_SECONDS,
         before=before,

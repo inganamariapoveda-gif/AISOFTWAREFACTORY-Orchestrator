@@ -439,3 +439,42 @@ Objetivos y verificables:
 ## DECISIONES REQUERIDAS
 
 No se identificaron decisiones materiales pendientes para iniciar el MVP.
+
+
+## 19. ROLE-CAPABILITY-001: asignación y capacidad
+
+El motor distingue rol funcional (`director`, `builder`, `verifier`), identidad
+(clave del roster), proveedor, adaptador y capacidad. El agente compatible
+`developer` tiene rol `builder`, proveedor `claude_code_cli` y adaptador explícito
+`claude_code_cli`. La única combinación operacional implementada sigue siendo
+ese proveedor/adaptador; no hay imports dinámicos ni selección desde Task Packets.
+Los nombres Developer, probes y estados de capacidad se conservan.
+
+AGENTS.yaml selecciona exactamente un Builder habilitado cuando se requiere
+implementación. Cero o múltiples candidatos bloquean; roles/adaptadores no
+soportados y combinaciones incompatibles fallan cerrado. Director sigue
+inhabilitado; un Verifier inhabilitado es representable sin inventar proveedor.
+
+PERMISSIONS.yaml declara `role_capabilities.builder` con
+`implement_authorized_changes`. Esta condición adicional se comprueba antes de
+reservar presupuesto o invocar implementación. Ni rol, proveedor ni adaptador
+conceden autoridad. La capacidad se intersecta con alcance del Task Packet,
+reglas del proyecto, rutas protegidas, comandos y controles de seguridad;
+no concede Git, comandos de tests/build al modelo, administración de bases de
+datos, producción, despliegue, cambios de permisos ni gobernanza.
+
+El ledger existente registra rol, identidad y proveedor resueltos, sin cambiar
+su esquema ni límites. Reanudación vuelve a validar asignación y capacidad;
+no puede cambiar la identidad/proveedor del Builder registrado anteriormente.
+
+Contrato futuro, no operativo: revisión independiente vinculará rol `verifier`,
+identidad autorizada, nuevo run de Verifier y candidato exacto revisado. Su
+identidad deberá diferir de todos los Builders que produjeron ese candidato;
+proveedor y adaptador deberán coincidir con la asignación validada. Diversidad
+de proveedor podrá exigirse por política futura de gate/proyecto; no es una
+invariante universal del motor. Verifier emitirá hallazgos y veredicto, nunca
+permisos, ampliación de alcance, producción ni aprobación de Human Gate.
+Motor/Director aplican política y gates; la autoridad del Director no cambia.
+Este incremento no invoca Director/Verifier, reserva runs de Verifier ni genera
+evidencia de revisión independiente. TECHNICAL_REVIEW y SECURITY_REVIEW
+continúan siendo checks/estados deterministas; GATES.yaml no cambia.

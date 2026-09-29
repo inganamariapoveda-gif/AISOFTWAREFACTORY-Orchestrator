@@ -112,7 +112,7 @@ def _baseline_agents() -> dict:
         "version": 1,
         "agents": {
             "director": {"role": "director", "enabled": False},
-            "developer": {"role": "developer", "enabled": False},
+            "developer": {"role": "builder", "provider": "claude_code_cli", "adapter": "claude_code_cli", "enabled": False},
         },
     }
 
@@ -144,6 +144,7 @@ def _baseline_permissions() -> dict:
             "secret_files": True,
         },
         "allowed_commands": [],
+        "role_capabilities": {"builder": ["implement_authorized_changes"]},
     }
 
 
@@ -364,7 +365,7 @@ allowed_commands: []
 
 def _valid_developer_handshake() -> dict:
     return {
-        "role": "developer",
+        "role": "builder", "provider": "claude_code_cli", "adapter": "claude_code_cli",
         "enabled": True,
         "executable": "claude",
         "output_format": "json",
@@ -592,7 +593,7 @@ class CapacityWaitConfigTests(unittest.TestCase):
             tmp = Path(tmp_str)
             agents = _baseline_agents()
             developer = (
-                _valid_developer_handshake() if developer_enabled else {"enabled": False}
+                _valid_developer_handshake() if developer_enabled else {"role": "builder", "enabled": False}
             )
             developer["capacity_wait"] = block
             agents["agents"]["developer"] = developer
@@ -1084,3 +1085,106 @@ class NotificationsConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoleCapabilityConfigTests(unittest.TestCase):
+    def roster(self):
+        agents = _baseline_agents()
+        agents["agents"]["developer"] = _valid_developer_handshake()
+        return agents
+
+    def resolve(self, agents):
+        from orchestrator.config_loader import resolve_builder
+        return resolve_builder(agents)
+
+    def test_current_assignment(self):
+        identity, agent = self.resolve(yaml.safe_load((CONFIG_DIR / "AGENTS.yaml").read_text(encoding="utf-8")))
+        self.assertEqual(identity, "developer")
+        self.assertEqual((agent["role"], agent["provider"], agent["adapter"], agent["enabled"]),
+                         ("builder", "claude_code_cli", "claude_code_cli", True))
+        self.assertNotEqual(identity, agent["role"])
+        self.assertNotEqual(agent["role"], agent["provider"])
+
+    def test_alternate_identity(self):
+        agents = self.roster()
+        agents["agents"]["implementation_agent"] = agents["agents"].pop("developer")
+        self.assertEqual(self.resolve(agents)[0], "implementation_agent")
+
+    def test_zero_builders(self):
+        agents = self.roster()
+        del agents["agents"]["developer"]
+        with self.assertRaises(ConfigError):
+            self.resolve(agents)
+
+    def test_disabled_builder_not_selected(self):
+        with self.assertRaises(ConfigError):
+            self.resolve(_baseline_agents())
+
+    def test_two_builders(self):
+        agents = self.roster()
+        agents["agents"]["second"] = dict(agents["agents"]["developer"])
+        with self.assertRaises(ConfigError):
+            self.resolve(agents)
+
+    def test_unknown_role(self):
+        agents = self.roster()
+        agents["agents"]["developer"]["role"] = "developer"
+        with self.assertRaises(ConfigError):
+            self.resolve(agents)
+
+    def test_adapter_and_provider_fail_closed(self):
+        for key, value in [("adapter", "unknown"), ("adapter", "os.system"),
+                           ("provider", "openai_api"), ("provider", None), ("adapter", None)]:
+            with self.subTest(key=key, value=value):
+                agents = self.roster()
+                agents["agents"]["developer"][key] = value
+                with self.assertRaises(ConfigError):
+                    self.resolve(agents)
+
+    def test_disabled_verifier_without_invented_provider(self):
+        agents = self.roster()
+        agents["agents"]["independent_review"] = {"role": "verifier", "enabled": False}
+        self.assertEqual(self.resolve(agents)[0], "developer")
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_core_config(Path(tmp), agents=agents)
+            self.assertFalse(load_core_config(Path(tmp)).agents["agents"]["independent_review"]["enabled"])
+
+    def test_director_and_verifier_cannot_be_enabled(self):
+        for role in ("director", "verifier"):
+            agents = self.roster()
+            agents["agents"][role] = {"role": role, "enabled": True}
+            with self.assertRaises(ConfigError):
+                self.resolve(agents)
+
+    def test_capability_is_explicit_not_inferred_from_role(self):
+        from orchestrator.config_loader import require_builder_capability
+        permissions = _baseline_permissions()
+        require_builder_capability(permissions)
+        permissions["role_capabilities"]["builder"] = []
+        with self.assertRaises(ConfigError):
+            require_builder_capability(permissions)
+        del permissions["role_capabilities"]
+        with self.assertRaises(ConfigError):
+            require_builder_capability(permissions)
+
+    def test_unknown_and_nonoperational_grants_fail_configuration(self):
+        for grants in ({"builder": ["arbitrary_execution"]}, {"unknown": []},
+                       {"director": ["implement_authorized_changes"]},
+                       {"verifier": ["implement_authorized_changes"]}):
+            with self.subTest(grants=grants), tempfile.TemporaryDirectory() as tmp:
+                permissions = _baseline_permissions()
+                permissions["role_capabilities"] = grants
+                _write_core_config(Path(tmp), permissions=permissions)
+                with self.assertRaises(ConfigError):
+                    load_core_config(Path(tmp))
+
+    def test_capability_cannot_override_denials_or_command_validation(self):
+        from orchestrator.config_loader import require_builder_capability
+        for field in ("deny", "allowed_commands"):
+            permissions = _baseline_permissions()
+            if field == "deny":
+                permissions["deny"]["production"] = False
+            else:
+                permissions["allowed_commands"] = ["python -c arbitrary"]
+            with self.assertRaises(ConfigError):
+                require_builder_capability(permissions)

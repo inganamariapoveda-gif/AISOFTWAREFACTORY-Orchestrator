@@ -219,23 +219,41 @@ def _validate_agents(data: dict[str, Any], path: Path) -> None:
     if director.get("enabled") is not False:
         raise ConfigError(f"agent 'director' must have enabled: false ({path})")
 
-    developer = _require(data, "agents.developer", path)
-    if not isinstance(developer, dict):
-        raise ConfigError(f"'agents.developer' must be a mapping in {path}")
-    developer_enabled = developer.get("enabled")
-    if not isinstance(developer_enabled, bool):
-        raise ConfigError(
-            f"agent 'developer' must declare a boolean 'enabled' ({path})"
-        )
-    if developer_enabled:
-        _validate_developer_handshake_config(developer, path)
-    # Independiente de developer_enabled: si alguien declara write_probe
-    # habilitado, sus campos deben ser válidos de todos modos (fail closed,
-    # sin defaults silenciosos).
-    _validate_write_probe_config(developer, path)
-    # Igual que write_probe: independiente de developer_enabled, un bloque
-    # capacity_wait declarado debe ser válido de todos modos.
-    _validate_capacity_wait_config(developer, path)
+    if director.get("role") != "director":
+        raise ConfigError("director must retain its functional role")
+    for identity, agent in data["agents"].items():
+        if not isinstance(identity, str) or not _LOGICAL_ID_RE.fullmatch(identity):
+            raise ConfigError("invalid agent identity")
+        if not isinstance(agent, dict) or agent.get("role") not in {"director", "builder", "verifier"}:
+            raise ConfigError("unsupported agent role")
+        if type(agent.get("enabled")) is not bool:
+            raise ConfigError("agent must declare boolean enabled")
+        if agent["enabled"]:
+            if agent["role"] != "builder":
+                raise ConfigError("agent role has no operational adapter")
+            if agent.get("adapter") != "claude_code_cli" or agent.get("provider") != "claude_code_cli":
+                raise ConfigError("unsupported provider/adapter assignment")
+            _validate_developer_handshake_config(agent, path)
+        elif "adapter" in agent and agent["adapter"] != "claude_code_cli":
+            raise ConfigError("unsupported adapter")
+        _validate_write_probe_config(agent, path)
+        _validate_capacity_wait_config(agent, path)
+
+
+def resolve_builder(agents: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Resolve one configured identity, never a fallback identity/provider."""
+    _validate_agents(agents, Path("AGENTS.yaml"))
+    matches = [(identity, agent) for identity, agent in agents["agents"].items()
+               if agent["role"] == "builder" and agent["enabled"]]
+    if len(matches) != 1:
+        raise ConfigError("exactly one enabled Builder is required")
+    return matches[0]
+
+
+def require_builder_capability(permissions: dict[str, Any]) -> None:
+    _validate_permissions(permissions, Path("PERMISSIONS.yaml"))
+    if "implement_authorized_changes" not in permissions.get("role_capabilities", {}).get("builder", []):
+        raise ConfigError("Builder capability is not authorized")
 
 
 def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
@@ -407,6 +425,14 @@ def _validate_gates(data: dict[str, Any], path: Path) -> None:
 
 
 def _validate_permissions(data: dict[str, Any], path: Path) -> None:
+    capabilities = data.get("role_capabilities", {})
+    if not isinstance(capabilities, dict):
+        raise ConfigError("role_capabilities must be a mapping")
+    for role, grants in capabilities.items():
+        if role not in {"director", "builder", "verifier"} or not isinstance(grants, list):
+            raise ConfigError("invalid role capability policy")
+        if any(grant != "implement_authorized_changes" or role != "builder" for grant in grants):
+            raise ConfigError("unsupported role capability")
     for key in REQUIRED_PERMISSION_DENY_KEYS:
         _require_true(data, key, path)
     allowed_commands = _require(data, "allowed_commands", path)

@@ -25,3 +25,10 @@ allowed_commands:
   - unit
   - lint
   - build
+
+# Additional prerequisite; never overrides scope, commands, paths or denials.
+role_capabilities:
+  builder:
+    - implement_authorized_changes
+  director: []
+  verifier: []
