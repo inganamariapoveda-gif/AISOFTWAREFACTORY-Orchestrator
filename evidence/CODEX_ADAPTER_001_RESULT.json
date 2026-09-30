@@ -1,0 +1,144 @@
+{
+  "task_id": "CODEX-ADAPTER-001",
+  "final_state": "TECH_APPROVED",
+  "implementation_result": "PASS",
+  "correction_attempts_used": 1,
+  "implementation_commit": "e45e9d81d97a17a9e77bde7130973290d0172636",
+  "codex_agent": {
+    "id": "codex_builder",
+    "role": "builder",
+    "provider": "openai_codex",
+    "adapter": "codex_cli",
+    "canonical_enabled": false
+  },
+  "canonical_builder": {
+    "agent": "developer",
+    "enabled": true
+  },
+  "adapter": {
+    "execution": "local_cli",
+    "shell": false,
+    "explicit_cwd": true,
+    "stdin_instruction": true,
+    "sandbox": "workspace-write",
+    "approval_policy": "never",
+    "structured_output": "jsonl",
+    "ephemeral": true,
+    "ignore_user_config": true,
+    "session_resume": false,
+    "retry_loop": false,
+    "timeout_seconds": 600,
+    "network_configured_disabled": true
+  },
+  "child_environment": {
+    "explicit": true,
+    "full_parent_inherited": false,
+    "allowlist": true,
+    "unrelated_application_secrets_forwarded": false,
+    "credential_contents_read": false
+  },
+  "resource_budget": {
+    "existing_ledger_reused": true,
+    "reservation_before_launch": true,
+    "failure_refunds_reservation": false,
+    "schema_changed": false
+  },
+  "tests": {
+    "initial_focused": {
+      "total": 26,
+      "passed": 26
+    },
+    "initial_affected_1": {
+      "total": 268,
+      "passed": 268
+    },
+    "initial_affected_2": {
+      "total": 73,
+      "passed": 73
+    },
+    "initial_full_regression": {
+      "total": 1011,
+      "passed": 1011,
+      "failed": 0,
+      "errors": 0,
+      "duration_seconds": 740.136,
+      "exit_code": 0
+    },
+    "independent_initial": {
+      "total": 114,
+      "passed": 114,
+      "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+      "provenance": "Director-provided CLOSE-AND-COMMIT-001 authorization"
+    },
+    "correction_codex_adapter": {
+      "total": 15,
+      "passed": 15,
+      "duration_seconds": 0.15,
+      "exit_code": 0
+    },
+    "correction_dispatch": {
+      "total": 9,
+      "passed": 9,
+      "duration_seconds": 12.587,
+      "exit_code": 0
+    },
+    "correction_full_regression_attempt": {
+      "result": "INCONCLUSIVE_HARNESS_PROCESS_LOSS",
+      "detail": "Unknown process id 5013",
+      "product_test_failure_established": false
+    },
+    "independent_correction": {
+      "total": 24,
+      "passed": 24,
+      "failed": 0,
+      "errors": 0,
+      "exit_code": 0,
+      "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+      "provenance": "Director-provided CLOSE-AND-COMMIT-001 authorization"
+    },
+    "rerun_during_closure": false
+  },
+  "full_regression_assessment": {
+    "result": "BOUNDED_EVIDENCE_SUFFICIENT",
+    "provenance": "Director-provided CLOSE-AND-COMMIT-001 authorization"
+  },
+  "resolved_findings": [
+    "CX-2"
+  ],
+  "resolved_finding_details": {
+    "CX-2": "Codex subprocess no longer inherits the complete Orchestrator environment."
+  },
+  "accepted_nonblocking_observations": [
+    "CX-1",
+    "CX-3",
+    "CX-4",
+    "CX-5",
+    "ENV-OBS-1",
+    "ENV-OBS-2",
+    "ENV-OBS-3"
+  ],
+  "accepted_observation_details": {
+    "CX-1": "Activation blockers are governance-controlled, not engine-interlocked.",
+    "CX-3": "Task-execution-probe may later dispatch Codex when enabled.",
+    "CX-4": "Actual argv/flags not validated against real Codex execution.",
+    "CX-5": "Documentation URL accuracy observation.",
+    "ENV-OBS-1": "Real Windows execution may require additional safe environment context.",
+    "ENV-OBS-2": "Pre-launch environment failure classified PROCESS_FAILURE.",
+    "ENV-OBS-3": "CODEX_HOME no-read test weaker than code inspection."
+  },
+  "activation_blockers": [
+    "CODEX_ACTIVATION_BLOCKER_AUTH_UNVERIFIED",
+    "CODEX_ACTIVATION_BLOCKER_PROTECTED_PATHS",
+    "WINDOWS_SANDBOX_UNVERIFIED",
+    "NETWORK_ISOLATION_UNVERIFIED",
+    "REAL_JSONL_CONTRACT_UNVERIFIED",
+    "REAL_CLI_ARGV_UNVERIFIED",
+    "WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED",
+    "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED"
+  ],
+  "authentication_state": "UNKNOWN",
+  "human_gate": {
+    "required": false,
+    "reason": "adapter foundation only; Codex remains disabled and no real Codex task was executed"
+  }
+}
