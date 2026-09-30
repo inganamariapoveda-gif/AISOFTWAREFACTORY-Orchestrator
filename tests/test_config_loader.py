@@ -1188,3 +1188,53 @@ class RoleCapabilityConfigTests(unittest.TestCase):
                 permissions["allowed_commands"] = ["python -c arbitrary"]
             with self.assertRaises(ConfigError):
                 require_builder_capability(permissions)
+
+
+class CodexConfigTests(unittest.TestCase):
+    def load(self, mutate=None):
+        from tests.test_codex_adapter import codex_agent
+        agents = _baseline_agents()
+        agents["agents"]["codex_builder"] = codex_agent()
+        if mutate:
+            mutate(agents["agents"]["codex_builder"])
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_core_config(Path(tmp), agents=agents)
+            return load_core_config(Path(tmp))
+
+    def test_canonical_claude_only_and_disabled_codex(self):
+        from orchestrator.config_loader import resolve_builder
+        config = load_core_config(CONFIG_DIR)
+        self.assertEqual(resolve_builder(config.agents)[0], "developer")
+        agent = config.agents["agents"]["codex_builder"]
+        self.assertIs(agent["enabled"], False)
+        self.assertEqual((agent["role"], agent["provider"], agent["adapter"]),
+                         ("builder", "openai_codex", "codex_cli"))
+        self.assertEqual(agent["executable"], "codex")
+
+    def test_temporary_codex_builder_resolves(self):
+        from orchestrator.config_loader import resolve_builder
+        self.assertEqual(resolve_builder(self.load().agents)[0], "codex_builder")
+
+    def test_pairing_and_module_paths_rejected(self):
+        for key, value in (("provider", "claude_code_cli"), ("provider", "unknown"),
+                           ("adapter", "claude_code_cli"), ("adapter", "os.system"),
+                           ("adapter", "unknown"), ("executable", "C:/version/codex.exe")):
+            with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                self.load(lambda a: a.update({key: value}))
+
+    def test_execution_settings_closed_and_exact(self):
+        cases = [("timeout_seconds", 0), ("timeout_seconds", True), ("timeout_seconds", 1.5),
+                 ("sandbox", "danger-full-access"), ("approval_policy", "on-request"),
+                 ("structured_output", "text"), ("ephemeral", False), ("ephemeral", 1),
+                 ("ignore_user_config", False), ("ignore_user_config", "true"),
+                 ("network_access", True), ("network_access", 0), ("max_turns", 8)]
+        for key, value in cases:
+            with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                self.load(lambda a: a["task_execution"].update({key: value}))
+
+    def test_unknown_or_missing_agent_keys_denied_even_disabled(self):
+        for mutation in (lambda a: a.update(enabled=False, arbitrary=True),
+                         lambda a: a["task_execution"].pop("sandbox"),
+                         lambda a: a.update(task_execution=[])):
+            with self.assertRaises(ConfigError):
+                self.load(mutation)

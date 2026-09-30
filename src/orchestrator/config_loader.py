@@ -224,20 +224,50 @@ def _validate_agents(data: dict[str, Any], path: Path) -> None:
     for identity, agent in data["agents"].items():
         if not isinstance(identity, str) or not _LOGICAL_ID_RE.fullmatch(identity):
             raise ConfigError("invalid agent identity")
-        if not isinstance(agent, dict) or agent.get("role") not in {"director", "builder", "verifier"}:
+        if not isinstance(agent, dict) or not isinstance(agent.get("role"), str) or agent["role"] not in {"director", "builder", "verifier"}:
             raise ConfigError("unsupported agent role")
         if type(agent.get("enabled")) is not bool:
             raise ConfigError("agent must declare boolean enabled")
-        if agent["enabled"]:
-            if agent["role"] != "builder":
-                raise ConfigError("agent role has no operational adapter")
-            if agent.get("adapter") != "claude_code_cli" or agent.get("provider") != "claude_code_cli":
+        if agent["enabled"] and agent["role"] != "builder":
+            raise ConfigError("agent role has no operational adapter")
+        if agent["enabled"] or "adapter" in agent:
+            pair = (agent.get("provider"), agent.get("adapter"))
+            if pair not in (("claude_code_cli", "claude_code_cli"), ("openai_codex", "codex_cli")):
                 raise ConfigError("unsupported provider/adapter assignment")
+        if agent.get("adapter") == "codex_cli":
+            validate_codex_execution_config(agent)
+            continue
+        if agent["enabled"]:
             _validate_developer_handshake_config(agent, path)
-        elif "adapter" in agent and agent["adapter"] != "claude_code_cli":
-            raise ConfigError("unsupported adapter")
         _validate_write_probe_config(agent, path)
         _validate_capacity_wait_config(agent, path)
+
+
+def validate_codex_execution_config(agent: dict[str, Any]) -> dict[str, Any]:
+    """Closed Codex invocation settings, also validated while disabled."""
+    if not isinstance(agent, dict) or set(agent) != {
+        "role", "provider", "adapter", "enabled", "executable", "task_execution"
+    }:
+        raise ConfigError("invalid Codex agent keys")
+    if (agent["role"], agent["provider"], agent["adapter"]) != ("builder", "openai_codex", "codex_cli"):
+        raise ConfigError("invalid Codex assignment")
+    if type(agent["enabled"]) is not bool or agent["executable"] not in ("codex", "codex.exe"):
+        raise ConfigError("invalid Codex executable or enabled state")
+    execution = agent["task_execution"]
+    if not isinstance(execution, dict) or set(execution) != {
+        "timeout_seconds", "sandbox", "approval_policy", "structured_output",
+        "ephemeral", "ignore_user_config", "network_access"
+    }:
+        raise ConfigError("invalid Codex execution keys")
+    if type(execution["timeout_seconds"]) is not int or execution["timeout_seconds"] < 1:
+        raise ConfigError("invalid Codex timeout")
+    if (execution["sandbox"], execution["approval_policy"], execution["structured_output"]) != (
+        "workspace-write", "never", "json"
+    ):
+        raise ConfigError("unsupported Codex execution mode")
+    if execution["ephemeral"] is not True or execution["ignore_user_config"] is not True or execution["network_access"] is not False:
+        raise ConfigError("unsafe Codex execution settings")
+    return execution
 
 
 def resolve_builder(agents: dict[str, Any]) -> tuple[str, dict[str, Any]]:

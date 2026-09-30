@@ -5830,3 +5830,147 @@ class HandshakeGovernanceTests(CliFixtureTestCase):
         with mock.patch.object(app, "run_handshake") as adapter:
             self.assertNotEqual(self.run_cli("developer-probe"), 0)
         adapter.assert_not_called()
+
+
+class CodexDispatchTests(PersistedExecutionTestCase):
+    def setUp(self):
+        super().setUp()
+        from tests.test_codex_adapter import codex_agent
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["developer"]["enabled"] = False
+        data["agents"]["codex_builder"] = codex_agent()
+        _write_yaml(path, data)
+        self.codex_process = mock.MagicMock(side_effect=self.codex_success)
+
+    def runs(self):
+        with Store(self.db_path) as store:
+            return store.list_agent_runs(TASK_ID)
+
+    def codex_success(self, args, **kwargs):
+        from tests.test_codex_adapter import SUCCESS_OUTPUT
+        (Path(kwargs["cwd"]) / "allowed.txt").write_text("AFTER", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, SUCCESS_OUTPUT, "PRIVATE_STDERR")
+
+    @contextlib.contextmanager
+    def patched_subprocess(self, *, developer=None, test=None):
+        def which(name, *args, **kwargs):
+            if name in ("codex", "claude"):
+                return "/resolved/" + name
+            return _REAL_SHUTIL_WHICH(name, *args, **kwargs)
+        def run(args, **kwargs):
+            if args[0] == "/resolved/codex":
+                return self.codex_process(args, **kwargs)
+            if args[0] == "/resolved/claude":
+                if developer is None:
+                    raise AssertionError("no Claude fallback")
+                return developer(args, **kwargs)
+            if args[0] == "python":
+                if test is None:
+                    raise AssertionError("unexpected test command")
+                return test(args, **kwargs)
+            return _REAL_SUBPROCESS_RUN(args, **kwargs)
+        with mock.patch("shutil.which", side_effect=which), mock.patch("subprocess.run", side_effect=run):
+            yield
+
+    def test_codex_reservation_before_process_then_existing_human_gate(self):
+        def launch(args, **kwargs):
+            runs = self.runs()
+            self.assertEqual(len(runs), 1)
+            self.assertEqual((runs[0]["role"], runs[0]["agent"], runs[0]["provider"], runs[0]["state"]),
+                             ("builder", "codex_builder", "openai_codex", "RESERVED"))
+            return self.codex_success(args, **kwargs)
+        self.codex_process.side_effect = launch
+        rc, result, tests = self.run_task()
+        self.assertEqual((rc, result["state"], result["human_gate"]), (0, "HUMAN_GATE", "HUMAN_FUNCTIONAL_TEST"))
+        self.assertTrue(result["pre_test_evidence_passed"])
+        self.assertTrue(result["post_test_evidence_passed"])
+        self.assertEqual(self.runs()[0]["state"], "SUCCEEDED")
+        tests.assert_called_once()
+        self.codex_process.assert_called_once()
+        self.assertNotIn("PRIVATE_", json.dumps(result))
+
+    def test_missing_capability_zero_calls_and_reservations(self):
+        path = self.config_dir / "PERMISSIONS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["role_capabilities"]["builder"] = []
+        _write_yaml(path, data)
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, _, _ = self.run_task()
+        self.assertNotEqual(rc, 0)
+        self.codex_process.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(self.runs(), [])
+
+    def test_exhausted_budget_zero_calls(self):
+        with mock.patch.object(Store, "reserve_agent_run", return_value=None) as reserve:
+            rc, result, _ = self.run_task()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        reserve.assert_called_once()
+        self.codex_process.assert_not_called()
+
+    def test_bad_pair_zero_calls(self):
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["codex_builder"]["provider"] = "claude_code_cli"
+        _write_yaml(path, data)
+        with mock.patch.object(Store, "reserve_agent_run") as reserve:
+            rc, _, _ = self.run_task()
+        self.assertNotEqual(rc, 0)
+        self.codex_process.assert_not_called()
+        reserve.assert_not_called()
+
+    def test_failure_consumes_reservation_and_never_retries(self):
+        self.codex_process.side_effect = subprocess.TimeoutExpired("PRIVATE", 600, output="PRIVATE")
+        rc, result, tests = self.run_task()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(result["developer_failure_category"], "TIMEOUT")
+        self.assertEqual([r["state"] for r in self.runs()], ["FAILED"])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertIsNone(self.suspension())
+        tests.assert_not_called()
+        self.codex_process.assert_called_once()
+
+    def test_process_failure_with_partial_edits_preserves_evidence_no_capacity_retry(self):
+        def launch(args, **kwargs):
+            (Path(kwargs["cwd"]) / "allowed.txt").write_text("PARTIAL", encoding="utf-8")
+            return subprocess.CompletedProcess(args, 1, "PRIVATE_OUTPUT", "rate limit auth PRIVATE_ERROR")
+        self.codex_process.side_effect = launch
+        rc, result, tests = self.run_task()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(result["developer_failure_category"], "PROCESS_FAILURE")
+        self.assertIn("allowed.txt", result["touched_paths"])
+        self.assertEqual(self.runs()[0]["state"], "FAILED")
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertIsNone(self.suspension())
+        tests.assert_not_called()
+
+    def test_out_of_scope_change_still_blocks(self):
+        def launch(args, **kwargs):
+            (Path(kwargs["cwd"]) / "unauthorized.txt").write_text("outside scope", encoding="utf-8")
+            return self.codex_success(args, **kwargs)
+        self.codex_process.side_effect = launch
+        rc, result, tests = self.run_task()
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertIn("unauthorized.txt", result["out_of_scope_paths"])
+        tests.assert_not_called()
+
+    def test_claude_still_selectable_without_codex_call(self):
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["developer"]["enabled"] = True
+        data["agents"]["codex_builder"]["enabled"] = False
+        _write_yaml(path, data)
+        developer = self.developer_completes()
+        rc, result, _ = self.run_task(developer=developer)
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        developer.assert_called_once()
+        self.codex_process.assert_not_called()
+        self.assertEqual(self.runs()[0]["provider"], "claude_code_cli")
+
+    def test_unimplemented_codex_probes_fail_closed(self):
+        for command in ("developer-probe", "developer-write-probe"):
+            with self.subTest(command=command), self.patched_subprocess():
+                self.assertNotEqual(self.run_cli(command), 0)
+        self.codex_process.assert_not_called()
+        self.assertFalse(self.db_path.exists())

@@ -18,6 +18,22 @@
 version: 1
 
 agents:
+  # CODEX-ADAPTER-001: foundation only. Activation requires separate approval.
+  codex_builder:
+    role: builder
+    provider: openai_codex
+    adapter: codex_cli
+    enabled: false
+    executable: codex
+    task_execution:
+      timeout_seconds: 600
+      sandbox: workspace-write
+      approval_policy: never
+      structured_output: json
+      ephemeral: true
+      ignore_user_config: true
+      network_access: false
+
   director:
     role: "director"
     provider: "openai_api"

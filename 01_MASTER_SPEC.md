@@ -478,3 +478,58 @@ Motor/Director aplican política y gates; la autoridad del Director no cambia.
 Este incremento no invoca Director/Verifier, reserva runs de Verifier ni genera
 evidencia de revisión independiente. TECHNICAL_REVIEW y SECURITY_REVIEW
 continúan siendo checks/estados deterministas; GATES.yaml no cambia.
+
+## 20. CODEX-ADAPTER-001: fundamento CLI sin activación
+
+Se implementa la combinación cerrada `openai_codex` / `codex_cli`, con identidad
+`codex_builder` y rol `builder`. La entrada canónica permanece `enabled: false`;
+`developer`/Claude sigue siendo el único Builder habilitado. No hay fallback,
+imports dinámicos, nuevo permiso, proveedor operacional activo ni modelo Verifier.
+
+AGENTS.yaml conserva los ajustes Codex: ejecutable estable `codex`, timeout de
+600 segundos, `workspace-write`, aprobación `never`, JSONL, ejecución efímera,
+configuración personal ignorada y red del sandbox deshabilitada. No se configura
+modelo ni max_turns. El proceso usa argv, `shell=False`, cwd explícito e instrucción
+por stdin. No se inyectan credenciales ni se leen archivos de autenticación.
+El hijo Codex recibe un entorno explícito por allowlist: PATH/PATHEXT para
+resolución de ejecutables, SYSTEMROOT para Windows, USERPROFILE/HOME/CODEX_HOME
+para ubicación del home y autenticación local, y TEMP/TMP para temporales.
+Solo se copian valores presentes, conservando casing; no se heredan variables
+de aplicación ni API keys. Contexto Windows esencial ausente bloquea sin fallback
+al entorno completo. No se registran valores ni se inspecciona el almacén auth.
+Los overrides de invocación excluyen raíces adicionales y temporales de escritura
+y deshabilitan web search; su eficacia real en Windows debe validarse al activar.
+
+El parser aislado exige JSONL válido, inicio y cierre terminal reconocido de una
+única invocación, exit 0 y ausencia de terminales contradictorios/incompletos.
+El resultado solo contiene metadatos sanitizados. No persiste stdout/stderr,
+mensajes, razonamiento ni sesiones. AUTH_UNAVAILABLE, TEMPORARY_CAPACITY y
+RESOURCE_LIMIT quedan reservados hasta verificar señales estructuradas estables;
+no se infieren de texto libre. Fallos desconocidos bloquean sin reintento.
+
+El motor conserva resolución/capacidad, reserva durable previa al subprocess,
+consumo tras resultado incierto, evidencia, mandatory tests y Human Gates. El
+adaptador no decide política ni escribe Store. Cada unidad usa una invocación
+fresca; nunca `exec resume` ni `--last`. El flujo Claude permanece implementado.
+Handshake/write-probe Codex fallan cerrado hasta activación; los probes canónicos
+continúan usando Claude. El task-execution-probe comparte dispatch y controles,
+pero no tiene reservas ni reintentos, como antes.
+
+workspace-write permite comandos locales: serían ayudas de implementación,
+nunca verificación autoritativa. Las instrucciones de no asumir Git, deploy,
+producción, gobernanza o aprobación final no son una barrera técnica. El permiso
+para comandos Codex queda condicionado a CODEX-ACTIVATION-001, no activa una
+excepción operacional en este incremento. El alcance exacto de archivos sigue
+requiriendo comprobación del motor; esta tarea no corrige protected_paths.
+
+Bloqueos de activación explícitos:
+- `CODEX_ACTIVATION_BLOCKER_PROTECTED_PATHS`: validar/resolver protección efectiva.
+- `CODEX_ACTIVATION_BLOCKER_AUTH_UNVERIFIED`: AUTH_STATE permanece UNKNOWN.
+- Validar sandbox Windows, red, raíces, configuración efectiva y contrato real
+  de eventos de la CLI alpha; aún no se ejecutó ningún smoke de modelo real.
+- El timeout del padre termina y espera al hijo directo mediante subprocess.run;
+  limpieza de descendientes no está garantizada. Resolver o aceptar explícitamente
+  esta limitación en activación, sin introducir aquí un gestor de procesos.
+
+Referencia del mecanismo de configuración CLI:
+https://learn.chatgpt.com/docs/config-file/config-reference

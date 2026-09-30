@@ -34,6 +34,7 @@ from .adapters.claude_code import (
     _validate_task_execution_config,
 )
 from .adapters.slack_notifier import SlackWebhookNotifier
+from .adapters.codex_cli import CodexExecutionError, run_codex_task
 from .config_loader import (
     ConfigError,
     NotificationsConfig,
@@ -44,6 +45,7 @@ from .config_loader import (
     resolve_project_root,
     resolve_builder,
     require_builder_capability,
+    validate_codex_execution_config,
 )
 from .evidence import EvidenceError
 from .notifications import (
@@ -288,6 +290,8 @@ def cmd_developer_probe(args: argparse.Namespace) -> int:
     ejecución se limita exclusivamente a este repositorio."""
     config = _require_core_config()
     developer_config = resolve_builder(config.agents)[1]
+    if developer_config["adapter"] != "claude_code_cli":
+        raise ConfigError("Codex handshake awaits activation validation")
 
     result = run_handshake(
         developer_config=developer_config,
@@ -318,6 +322,8 @@ def cmd_developer_write_probe(args: argparse.Namespace) -> int:
     config = _require_core_config()
     developer_config = resolve_builder(config.agents)[1]
     require_builder_capability(config.permissions)
+    if developer_config["adapter"] != "claude_code_cli":
+        raise ConfigError("Codex write-probe awaits activation validation")
     write_probe_config = developer_config.get("write_probe", {})
     if write_probe_config.get("enabled") is not True:
         print("error: write_probe is not enabled in AGENTS.yaml", file=sys.stderr)
@@ -637,13 +643,18 @@ def execute_task_packet(
     if budget_store is not None:
         # Reuse the runner's exact validators without executing a command.
         try:
-            _validate_task_execution_config(developer_config)
+            if resolved_config["adapter"] == "claude_code_cli":
+                _validate_task_execution_config(developer_config)
+            elif resolved_config["adapter"] == "codex_cli":
+                validate_codex_execution_config(developer_config)
+            else:
+                raise ConfigError("unsupported execution adapter")
             for test_id in packet.mandatory_tests:
                 test_runner_mod._validate_test_id(test_id)
                 if test_id not in permissions["allowed_commands"] or test_id not in project_rules["commands"]:
                     raise test_runner_mod.TestRunnerError("mandatory command is not authorized")
                 test_runner_mod._validate_resolved_argv(project_rules["commands"][test_id], test_id)
-        except (DeveloperExecutionError, test_runner_mod.TestRunnerError):
+        except (ConfigError, DeveloperExecutionError, test_runner_mod.TestRunnerError):
             return _blocked("local model execution preflight failed")
         try:
             run_id = budget_store.reserve_agent_run(
@@ -657,14 +668,24 @@ def execute_task_packet(
         if run_id is None:
             return _blocked("resource budget exhausted", resource_budget_reason="resource budget exhausted")
     try:
-        run_developer_task(
-            developer_config=developer_config,
-            prompt=instruction,
-            cwd=project_root,
-            authorized_root=project_root,
-            resume=resume,
-        )
-    except DeveloperExecutionError as exc:
+        if resolved_config["adapter"] == "claude_code_cli":
+            run_developer_task(
+                developer_config=developer_config,
+                prompt=instruction,
+                cwd=project_root,
+                authorized_root=project_root,
+                resume=resume,
+            )
+        elif resolved_config["adapter"] == "codex_cli":
+            codex_result = run_codex_task(
+                repository_root=project_root, authorized_root=project_root,
+                instruction=instruction, execution_config=developer_config,
+            )
+            if not codex_result.completed:
+                raise CodexExecutionError(codex_result)
+        else:
+            raise ConfigError("unsupported execution adapter")
+    except (DeveloperExecutionError, CodexExecutionError) as exc:
         if run_id is not None:
             budget_store.complete_agent_run(run_id, state="FAILED")
         # TASK-EXECUTION-004: Claude fue REALMENTE invocado y falló
