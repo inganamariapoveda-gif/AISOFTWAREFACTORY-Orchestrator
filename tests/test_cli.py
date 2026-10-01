@@ -6060,6 +6060,15 @@ class ProtectedPathFlowTests(PersistedExecutionTestCase):
 
 
 class CodexDispatchTests(PersistedExecutionTestCase):
+    def test_no_action_turn_can_reach_gate_only_after_engine_tests(self):
+        self.codex_process.side_effect = lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 0, '{"type":"turn.started"}\n{"type":"turn.completed"}', "")
+        rc, result, tests = self.run_task()
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        self.assertEqual(result["touched_paths"], [])
+        tests.assert_called_once()
+        self.codex_process.assert_called_once()
+
     def setUp(self):
         super().setUp()
         from tests.test_codex_adapter import codex_agent

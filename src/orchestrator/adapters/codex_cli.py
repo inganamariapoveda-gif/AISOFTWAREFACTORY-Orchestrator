@@ -54,6 +54,7 @@ class CodexFailureCategory(str, enum.Enum):
 
 @dataclass(frozen=True)
 class CodexResult:
+    """SUCCESS means turn completion at the adapter boundary, not task approval."""
     completed: bool
     failure_category: CodexFailureCategory
     public_reason: str
@@ -61,13 +62,19 @@ class CodexResult:
     terminal_status: str | None = None
     provider: str = "openai_codex"
     adapter: str = "codex_cli"
+    event_count: int = 0
+    item_started_count: int = 0
+    item_completed_count: int = 0
+    command_execution_count: int = 0
+    file_change_item_count: int = 0
+    action_evidence_observed: bool = False
 
 
 def _result(category: CodexFailureCategory, code: int | None = None,
-            terminal: str | None = None) -> CodexResult:
+            terminal: str | None = None, **telemetry: Any) -> CodexResult:
     # Never derive a reason from model text, stderr, paths or exception messages.
     return CodexResult(category is CodexFailureCategory.SUCCESS, category,
-                       "Codex execution: " + category.value, code, terminal)
+                       "Codex execution: " + category.value, code, terminal, **telemetry)
 
 
 class CodexExecutionError(Exception):
@@ -104,6 +111,9 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
     terminal = None
     pending_items: set[str] = set()
     seen = False
+    counts = dict(event_count=0, item_started_count=0, item_completed_count=0,
+                  command_execution_count=0, file_change_item_count=0)
+    action_ids: dict[str, str] = {}
     try:
         for line in stdout.splitlines():
             if not line.strip():
@@ -112,6 +122,7 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 raise ValueError
             kind = event["type"]
+            counts["event_count"] += 1
             seen = True
             if terminal is not None:
                 raise ValueError
@@ -132,6 +143,21 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
                 item = event.get("item")
                 if not started or not isinstance(item, dict) or not isinstance(item.get("id"), str):
                     raise ValueError
+                item_type = item.get("type")
+                if not isinstance(item_type, str) or not item["id"]:
+                    raise ValueError
+                if item_type in {"command_execution", "file_change"}:
+                    previous = action_ids.get(item["id"])
+                    if previous is not None and previous != item_type:
+                        raise ValueError
+                    if previous is None:
+                        action_ids[item["id"]] = item_type
+                        key = "command_execution_count" if item_type == "command_execution" else "file_change_item_count"
+                        counts[key] += 1
+                if kind == "item.started":
+                    counts["item_started_count"] += 1
+                elif kind == "item.completed":
+                    counts["item_completed_count"] += 1
                 if kind == "item.started":
                     if item["id"] in pending_items:
                         raise ValueError
@@ -145,8 +171,10 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
     if not seen or terminal is None:
         return _result(CodexFailureCategory.MALFORMED_OUTPUT, returncode)
     if terminal == "turn.failed":
-        return _result(CodexFailureCategory.UNKNOWN, returncode, terminal)
-    return _result(CodexFailureCategory.SUCCESS, returncode, terminal)
+        return _result(CodexFailureCategory.UNKNOWN, returncode, terminal,
+                       **counts, action_evidence_observed=bool(action_ids))
+    return _result(CodexFailureCategory.SUCCESS, returncode, terminal,
+                   **counts, action_evidence_observed=bool(action_ids))
 
 
 def run_codex_task(*, repository_root: Path, authorized_root: Path,

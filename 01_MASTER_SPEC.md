@@ -592,3 +592,47 @@ WINDOWS_SANDBOX_UNVERIFIED, NETWORK_ISOLATION_UNVERIFIED,
 REAL_JSONL_CONTRACT_UNVERIFIED, REAL_CLI_ARGV_UNVERIFIED,
 WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED y DESCENDANT_PROCESS_CLEANUP_UNVERIFIED.
 AUTH_STATE sigue UNKNOWN.
+
+## 22. Phase B: diagnóstico de evidencia de acciones
+
+Primer smoke real controlado: autenticación READY, proceso lanzado, argv aceptado,
+exit 0 y turn.completed reconocidos. No se observó la modificación solicitada ni
+resultados de probes de sandbox/red/descendientes. No se conservó JSONL/stderr
+crudo; la causa de la ausencia de acciones no puede reconstruirse. No se autoriza
+otra invocación real en DIAGNOSTIC-AND-ACTION-EVIDENCE-001.
+
+SUCCESS significa exclusivamente "Codex turn completed successfully at the
+adapter boundary", no implementación realizada. Exit 0, JSONL válido e inicio y
+terminal de éxito son suficientes; no se exige acción ni cambio de archivo.
+El motor conserva Git, protected_paths, alcance, pruebas y gates como autoridad.
+Un turno sin cambios puede llegar a Human Gate si supera esas comprobaciones;
+no existe requisito global de modificación. Un requisito por tarea de cambio
+obligatorio necesitaría una decisión futura, no se implementa aquí.
+
+Telemetría sanitizada: event_count, item_started_count, item_completed_count,
+command_execution_count, file_change_item_count y action_evidence_observed.
+Los dos contadores de acciones cuentan IDs únicos de tipos explícitos
+command_execution/file_change, no cada actualización del mismo item. IDs y
+payloads nunca salen del parser. El booleano solo indica presencia estructurada
+de esos items, no éxito del comando ni aceptación. Mensajes y reasoning no cuentan.
+Se exige item.type string e ID no vacío. La validación terminal cerrada existente
+se conserva: eventos superiores desconocidos fallan cerrado, pues no se puede
+determinar si alteran el ciclo terminal. Tipos item desconocidos no aportan
+evidencia de acción. Salida inválida o exit no cero devuelve contadores por defecto,
+no prueba ausencia de acciones; turn.failed válido puede conservar los contadores.
+
+Ayuda local inspeccionada: codex-cli 0.159.0. Confirma '-' como prompt stdin,
+workspace-write, approval never y --ignore-user-config (omite config.toml, no
+anuncia desactivación de herramientas). No anuncia --full-auto; no se establece
+equivalencia ni se cambian flags. No se confirma retroactivamente la versión del
+smoke anterior. Referencia de eventos: https://learn.chatgpt.com/docs/non-interactive-mode
+La referencia oficial describe --full-auto como compatibilidad obsoleta y
+recomienda --sandbox workspace-write; no demuestra una necesidad de cambiar flags.
+
+Estado actual: autenticación local disponible; CLI/argv observados; JSONL se
+precisa como REAL_JSONL_TERMINAL_CONTRACT_OBSERVED. Semántica real de acciones
+pendiente: CODEX_ACTION_EXECUTION_EVIDENCE_UNVERIFIED. Continúan pendientes
+WINDOWS_SANDBOX_UNVERIFIED, NETWORK_ISOLATION_UNVERIFIED,
+WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED para trabajo Builder completo y
+DESCENDANT_PROCESS_CLEANUP_UNVERIFIED (Codex y pruebas). El bloqueo de rutas
+protegidas conserva su resolución Phase A. Codex permanece deshabilitado.

@@ -136,6 +136,37 @@ class CodexAdapterTests(unittest.TestCase):
                 self.assertFalse(result.completed)
                 self.assertEqual(result.failure_category.value, "MALFORMED_OUTPUT")
 
+    def test_turn_only_and_message_have_no_action_evidence(self):
+        for events in ([], [{"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": "PRIVATE_SECRET"}}]):
+            result, _ = self.call(output=jsonl({"type": "turn.started"}, *events, {"type": "turn.completed"}))
+            self.assertTrue(result.completed)
+            self.assertFalse(result.action_evidence_observed)
+            self.assertEqual(result.event_count, 2 + len(events))
+
+    def test_action_counts_are_unique_and_sanitized(self):
+        command = {"id": "PRIVATE_ID", "type": "command_execution", "command": "PRIVATE_COMMAND", "aggregated_output": "PRIVATE_SECRET"}
+        file_item = {"id": "PRIVATE_FILE_ID", "type": "file_change", "changes": [{"path": "PRIVATE_PATH"}]}
+        stream = jsonl({"type": "turn.started"}, {"type": "item.started", "item": command},
+            {"type": "item.updated", "item": command}, {"type": "item.completed", "item": command},
+            {"type": "item.completed", "item": file_item}, {"type": "turn.completed"})
+        result, _ = self.call(output=stream)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.action_evidence_observed)
+        self.assertEqual((result.event_count, result.item_started_count, result.item_completed_count,
+                          result.command_execution_count, result.file_change_item_count), (6, 1, 2, 1, 1))
+        self.assertNotIn("PRIVATE", str(asdict(result)))
+
+    def test_malformed_action_and_failure_after_action(self):
+        for item in ({"type": "command_execution"}, {"id": "", "type": "command_execution"}, {"id": "a", "type": []}):
+            result, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "item.completed", "item": item}, {"type": "turn.completed"}))
+            self.assertEqual(result.failure_category.value, "MALFORMED_OUTPUT")
+        stream = jsonl({"type": "turn.started"}, {"type": "item.completed", "item": {"id": "a", "type": "command_execution"}}, {"type": "turn.failed"})
+        result, _ = self.call(output=stream)
+        self.assertFalse(result.completed)
+        self.assertTrue(result.action_evidence_observed)
+        result, _ = self.call(output=stream, code=1)
+        self.assertEqual(result.failure_category.value, "PROCESS_FAILURE")
+
     def test_failed_terminal_is_unknown_not_capacity_or_auth(self):
         result, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "turn.failed", "error": {"message": "rate limit auth"}}))
         self.assertEqual(result.failure_category.value, "UNKNOWN")
