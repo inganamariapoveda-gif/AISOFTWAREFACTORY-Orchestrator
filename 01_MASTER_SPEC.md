@@ -523,7 +523,9 @@ excepción operacional en este incremento. El alcance exacto de archivos sigue
 requiriendo comprobación del motor; esta tarea no corrige protected_paths.
 
 Bloqueos de activación explícitos:
-- `CODEX_ACTIVATION_BLOCKER_PROTECTED_PATHS`: validar/resolver protección efectiva.
+- `CODEX_ACTIVATION_BLOCKER_PROTECTED_PATHS`: RESOLVED_BY_ENGINE_PROTECTED_PATH_SNAPSHOT_AND_SCOPE_ENFORCEMENT
+  en Phase A; control detectivo durante validación del Orquestador, no aislamiento
+  preventivo del sandbox (ver §21).
 - `CODEX_ACTIVATION_BLOCKER_AUTH_UNVERIFIED`: AUTH_STATE permanece UNKNOWN.
 - Validar sandbox Windows, red, raíces, configuración efectiva y contrato real
   de eventos de la CLI alpha; aún no se ejecutó ningún smoke de modelo real.
@@ -533,3 +535,60 @@ Bloqueos de activación explícitos:
 
 Referencia del mecanismo de configuración CLI:
 https://learn.chatgpt.com/docs/config-file/config-reference
+
+## 21. CODEX-ACTIVATION-001 Phase A: protected_paths
+
+El motor evalúa `PROJECT_RULES.yaml.protected_paths` contra `touched_paths` de
+la evidencia Git existente: cambios, creaciones, eliminaciones, untracked y ambos
+extremos de renombres. Se aplica independientemente del proveedor y antes de
+mandatory tests; también se revalida después de tests y en continuidad/capacidad.
+Protected prevalece sobre authorized_files; forbidden_files mantiene su control
+exacto existente. Una violación bloquea, no alcanza Human Gate ni provoca otro
+modelo automáticamente. No restaura, elimina ni revierte cambios.
+
+Los patrones son relativos a la raíz; se normalizan separadores y se reutiliza
+la validación de rutas de evidencia para rechazar absolutos, drives y traversal.
+Matching de ruta completa: `*`, `?` y clases de fnmatch operan dentro de un
+segmento; `**` como segmento abarca cero o más segmentos. No hay prefijos ni
+directorios implícitos. Comparación sin distinción de casing en Windows; el
+control exacto anterior de Task Packet no cambia. No se recorren archivos para
+resolver patrones ni se leen contenidos para explicar una violación. El motivo
+es fijo y sanitizado. Configuración inválida falla cerrado en la evaluación.
+
+RESOLVED_BY_ENGINE_PROTECTED_PATH_SNAPSHOT_AND_SCOPE_ENFORCEMENT significa
+control DETECTIVO en tiempo de validación del Orquestador. La captura local de
+rutas protegidas complementa Git y cubre archivos ignorados: compara antes y
+después de cada invocación Builder y de la ejecución de mandatory tests nombres
+relativos, tipos y SHA-256 de archivos
+regulares. Un archivo preexistente sin cambios no viola esta comparación.
+Creación, sustitución incluso del mismo tamaño, eliminación y renombres hacia o
+desde protección durante el Builder bloquean antes de mandatory tests; durante
+mandatory tests bloquean antes de Human Gate. Se conserva la
+captura Git posterior; no hay restauración ni llamada correctiva automática.
+
+Las capturas viven solo en memoria; ni contenidos ni hashes se persisten, se
+registran o se envían al modelo. El recorrido queda dentro de la raíz validada,
+sin depender de reglas ignore. Omite .git salvo patrón que lo gobierne; no sigue
+symlinks/reparse points y falla cerrado ante ellos o evaluación insegura. Esta
+limitación conservadora puede bloquear repositorios con enlaces. Los patrones
+continúan procediendo únicamente de PROJECT_RULES.yaml.
+
+Esto no impide intentos de escritura y NO impide lectura de archivos protegidos.
+No constituye aislamiento preventivo de sandbox; la comparación corresponde a
+las ventanas de ejecución Builder y mandatory tests, no a vigilancia permanente
+del filesystem. La captura AFTER BUILDER válida se reutiliza como BEFORE TESTS:
+las comprobaciones intermedias de Git/alcance son de solo lectura. AFTER TESTS se
+captura también ante exit no cero, timeout o error manejado de ejecución. Un fallo
+de prueba no omite esta revisión: una violación protegida prevalece en el motivo
+y en security_review=false, manteniendo los resultados de pruebas sanitizados.
+
+Phase A no activa Codex: developer sigue habilitado y codex_builder deshabilitado.
+Fixtures temporales con datos sintéticos y subprocess mock permiten seleccionar
+Codex sin cambiar configuración canónica; no constituyen smoke real. Phase B
+requiere Human Critical Approval y un repositorio desechable sintético separado.
+
+Permanecen sin resolver CODEX_ACTIVATION_BLOCKER_AUTH_UNVERIFIED,
+WINDOWS_SANDBOX_UNVERIFIED, NETWORK_ISOLATION_UNVERIFIED,
+REAL_JSONL_CONTRACT_UNVERIFIED, REAL_CLI_ARGV_UNVERIFIED,
+WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED y DESCENDANT_PROCESS_CLEANUP_UNVERIFIED.
+AUTH_STATE sigue UNKNOWN.

@@ -5832,6 +5832,233 @@ class HandshakeGovernanceTests(CliFixtureTestCase):
         adapter.assert_not_called()
 
 
+class ProtectedPathMatchingTests(unittest.TestCase):
+    _evidence = ForbiddenFilesUseTouchedPathsTests._evidence
+
+    def test_patterns_and_normalization(self):
+        cases = [("a/b.txt", "a/*.txt", True), ("a/deep/b.txt", "a/*.txt", False),
+                 ("a/deep/b.txt", "a/**/*.txt", True), ("b.txt", "**/b.txt", True),
+                 ("a/b.txt.bak", "a/b.txt", False), ("other/a/b.txt", "a/b.txt", False),
+                 ("a/b.txt", "a\\b.txt", True), ("a\\b.txt", "a/b.txt", True),
+                 ("a/file1.txt", "a/file?.txt", True)]
+        for path, pattern, blocked in cases:
+            with self.subTest(path=path, pattern=pattern):
+                ok, _ = app._evaluate_scope_security(self._evidence(changed_paths=(path,)),
+                    forbidden_files=(), protected_paths=[pattern])
+                self.assertEqual(ok, not blocked)
+
+    def test_windows_case_comparison(self):
+        with mock.patch.object(app.sys, "platform", "win32"):
+            self.assertTrue(app._protected_path_matches("A/File.TXT", "a/file.txt"))
+
+    def test_invalid_patterns_and_traversal_fail_closed(self):
+        for patterns in (["../x"], ["a/../x"], ["C:/x"], ["/x"], [""], [None], "x"):
+            ok, reason = app._evaluate_scope_security(self._evidence(changed_paths=("x",)),
+                forbidden_files=(), protected_paths=patterns)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "invalid protected-path configuration or evidence")
+        ok, _ = app._evaluate_scope_security(self._evidence(changed_paths=("../x",)),
+            forbidden_files=(), protected_paths=["x"])
+        self.assertFalse(ok)
+
+    def test_all_git_change_categories_protected(self):
+        for paths in ({"changed_paths": ("x",)}, {"created_paths": ("x",)},
+                      {"deleted_paths": ("x",)}, {"untracked_paths": ("x",)},
+                      {"renamed_paths": (("x", "y"),)}, {"renamed_paths": (("y", "x"),)}):
+            ok, reason = app._evaluate_scope_security(self._evidence(**paths),
+                forbidden_files=(), protected_paths=["x"])
+            self.assertFalse(ok)
+            self.assertEqual(reason, "project protected path changed")
+
+
+class ProtectedPathFlowTests(PersistedExecutionTestCase):
+    def post_test_edit(self, edit, *, outcome=0, blocked=True):
+        developer = self.developer_completes()
+        def test_command(args, **kwargs):
+            edit()
+            if isinstance(outcome, Exception):
+                raise outcome
+            return subprocess.CompletedProcess(args, outcome, "", "")
+        test = mock.MagicMock(side_effect=test_command)
+        rc, report, _ = self.run_task(developer=developer, test=test)
+        provider = self.codex_process if hasattr(self, "codex_process") else developer
+        provider.assert_called_once()
+        test.assert_called_once()
+        if blocked:
+            self.assertEqual((rc, report["state"], self.task()["status"]), (1, "BLOCKED", "BLOCKED"))
+            self.assertFalse(report["security_review"])
+            self.assertFalse(report["post_test_evidence_passed"])
+            self.assertIn("protected path changed during mandatory tests", report["reason"])
+            self.assertNotIn("HUMAN_GATE", [e["to_status"] for e in self.history()])
+        else:
+            self.assertEqual((rc, report["state"]), (0, "HUMAN_GATE"))
+        public = json.dumps(report) + self.dump_db()
+        for marker in ("PRIVATE_FILE_CONTENT_A", "PRIVATE_FILE_CONTENT_B", "PRIVATE_FILE_CONTENT_LONGER"):
+            self.assertNotIn(marker, public)
+            self.assertNotIn(hashlib.sha256(marker.encode()).hexdigest(), public)
+        return report
+
+    def test_post_test_ignored_create_blocks(self):
+        path = self.ignored_fixture(existing=False, allowed=True)
+        self.post_test_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT_A"))
+        self.assertTrue(path.exists())
+        self.assertEqual(_git("ls-files", "--", ".env", cwd=self.taskexec_repo).stdout.strip(), "")
+
+    def test_post_test_ignored_modified_blocks(self):
+        path = self.ignored_fixture()
+        self.post_test_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT_LONGER"))
+        self.assertEqual(path.read_text(), "PRIVATE_FILE_CONTENT_LONGER")
+
+    def test_post_test_same_size_failed_test_blocks(self):
+        path = self.ignored_fixture()
+        report = self.post_test_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT_B"), outcome=1)
+        self.assertEqual(report["mandatory_test_results"][0]["result"], "FAIL")
+        self.assertEqual(path.read_text(), "PRIVATE_FILE_CONTENT_B")
+
+    def test_post_test_delete_timeout_blocks(self):
+        path = self.ignored_fixture()
+        self.post_test_edit(path.unlink, outcome=subprocess.TimeoutExpired("synthetic", 1))
+        self.assertFalse(path.exists())
+
+    def test_post_test_handled_error_mutation_blocks(self):
+        path = self.ignored_fixture()
+        self.post_test_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT_B"),
+                            outcome=app.test_runner_mod.TestRunnerError("synthetic handled error"))
+
+    def test_post_test_unchanged_ignored_protected_passes(self):
+        self.ignored_fixture()
+        self.post_test_edit(lambda: None, blocked=False)
+
+    def test_post_test_nonprotected_ignored_edit_passes(self):
+        self.ignored_fixture()
+        self.post_test_edit(lambda: (self.taskexec_repo / "cache.tmp").write_text("synthetic"), blocked=False)
+
+    def ignored_fixture(self, *, existing=True, allowed=False):
+        (self.taskexec_repo / ".gitignore").write_text(".env\ncache.tmp\nnested/\n", encoding="utf-8")
+        _git("add", ".gitignore", cwd=self.taskexec_repo)
+        _git("commit", "-m", "synthetic ignore fixture", cwd=self.taskexec_repo)
+        self._write_taskexec_packet(mandatory_tests=["unit"],
+            authorized_files=["allowed.txt", ".env"] if allowed else ["allowed.txt"])
+        self.protect(["**/.env*"])
+        path = self.taskexec_repo / ".env"
+        if existing:
+            path.write_text("PRIVATE_FILE_CONTENT_A", encoding="utf-8")
+        return path
+
+    def test_ignored_protected_unchanged_and_nonprotected_ignored_edit_pass(self):
+        self.ignored_fixture()
+        rc, result, tests = self.run_edit(lambda: (self.taskexec_repo / "cache.tmp").write_text("synthetic"))
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        tests.assert_called_once()
+
+    def test_ignored_protected_creation_blocks_even_allowed(self):
+        path = self.ignored_fixture(existing=False, allowed=True)
+        self.assert_protected(self.run_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT")))
+        self.assertTrue(path.exists())
+        self.assertEqual(_git("ls-files", "--", ".env", cwd=self.taskexec_repo).stdout.strip(), "")
+
+    def test_ignored_same_size_replacement_blocks(self):
+        path = self.ignored_fixture()
+        self.assert_protected(self.run_edit(lambda: path.write_text("PRIVATE_FILE_CONTENT_B")))
+        self.assertEqual(path.read_text(), "PRIVATE_FILE_CONTENT_B")
+
+    def test_ignored_protected_deletion_blocks(self):
+        path = self.ignored_fixture()
+        self.assert_protected(self.run_edit(path.unlink))
+        self.assertFalse(path.exists())
+
+    def test_ignored_nested_rename_into_protection_blocks(self):
+        self.ignored_fixture(existing=False)
+        directory = self.taskexec_repo / "nested"
+        directory.mkdir()
+        source = directory / "normal.txt"
+        source.write_text("PRIVATE_FILE_CONTENT")
+        self.assert_protected(self.run_edit(lambda: source.rename(directory / ".env")))
+
+    def test_ignored_rename_out_of_protection_blocks(self):
+        path = self.ignored_fixture()
+        self.assert_protected(self.run_edit(lambda: path.rename(self.taskexec_repo / "cache.tmp")))
+
+    def test_snapshot_link_rejection_never_reads_target(self):
+        self.protect(["**/.env*"])
+        directory = self.taskexec_repo / "linked"
+        directory.mkdir()
+        original = app.sandbox_mod._is_link_like
+        def is_link(path):
+            return Path(path) == directory or original(path)
+        with mock.patch.object(app.sandbox_mod, "_is_link_like", side_effect=is_link), \
+                mock.patch.object(app.os, "open", side_effect=AssertionError("must not read target")):
+            with self.assertRaisesRegex(app.EvidenceError, "^protected-path snapshot unavailable$"):
+                app._capture_protected_paths(self.taskexec_repo, ["**/.env*"])
+
+    def protect(self, patterns):
+        data = yaml.safe_load(self.rules_path.read_text(encoding="utf-8"))
+        data["protected_paths"] = patterns
+        _write_yaml(self.rules_path, data)
+
+    def run_edit(self, edit):
+        developer = self.developer_completes(on_run=edit)
+        if hasattr(self, "codex_process"):
+            original = self.codex_success
+            def launch(args, **kwargs):
+                edit()
+                return original(args, **kwargs)
+            self.codex_process.side_effect = launch
+        rc, result, tests = self.run_task(developer=developer)
+        self.assertTrue((self.codex_process if hasattr(self, "codex_process") else developer).called, result)
+        (self.codex_process if hasattr(self, "codex_process") else developer).assert_called_once()
+        return rc, result, tests
+
+    def assert_protected(self, result):
+        rc, report, tests = result
+        self.assertEqual((rc, report["state"]), (1, "BLOCKED"))
+        self.assertEqual(self.task()["status"], "BLOCKED")
+        self.assertNotIn("HUMAN_GATE", [event["to_status"] for event in self.history()])
+        self.assertFalse(report["security_review"])
+        self.assertNotIn("PRIVATE_FILE_CONTENT", json.dumps(report) + self.dump_db())
+        tests.assert_not_called()
+
+    def test_allowed_existing_protected_edit_blocks_without_revert(self):
+        self.protect(["allowed.txt"])
+        head = self.head()
+        self.assert_protected(self.run_edit(lambda: None))
+        self.assertEqual((self.taskexec_repo / "allowed.txt").read_text(), "AFTER")
+        self.assertEqual(self.head(), head)
+
+    def test_new_nested_protected_file_blocks(self):
+        name = "vault/nested/private.txt"
+        self._write_taskexec_packet(mandatory_tests=["unit"], authorized_files=["allowed.txt", name])
+        self.protect(["vault/**/*.txt"])
+        def edit():
+            path = self.taskexec_repo / name
+            path.parent.mkdir(parents=True)
+            path.write_text("PRIVATE_FILE_CONTENT", encoding="utf-8")
+        self.assert_protected(self.run_edit(edit))
+        self.assertEqual((self.taskexec_repo / name).read_text(), "PRIVATE_FILE_CONTENT")
+
+    def test_deleted_protected_file_blocks_without_restore(self):
+        path = self.taskexec_repo / "protected.txt"
+        path.write_text("PRIVATE_FILE_CONTENT", encoding="utf-8")
+        _git("add", "protected.txt", cwd=self.taskexec_repo)
+        _git("commit", "-m", "synthetic protected fixture", cwd=self.taskexec_repo)
+        self._write_taskexec_packet(mandatory_tests=["unit"], authorized_files=["allowed.txt", "protected.txt"])
+        self.protect(["protected.txt"])
+        self.assert_protected(self.run_edit(path.unlink))
+        self.assertFalse(path.exists())
+
+    def test_similar_nonmatching_path_reaches_gate(self):
+        self.protect(["allowed.txt.bak", "other/**"])
+        rc, result, tests = self.run_edit(lambda: None)
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        tests.assert_called_once()
+
+    def test_forbidden_files_still_block(self):
+        self.protect([])
+        rc, result, tests = self.run_edit(lambda: (self.taskexec_repo / "untouched.txt").write_text("PRIVATE_FILE_CONTENT"))
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        tests.assert_not_called()
+
+
 class CodexDispatchTests(PersistedExecutionTestCase):
     def setUp(self):
         super().setUp()
@@ -5974,3 +6201,18 @@ class CodexDispatchTests(PersistedExecutionTestCase):
                 self.assertNotEqual(self.run_cli(command), 0)
         self.codex_process.assert_not_called()
         self.assertFalse(self.db_path.exists())
+
+
+class CodexProtectedPathFlowTests(ProtectedPathFlowTests):
+    patched_subprocess = CodexDispatchTests.patched_subprocess
+    codex_success = CodexDispatchTests.codex_success
+
+    def setUp(self):
+        super().setUp()
+        from tests.test_codex_adapter import codex_agent
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["developer"]["enabled"] = False
+        data["agents"]["codex_builder"] = codex_agent()
+        _write_yaml(path, data)
+        self.codex_process = mock.MagicMock(side_effect=self.codex_success)

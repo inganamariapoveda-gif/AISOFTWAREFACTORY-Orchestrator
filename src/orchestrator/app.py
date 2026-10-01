@@ -8,8 +8,11 @@ transición de estado y consultar su historial.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
+import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -463,10 +466,91 @@ def cmd_task_packet_probe(args: argparse.Namespace) -> int:
     return 0 if instruction_deterministic else 1
 
 
+def _protected_path_matches(path: str, pattern: str) -> bool:
+    """Whole relative path; * and ? stay in a segment, ** spans segments.
+
+    No filesystem traversal. Keep Python 3.10 compatibility and use stdlib
+    fnmatchcase for each segment. Windows comparisons are case-insensitive.
+    """
+    if sys.platform == "win32":
+        path, pattern = path.casefold(), pattern.casefold()
+    parts, patterns = path.split("/"), pattern.split("/")
+    reachable = {0}
+    for component in patterns:
+        if component == "**":
+            reachable = set(range(min(reachable), len(parts) + 1)) if reachable else set()
+        else:
+            reachable = {index + 1 for index in reachable
+                         if index < len(parts) and fnmatch.fnmatchcase(parts[index], component)}
+    return len(parts) in reachable
+
+
+def _capture_protected_paths(root: Path, patterns: list[str]) -> dict[str, tuple]:
+    """Ephemeral security metadata, independent of Git ignore rules.
+
+    Never follows links/reparse points. Such entries fail closed because their
+    descendants cannot be safely evaluated by this bounded local walk.
+    """
+    try:
+        if not isinstance(patterns, list) or any(not isinstance(p, str) for p in patterns):
+            raise ValueError
+        normalized = evidence_mod._normalize_allowed_paths([p.replace("\\", "/") for p in patterns])
+        if not normalized:
+            return {}
+        root = evidence_mod._validate_repo_root(root, root)
+        snapshot: dict[str, tuple] = {}
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            if sandbox_mod._is_link_like(directory) or evidence_mod._is_reparse_point(directory):
+                raise ValueError
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            for entry in children:
+                path = Path(entry.path)
+                relative = path.relative_to(root).as_posix()
+                if relative == ".git" and not any(
+                    p.startswith(".git/") or _protected_path_matches(".git", p) for p in normalized
+                ):
+                    continue
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise ValueError
+                matches = any(_protected_path_matches(relative, p) for p in normalized)
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+                    if matches:
+                        snapshot[relative] = ("directory",)
+                elif matches:
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ValueError
+                    digest = hashlib.sha256()
+                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    with os.fdopen(os.open(path, flags), "rb") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                            raise ValueError
+                        for chunk in iter(lambda: handle.read(65536), b""):
+                            digest.update(chunk)
+                        after = os.fstat(handle.fileno())
+                    final = path.lstat()
+                    if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
+                        after.st_size, after.st_mtime_ns, after.st_ctime_ns
+                    ) or (final.st_dev, final.st_ino, final.st_mode) != (
+                        info.st_dev, info.st_ino, info.st_mode
+                    ):
+                        raise ValueError
+                    snapshot[relative] = ("file", digest.hexdigest())
+        return snapshot
+    except (OSError, ValueError, EvidenceError):
+        raise EvidenceError("protected-path snapshot unavailable") from None
+
+
 def _evaluate_scope_security(
     change_evidence: evidence_mod.GitChangeEvidence,
     *,
     forbidden_files: tuple[str, ...],
+    protected_paths: list[str] | tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """TASK-EXECUTION-002/CORRECTION-001: evalúa (HEAD unchanged + scope) +
     forbidden_files a partir de una captura de evidencia dada. Reutilizada
@@ -483,6 +567,23 @@ def _evaluate_scope_security(
         return False, evidence_result.reason
     if forbidden_violations:
         return False, f"forbidden file(s) modified: {forbidden_violations}"
+    try:
+        if not isinstance(protected_paths, (list, tuple)) or any(
+            not isinstance(pattern, str) for pattern in protected_paths
+        ):
+            raise EvidenceError("invalid protected paths")
+        # Reuse existing relative-path/traversal validation; normalize Windows
+        # separators before matching. Never inspect protected file contents.
+        patterns = evidence_mod._normalize_allowed_paths(
+            [pattern.replace("\\", "/") for pattern in protected_paths]
+        )
+        paths = evidence_mod._normalize_allowed_paths(
+            [path.replace("\\", "/") for path in change_evidence.touched_paths]
+        )
+    except EvidenceError:
+        return False, "invalid protected-path configuration or evidence"
+    if any(_protected_path_matches(path, pattern) for path in paths for pattern in patterns):
+        return False, "project protected path changed"
     return True, "all checks passed"
 
 
@@ -668,6 +769,12 @@ def execute_task_packet(
         if run_id is None:
             return _blocked("resource budget exhausted", resource_budget_reason="resource budget exhausted")
     try:
+        protected_before = _capture_protected_paths(project_root, project_rules["protected_paths"])
+    except EvidenceError:
+        if run_id is not None:
+            budget_store.complete_agent_run(run_id, state="FAILED")
+        return _blocked("protected-path snapshot unavailable before Builder")
+    try:
         if resolved_config["adapter"] == "claude_code_cli":
             run_developer_task(
                 developer_config=developer_config,
@@ -688,6 +795,11 @@ def execute_task_packet(
     except (DeveloperExecutionError, CodexExecutionError) as exc:
         if run_id is not None:
             budget_store.complete_agent_run(run_id, state="FAILED")
+        try:
+            protected_after = _capture_protected_paths(project_root, project_rules["protected_paths"])
+            protected_reason = "project protected path changed" if protected_after != protected_before else None
+        except EvidenceError:
+            protected_reason = "protected-path snapshot unavailable after Builder"
         # TASK-EXECUTION-004: Claude fue REALMENTE invocado y falló
         # (DeveloperExecutionError). Nunca asumir que no hubo
         # modificaciones: run_developer_task puede fallar DESPUÉS de que
@@ -739,6 +851,8 @@ def execute_task_packet(
             **_git_path_report(post_failure_change_evidence),
         }
         reason = f"developer execution failed: {exc}; post-failure Git evidence captured"
+        if protected_reason:
+            return _blocked(protected_reason, security_review=False, **blocked_fields)
 
         # CAPACITY-RESUME-EXECUTION-002: SOLO CLAUDE_TEMPORARY_LIMIT, con
         # evidencia Git válida, puede pasar por el hook (que decide con el
@@ -749,7 +863,8 @@ def execute_task_packet(
             and exc.category is ClaudeFailureCategory.CLAUDE_TEMPORARY_LIMIT
         ):
             scope_ok, _scope_reason = _evaluate_scope_security(
-                post_failure_change_evidence, forbidden_files=packet.forbidden_files
+                post_failure_change_evidence, forbidden_files=packet.forbidden_files,
+                protected_paths=project_rules["protected_paths"],
             )
             waiting_fields = capacity_hook(
                 CapacityFailure(
@@ -765,8 +880,13 @@ def execute_task_packet(
                 blocked_fields.update(waiting_fields)
         return _blocked(reason, **blocked_fields)
 
+    try:
+        protected_after = _capture_protected_paths(project_root, project_rules["protected_paths"])
+        protected_reason = "project protected path changed" if protected_after != protected_before else None
+    except EvidenceError:
+        protected_reason = "protected-path snapshot unavailable after Builder"
     if run_id is not None:
-        budget_store.complete_agent_run(run_id, state="SUCCEEDED")
+        budget_store.complete_agent_run(run_id, state="FAILED" if protected_reason else "SUCCEEDED")
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
     # (HEAD unchanged, scope, forbidden_files). Debe pasar ANTES de
@@ -779,7 +899,8 @@ def execute_task_packet(
         return _blocked(f"git PRE-TEST evidence failed: {exc}", developer_completed=True)
 
     pre_test_security_review, pre_test_reason = _evaluate_scope_security(
-        pre_test_change_evidence, forbidden_files=packet.forbidden_files
+        pre_test_change_evidence, forbidden_files=packet.forbidden_files,
+        protected_paths=project_rules["protected_paths"],
     )
 
     common_fields = {
@@ -788,9 +909,9 @@ def execute_task_packet(
         **_git_path_report(pre_test_change_evidence),
     }
 
-    if not pre_test_security_review:
+    if protected_reason or not pre_test_security_review:
         return _blocked(
-            pre_test_reason,
+            protected_reason or pre_test_reason,
             security_review=False,
             pre_test_evidence_passed=False,
             **common_fields,
@@ -803,6 +924,9 @@ def execute_task_packet(
     # (nunca sobrescritos por iteración; un test no ejecutado no aparece).
     # Solo test_id/result/exit_code: nunca stdout, stderr, argv ni entorno.
     mandatory_test_results: list[dict[str, Any]] = []
+    # Intervening Git evidence/scope checks are read-only: reuse AFTER BUILDER.
+    protected_before_tests = protected_after
+    mandatory_failure_reason = None
     for test_id in packet.mandatory_tests:
         try:
             test_result = test_runner_mod.run_mandatory_test(
@@ -816,13 +940,8 @@ def execute_task_packet(
             mandatory_test_results.append(
                 {"test_id": test_id, "result": "ERROR", "exit_code": None}
             )
-            return _blocked(
-                f"mandatory test resolution/execution failed: {exc}",
-                security_review=pre_test_security_review,
-                pre_test_evidence_passed=True,
-                mandatory_test_results=mandatory_test_results,
-                **common_fields,
-            )
+            mandatory_failure_reason = f"mandatory test resolution/execution failed: {exc}"
+            break
         mandatory_test_results.append(
             {
                 "test_id": test_result.test_id,
@@ -831,13 +950,18 @@ def execute_task_packet(
             }
         )
         if not test_result.success:
-            return _blocked(
-                f"mandatory test {test_id!r} failed",
-                security_review=pre_test_security_review,
-                pre_test_evidence_passed=True,
-                mandatory_test_results=mandatory_test_results,
-                **common_fields,
-            )
+            mandatory_failure_reason = f"mandatory test {test_id!r} failed"
+            break
+
+    # Always inspect the test window, including nonzero/timeout/handled errors.
+    try:
+        protected_after_tests = _capture_protected_paths(project_root, project_rules["protected_paths"])
+        protected_test_reason = (
+            "project protected path changed during mandatory tests"
+            if protected_after_tests != protected_before_tests else None
+        )
+    except EvidenceError:
+        protected_test_reason = "protected-path snapshot unavailable after mandatory tests"
 
     # CORRECTION-001 (SECURITY_REVIEW: CHANGES_REQUESTED): un mandatory
     # test preautorizado puede retornar exit code 0 y aun así mutar el
@@ -854,14 +978,15 @@ def execute_task_packet(
         )
     except EvidenceError as exc:
         return _blocked(
-            f"git POST-TEST evidence failed: {exc}",
+            protected_test_reason or f"git POST-TEST evidence failed: {exc}",
             developer_completed=True,
             pre_test_evidence_passed=True,
             mandatory_test_results=mandatory_test_results,
         )
 
     post_test_security_review, post_test_reason = _evaluate_scope_security(
-        post_test_change_evidence, forbidden_files=packet.forbidden_files
+        post_test_change_evidence, forbidden_files=packet.forbidden_files,
+        protected_paths=project_rules["protected_paths"],
     )
 
     # El resultado final (changed_paths/out_of_scope_paths/head_unchanged)
@@ -874,12 +999,21 @@ def execute_task_packet(
         **_git_path_report(post_test_change_evidence),
     }
 
-    if not post_test_security_review:
+    if protected_test_reason or not post_test_security_review:
         return _blocked(
-            post_test_reason,
+            protected_test_reason or post_test_reason,
             security_review=False,
             pre_test_evidence_passed=True,
             post_test_evidence_passed=False,
+            mandatory_test_results=mandatory_test_results,
+            **common_fields,
+        )
+
+    if mandatory_failure_reason:
+        return _blocked(
+            mandatory_failure_reason,
+            security_review=post_test_security_review,
+            pre_test_evidence_passed=True,
             mandatory_test_results=mandatory_test_results,
             **common_fields,
         )
@@ -1545,7 +1679,8 @@ def _execute_claimed_resume(
     # Scope/security desde el baseline ORIGINAL (acumulado sobre la tarea).
     change = evidence_mod.capture_change_evidence(before, packet.authorized_files)
     scope_ok, _scope_reason = _evaluate_scope_security(
-        change, forbidden_files=packet.forbidden_files
+        change, forbidden_files=packet.forbidden_files,
+        protected_paths=project_rules["protected_paths"],
     )
     if not scope_ok:
         raise _ResumeBlocked(_REASON_SCOPE_INVALID)
