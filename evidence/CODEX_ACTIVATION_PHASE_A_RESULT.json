@@ -1,0 +1,120 @@
+{
+  "task_id": "CODEX-ACTIVATION-001-PHASE-A",
+  "final_state": "TECH_APPROVED",
+  "implementation_result": "PASS",
+  "correction_attempts_used": 2,
+  "implementation_commit": "6c5b3dc4d35bd81f120ef08d6c2baf11b6e0bc90",
+  "resolved_activation_blockers": [
+    "CODEX_ACTIVATION_BLOCKER_PROTECTED_PATHS"
+  ],
+  "protected_paths": {
+    "source": "PROJECT_RULES.yaml",
+    "builder_window_enforced": true,
+    "mandatory_test_window_enforced": true,
+    "git_ignored_paths_covered": true,
+    "same_size_content_changes_detected": true,
+    "allowed_files_override": false,
+    "forbidden_files_preserved": true,
+    "detective_control": true,
+    "preventive_sandbox_control": false,
+    "read_isolation": false,
+    "blocker_resolution": "RESOLVED_BY_ENGINE_PROTECTED_PATH_SNAPSHOT_AND_SCOPE_ENFORCEMENT",
+    "permanent_descendant_monitoring": false
+  },
+  "tests": {
+    "phase_a_initial": {
+      "focused": {
+        "total": 16,
+        "passed": 16
+      },
+      "affected": {
+        "total": 189,
+        "passed": 189
+      },
+      "full": {
+        "total": 1028,
+        "passed": 1028
+      }
+    },
+    "correction_001": {
+      "focused": {
+        "total": 30,
+        "passed": 30
+      },
+      "affected": {
+        "total": 65,
+        "passed": 65
+      },
+      "full": {
+        "total": 1042,
+        "passed": 1042
+      }
+    },
+    "correction_002": {
+      "focused": {
+        "total": 42,
+        "passed": 42
+      },
+      "affected": {
+        "total": 36,
+        "passed": 36
+      },
+      "full": {
+        "total": 1056,
+        "passed": 1056,
+        "failed": 0,
+        "errors": 0,
+        "duration_seconds": 841.02,
+        "exit_code": 0
+      }
+    },
+    "independent_final": {
+      "total": 79,
+      "passed": 79,
+      "failed": 0,
+      "errors": 0,
+      "exit_code": 0,
+      "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+      "provenance": "Director-provided PHASE-A CLOSE-AND-COMMIT authorization"
+    },
+    "rerun_during_closure": false
+  },
+  "p1_status": "RESOLVED",
+  "accepted_nonblocking_findings": [
+    "P-2",
+    "P-OBS-2",
+    "P-OBS-3",
+    "P-OBS-4",
+    "P1-OBS-1",
+    "P1-OBS-2"
+  ],
+  "accepted_finding_details": {
+    "P-2": "Broad fail-closed symlink/reparse-point policy.",
+    "P-OBS-2": "Pre-Builder snapshot failure may consume budget with zero model calls.",
+    "P-OBS-3": "x/** may match x because ** spans zero segments.",
+    "P-OBS-4": "Permission/mode-only protected changes are not detected.",
+    "P1-OBS-1": "Detached child processes can mutate after point-in-time snapshots; descendant cleanup remains an activation blocker for both Codex and mandatory-test descendants.",
+    "P1-OBS-2": "Failed mandatory tests now reach post-test Git/security evaluation before final failure reason selection; fail-closed behavior is preserved."
+  },
+  "remaining_activation_blockers": [
+    "CODEX_ACTIVATION_BLOCKER_AUTH_UNVERIFIED",
+    "WINDOWS_SANDBOX_UNVERIFIED",
+    "NETWORK_ISOLATION_UNVERIFIED",
+    "REAL_JSONL_CONTRACT_UNVERIFIED",
+    "REAL_CLI_ARGV_UNVERIFIED",
+    "WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED",
+    "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED"
+  ],
+  "descendant_cleanup_scope": [
+    "Codex process descendants",
+    "mandatory-test process descendants"
+  ],
+  "authentication_state": "UNKNOWN",
+  "codex_builder_enabled": false,
+  "developer_enabled": true,
+  "human_gate": {
+    "required_for_phase_a_closure": false,
+    "next_gate": "HUMAN_CRITICAL_APPROVAL",
+    "purpose": "authorize first real Codex smoke test in disposable repository"
+  }
+}
