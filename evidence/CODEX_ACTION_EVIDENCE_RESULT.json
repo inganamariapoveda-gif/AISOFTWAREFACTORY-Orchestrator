@@ -1,0 +1,90 @@
+{
+  "task_id": "CODEX-ACTION-EVIDENCE",
+  "final_state": "TECH_APPROVED",
+  "implementation_result": "PASS",
+  "implementation_commit": "248d05164da2c73e59eeed1f4fb83827485af7f1",
+  "first_real_smoke": {
+    "authentication": "READY",
+    "process_launched": true,
+    "return_code": 0,
+    "terminal_event": "turn.completed",
+    "workspace_action_demonstrated": false,
+    "outside_probe_demonstrated": false,
+    "network_probe_demonstrated": false,
+    "descendant_probe_demonstrated": false,
+    "root_cause": "UNDETERMINED",
+    "raw_jsonl_retained": false,
+    "raw_stderr_retained": false
+  },
+  "telemetry": {
+    "event_count": "supported",
+    "item_started_count": "supported",
+    "item_completed_count": "supported",
+    "command_execution_count": "supported",
+    "file_change_item_count": "supported",
+    "action_evidence_observed": "supported",
+    "raw_payloads_returned": false,
+    "ids_returned": false
+  },
+  "success_semantics": {
+    "adapter_turn_completed_only": true,
+    "implementation_success_implied": false,
+    "action_evidence_implies_attempt_only": true
+  },
+  "tests": {
+    "focused": {
+      "total": 18,
+      "passed": 18
+    },
+    "affected": {
+      "total": 10,
+      "passed": 10
+    },
+    "full": {
+      "total": 1060,
+      "passed": 1060,
+      "failed": 0,
+      "errors": 0,
+      "duration_seconds": 1078.306,
+      "exit_code": 0
+    },
+    "independent": {
+      "total": 28,
+      "passed": 28,
+      "failed": 0,
+      "errors": 0,
+      "exit_code": 0,
+      "result": "PASS_WITH_NONBLOCKING_OBSERVATIONS",
+      "provenance": "Director-provided ACTION-EVIDENCE-CLOSE-AND-COMMIT authorization"
+    },
+    "rerun_during_closure": false
+  },
+  "accepted_nonblocking_observations": [
+    "AE-1",
+    "AE-2",
+    "AE-3"
+  ],
+  "accepted_observation_details": {
+    "AE-1": "Telemetry currently lives only on CodexResult; execute_task_packet does not surface it. The next authorized controlled smoke will call the adapter directly and inspect its sanitized result. Operational propagation may be considered later only if needed.",
+    "AE-2": "Action evidence records presence/attempt, not successful command status.",
+    "AE-3": "Missing/non-string item.type fails closed as MALFORMED_OUTPUT."
+  },
+  "remaining_activation_blockers": [
+    "CODEX_ACTION_EXECUTION_EVIDENCE_UNVERIFIED",
+    "WINDOWS_SANDBOX_UNVERIFIED",
+    "NETWORK_ISOLATION_UNVERIFIED",
+    "WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED",
+    "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED"
+  ],
+  "observed_activation_facts": {
+    "existing_local_authentication_available": true,
+    "real_cli_invocation_accepted": true,
+    "real_terminal_jsonl_contract_observed": true,
+    "protected_path_engine_enforcement_resolved": true,
+    "action_evidence_resolved_by_telemetry_implementation": false
+  },
+  "codex_builder_enabled": false,
+  "developer_enabled": true,
+  "next_gate": "HUMAN_CRITICAL_APPROVAL",
+  "next_gate_purpose": "authorize one additional real controlled Codex smoke after telemetry was added"
+}
