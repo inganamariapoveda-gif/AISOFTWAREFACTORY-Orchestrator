@@ -58,6 +58,7 @@ class LauncherFlowTests(unittest.TestCase):
             "host_context": "NORMAL_USER", "interpreter_ok": True,
             "dependencies": (self.adapter, self.loader), "baseline": self.config,
             "codex_preflight": None,
+            "windows_backend_preflight": "PASS",
             "resolve_codex_executable": (str(Path("PRIVATE_CODEX.exe").absolute()), "FILTERED_PATH"),
             "system_preflight": None, "parent_done": "CREATED",
             "instruction": "BOUNDED_SYNTHETIC_INSTRUCTION",
@@ -167,6 +168,23 @@ class LauncherFlowTests(unittest.TestCase):
             self.assertEqual(report["codex_executable_resolution"],
                              "AMBIGUOUS" if code.endswith("AMBIGUOUS") else "FAILED")
             self.mocks["codex_preflight"].assert_not_called()
+
+    def test_backend_preflight_failure_never_consumes_model(self):
+        self.mocks["windows_backend_preflight"].side_effect = smoke.Stop("WINDOWS_SANDBOX_BACKEND_PREFLIGHT_FAILED")
+        report = self.assert_blocked()
+        self.assertFalse(report["invocation_consumed"])
+        self.assertEqual(report["windows_sandbox_backend_preflight"], "FAIL")
+        self.mocks["create_resources"].assert_not_called()
+        self.mocks["windows_backend_preflight"].assert_called_once()
+
+    def test_backend_pass_precedes_resources_and_model_consumption(self):
+        self.mocks["create_resources"].side_effect = smoke.Stop("RESOURCE_STOP")
+        report = self.assert_blocked()
+        self.assertFalse(report["invocation_consumed"])
+        self.assertEqual(report["windows_sandbox_backend_preflight"], "PASS")
+        selected = self.mocks["resolve_codex_executable"].return_value[0]
+        self.assertIs(self.mocks["windows_backend_preflight"].call_args.args[0], selected)
+        self.mocks["create_resources"].assert_called_once()
 
     def test_schema_diagnostics_do_not_authorize_unmatched_commands(self):
         observed = result()
@@ -761,6 +779,52 @@ class NetworkLogicTests(unittest.TestCase):
                 self.assertEqual(process.returncode, 0)
                 self.assertEqual(process.stdout.strip(), str(calls))
                 self.assertEqual((workspace / "network_probe_result.txt").read_text(), expected)
+
+
+class WindowsBackendPreflightTests(unittest.TestCase):
+    def test_not_applicable_creates_nothing(self):
+        with mock.patch.object(smoke.tempfile, "mkdtemp") as create, mock.patch.object(smoke.subprocess, "run") as process:
+            self.assertEqual(smoke.windows_backend_preflight("unused", {}, [], []), "NOT_APPLICABLE")
+        create.assert_not_called()
+        process.assert_not_called()
+
+    def test_fixed_control_exact_binding_output_and_owned_cleanup(self):
+        executable = str(Path("PRIVATE_CODEX.exe").absolute())
+        backend = ["-c", 'windows.sandbox="unelevated"']
+        env = {"SYSTEMROOT": "C:/Windows"}
+        cases = ((0, "CODEX_BACKEND_PREFLIGHT_OK\r\n", None, True),
+                 (1, "CODEX_BACKEND_PREFLIGHT_OK", None, False),
+                 (0, "wrong", None, False),
+                 (0, "prefix CODEX_BACKEND_PREFLIGHT_OK", None, False),
+                 (0, "", OSError("PRIVATE_PATH"), False),
+                 (0, "", subprocess.TimeoutExpired("PRIVATE_COMMAND", 60), False))
+        with tempfile.TemporaryDirectory() as parent:
+            for code, stdout, error, success in cases:
+                owned = []
+                with mock.patch.object(smoke.tempfile, "gettempdir", return_value=parent), mock.patch.object(
+                    smoke, "no_reparse"), mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+                    smoke.subprocess, "run", side_effect=error,
+                    return_value=subprocess.CompletedProcess([], code, stdout, "PRIVATE_STDERR")
+                ) as process:
+                    if success:
+                        self.assertEqual(smoke.windows_backend_preflight(executable, env, owned, backend), "PASS")
+                    else:
+                        with self.assertRaisesRegex(smoke.Stop, "^WINDOWS_SANDBOX_BACKEND_PREFLIGHT_FAILED$"):
+                            smoke.windows_backend_preflight(executable, env, owned, backend)
+                process.assert_called_once()
+                argv = process.call_args.args[0]
+                self.assertIs(argv[0], executable)
+                self.assertEqual(argv[1:6], backend + ["sandbox", "-P", ":workspace"])
+                self.assertNotIn("exec", argv)
+                self.assertEqual(argv[-4:], ["/d", "/c", "echo", "CODEX_BACKEND_PREFLIGHT_OK"])
+                self.assertEqual(argv.count(backend[1]), 1)
+                self.assertIs(process.call_args.kwargs["env"], env)
+                self.assertFalse(process.call_args.kwargs["shell"])
+                self.assertEqual(process.call_args.kwargs["timeout"], 60)
+                self.assertEqual(len(owned), 1)
+                self.assertEqual(owned[0].kind, "backend")
+                self.assertTrue(owned[0].path.is_relative_to(Path(parent)))
+                self.assertEqual(smoke.cleanup(owned), "COMPLETE")
 
 
 class ExecutableResolutionTests(unittest.TestCase):

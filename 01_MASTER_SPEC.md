@@ -792,3 +792,32 @@ BOUNDED_WINDOWS_INSTALLATION, FAILED o AMBIGUOUS; nunca ruta ni lista de candida
 Los controles del smoke y el límite de una llamada no cambian. No se efectuó
 ninguna llamada real durante esta implementación; aprobación sin consumir y
 Codex canónico deshabilitado. Pruebas pendientes de verificación independiente.
+
+CODEX-WINDOWS-SANDBOX-BACKEND-001: por decisión del Director, el adaptador
+vincula explícitamente `windows.sandbox="unelevated"` mediante un único override
+global antes de `exec`, exclusivamente cuando el runtime es Windows nativo.
+El esquema cerrado actual no tiene campo de backend: se implementa como binding
+de compatibilidad de plataforma, sin ampliar configuración ni opciones de política.
+`--ignore-user-config` sigue siendo obligatorio junto con workspace-write,
+approval never y el filtro de entorno existente (incluido SYSTEMROOT). No se
+añade --ignore-rules ni fallback elevated/full-access o recarga de configuración.
+Sin Windows no se añade selector. La identidad del ejecutable permanece única.
+
+Antes de consumir una llamada real, el launcher usa el mismo ejecutable y selector
+en un control sin modelo: `sandbox -P :workspace -C <workspace-propio>` ejecuta
+únicamente System32 cmd con echo de un token fijo. Exige exit 0 y salida exacta;
+timeout o fallo impide invocar al modelo. El workspace nuevo se registra con las
+reglas de propiedad existentes y se limpia en el finally habitual o queda
+preservado si no puede limpiarse con seguridad. No se tocan recursos forenses
+anteriores. Único nuevo dato público: windows_sandbox_backend_preflight con
+NOT_RUN/PASS/FAIL/NOT_APPLICABLE, sin comandos, rutas ni salidas crudas.
+
+Este preflight acredita solamente aceptación del backend y ejecución local de
+un proceso inocuo; no demuestra disponibilidad/selección de herramientas en exec,
+esquema JSONL, aislamiento universal de red ni éxito del smoke. La evidencia host
+sin modelo del backend explícito y de la cadena de shell fue PASS, según el
+Task Packet; la ayuda local acepta la colocación sintáctica del override.
+No está probado que la omisión anterior del backend causara el smoke inconcluso.
+La aprobación real previa está CONSUMED 1/1, restantes 0. No se efectuó inferencia
+en esta implementación; cualquier retry real requiere NUEVO Human Critical
+Approval. Codex canónico sigue deshabilitado.

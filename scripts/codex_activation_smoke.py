@@ -191,6 +191,33 @@ def system_preflight(env):
             raise Stop("SYSTEM_EXECUTABLE_UNAVAILABLE")
 
 
+def windows_backend_preflight(executable, env, owned, backend_args):
+    if not backend_args:
+        return "NOT_APPLICABLE"
+    try:
+        parent = Path(tempfile.gettempdir()).absolute()
+        no_reparse(parent)
+        if parent.is_relative_to(REPO):
+            raise Stop("UNSAFE_RESOURCE")
+        workspace = record_root(Path(tempfile.mkdtemp(prefix="codex-backend-preflight-", dir=parent)),
+                                "backend", owned)
+        _, curl = system_executables(env)
+        cmd = curl.with_name("cmd.exe")
+        no_reparse(cmd)
+        if not cmd.is_file():
+            raise Stop("SYSTEM_EXECUTABLE_UNAVAILABLE")
+        result = subprocess.run(
+            [executable, *backend_args, "sandbox", "-P", ":workspace", "-C", str(workspace),
+             "--", str(cmd), "/d", "/c", "echo", "CODEX_BACKEND_PREFLIGHT_OK"],
+            cwd=workspace, env=env, shell=False, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 or result.stdout.strip() != "CODEX_BACKEND_PREFLIGHT_OK":
+            raise Stop("WINDOWS_SANDBOX_BACKEND_PREFLIGHT_FAILED")
+        return "PASS"
+    except Exception:
+        # Existing owned-root cleanup in run() handles only this newly owned root.
+        raise Stop("WINDOWS_SANDBOX_BACKEND_PREFLIGHT_FAILED") from None
+
+
 def encode_command(source):
     return base64.b64encode(source.encode("utf-16le")).decode("ascii")
 
@@ -623,6 +650,7 @@ def cleanup(owned):
 
 def run(argv):
     report = dict(result="NOT_RUN", host_context="UNKNOWN", invocation_consumed=False,
+                  windows_sandbox_backend_preflight="NOT_RUN",
                   real_adapter_attempts=0, action_evidence="NOT_RUN", real_jsonl_action_contract="NOT_RUN",
                   outside_write_block="NOT_RUN", network_block="NOT_RUN",
                   descendant_canary="NOT_RUN", basic_windows_execution_environment="NOT_DEMONSTRATED",
@@ -659,6 +687,9 @@ def run(argv):
         report["codex_executable_resolution"] = resolution
         codex_preflight(resolved_codex, env)
         system_preflight(env)
+        report["windows_sandbox_backend_preflight"] = "FAIL"
+        report["windows_sandbox_backend_preflight"] = windows_backend_preflight(
+            resolved_codex, env, owned, adapter.windows_sandbox_args())
         report["auth"] = "READY"
         workspace, outside, probes = create_resources(owned, env)
         acquire_wrapper_protection(workspace, probes, locks)

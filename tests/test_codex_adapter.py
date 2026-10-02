@@ -178,7 +178,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual((result.provider, result.adapter), ("openai_codex", "codex_cli"))
         args = process.call_args.args[0]
         self.assertIsInstance(args, list)
-        self.assertEqual(args[:4], ["/resolved/codex", "-a", "never", "exec"])
+        prefix = ["/resolved/codex", *codex_cli.windows_sandbox_args(), "-a", "never", "exec"]
+        self.assertEqual(args[:len(prefix)], prefix)
         self.assertEqual(args[args.index("-C") + 1], str(self.root))
         self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
         for flag in ("--json", "--ephemeral", "--ignore-user-config"):
@@ -201,6 +202,31 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertNotIn("--last", args)
         self.assertNotIn("--add-dir", args)
         process.assert_called_once()
+
+    def test_windows_backend_scoping_and_failure_never_falls_back(self):
+        from types import SimpleNamespace
+        for platform in ("nt", "posix"):
+            for failure in (None, OSError("PRIVATE_BACKEND_FAILURE"), subprocess.TimeoutExpired("private", 600)):
+                with mock.patch.object(codex_cli, "os", SimpleNamespace(
+                    name=platform, environ={"SYSTEMROOT": "C:/Windows"})):
+                    actual, process = self.call(error=failure)
+                process.assert_called_once()
+                argv = process.call_args.args[0]
+                selector = 'windows.sandbox="unelevated"'
+                self.assertEqual(argv.count(selector), 1 if platform == "nt" else 0)
+                if platform == "nt":
+                    self.assertEqual(argv[1:3], ["-c", selector])
+                    self.assertLess(argv.index(selector), argv.index("exec"))
+                else:
+                    self.assertEqual(argv[:4], ["/resolved/codex", "-a", "never", "exec"])
+                self.assertIn("--ignore-user-config", argv)
+                self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
+                self.assertEqual(argv[argv.index("-a") + 1], "never")
+                self.assertFalse(process.call_args.kwargs["shell"])
+                for forbidden in ('windows.sandbox="elevated"', "danger-full-access",
+                                  "--dangerously-bypass-approvals-and-sandbox", "--ignore-rules"):
+                    self.assertNotIn(forbidden, argv)
+                self.assertEqual(actual.completed, failure is None)
 
     def test_bound_executable_exact_no_resolution_and_no_failure_fallback(self):
         candidate = self.root / "PRIVATE_BOUND_CODEX.exe"

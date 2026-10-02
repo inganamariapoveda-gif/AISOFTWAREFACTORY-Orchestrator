@@ -20,6 +20,11 @@ from typing import Any
 from ..config_loader import ConfigError, validate_codex_execution_config
 
 
+def windows_sandbox_args() -> list[str]:
+    """Director-approved native Windows compatibility binding; no fallback."""
+    return ["-c", 'windows.sandbox="unelevated"'] if os.name == "nt" else []
+
+
 def _child_environment() -> dict[str, str]:
     # PATH/PATHEXT: local executable lookup; SYSTEMROOT: Windows runtime.
     # USERPROFILE/HOME/CODEX_HOME: existing home/auth-store location only.
@@ -320,7 +325,7 @@ def run_codex_task(*, repository_root: Path, authorized_root: Path,
     if executable is None:
         return _result(CodexFailureCategory.EXECUTABLE_UNAVAILABLE)
     argv = [
-        executable, "-a", settings["approval_policy"], "exec",
+        executable, *windows_sandbox_args(), "-a", settings["approval_policy"], "exec",
         "-C", str(root), "--sandbox", settings["sandbox"], "--json",
         "--ephemeral", "--ignore-user-config",
         "-c", "sandbox_workspace_write.network_access=false",
