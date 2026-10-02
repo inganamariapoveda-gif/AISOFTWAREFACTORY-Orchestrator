@@ -768,3 +768,27 @@ mismo item tenga string. Comandos, hashes, IDs y JSONL nunca se exponen.
 Smoke real NO ejecutado; Codex canónico sigue deshabilitado y la aprobación
 permanece sin consumir. Pruebas Python pendientes del verificador independiente
 por el bloqueo confirmado del intérprete aprobado en el harness de desarrollo.
+
+CODEX-EXECUTABLE-BINDING-001: la configuración conserva `executable: codex` y
+su validación cerrada. El launcher resuelve una sola vez desde PATH filtrado;
+si no encuentra candidato, en Windows inspecciona únicamente
+`<USERPROFILE>/AppData/Local/OpenAI/Codex/bin/<hijo-directo>/codex.exe`.
+USERPROFILE procede del entorno filtrado existente; no se amplía PATH ni su
+allowlist. No se fija versión ni directorio hash. Cero candidatos falla cerrado;
+más de uno produce CODEX_EXECUTABLE_AMBIGUOUS, sin elegir por orden o fecha.
+Se exige ruta absoluta, archivo regular codex.exe, sin traversal ni reparse
+points en archivo/ancestros y, para discovery, relación directa con bin.
+Un candidato inseguro o error de inspección detiene la selección.
+No se pretende discovery universal: esta estructura Windows es la soportada.
+
+La misma ruta validada alimenta los tres preflights y el argumento opcional
+`resolved_executable` del adaptador. Con binding no hay segunda búsqueda ni
+fallback; el adaptador comprueba ruta absoluta, archivo regular y ausencia de
+links/reparse points antes de ejecutar exactamente la ruta recibida. Sin binding
+conserva su comportamiento anterior. Este binding identifica una ruta; no añade
+un lock del ejecutable ni una política de firmas. La procedencia del discovery
+corresponde al launcher. Solo se reporta FILTERED_PATH,
+BOUNDED_WINDOWS_INSTALLATION, FAILED o AMBIGUOUS; nunca ruta ni lista de candidatos.
+Los controles del smoke y el límite de una llamada no cambian. No se efectuó
+ninguna llamada real durante esta implementación; aprobación sin consumir y
+Codex canónico deshabilitado. Pruebas pendientes de verificación independiente.

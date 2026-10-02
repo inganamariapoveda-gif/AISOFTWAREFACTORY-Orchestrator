@@ -90,10 +90,66 @@ def baseline(expected, loader, env):
     return copy.deepcopy(agents["codex_builder"])
 
 
-def codex_preflight(config, env):
-    executable = shutil.which(config["executable"], path=env.get("PATH", env.get("Path", "")))
-    if not executable:
-        raise Stop("PREFLIGHT_FAILED")
+def validate_codex_candidate(candidate, bin_root=None):
+    try:
+        if (not candidate.is_absolute() or ".." in candidate.parts
+                or candidate.name.casefold() != "codex.exe"):
+            raise Stop("CODEX_EXECUTABLE_INVALID")
+        if bin_root is not None and candidate.parent.parent != bin_root:
+            raise Stop("CODEX_EXECUTABLE_INVALID")
+        no_reparse(candidate)
+        if not stat.S_ISREG(candidate.stat().st_mode):
+            raise Stop("CODEX_EXECUTABLE_INVALID")
+    except (OSError, ValueError, Stop):
+        raise Stop("CODEX_EXECUTABLE_INVALID") from None
+    return candidate
+
+
+def resolve_codex_executable(config, env):
+    """Activation-only selection; never mutate PATH or choose among installations."""
+    try:
+        found = shutil.which(config["executable"], path=env.get("PATH", env.get("Path", "")))
+        if found:
+            candidate = validate_codex_candidate(Path(found))
+            return str(candidate), "FILTERED_PATH"
+        if os.name != "nt":
+            raise Stop("CODEX_EXECUTABLE_NOT_FOUND")
+        profile = next((value for key, value in env.items() if key.upper() == "USERPROFILE"), "")
+        home = Path(profile)
+        if not profile or not home.is_absolute() or ".." in home.parts:
+            raise Stop("CODEX_EXECUTABLE_INVALID")
+        bin_root = home / "AppData/Local/OpenAI/Codex/bin"
+        try:
+            no_reparse(bin_root)
+        except FileNotFoundError:
+            raise Stop("CODEX_EXECUTABLE_NOT_FOUND") from None
+        if not bin_root.is_dir():
+            raise Stop("CODEX_EXECUTABLE_INVALID")
+        candidates = []
+        for child in bin_root.iterdir():
+            no_reparse(child)
+            if not child.is_dir():
+                continue
+            candidate = child / "codex.exe"
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            candidates.append(validate_codex_candidate(candidate, bin_root))
+        if len(candidates) > 1:
+            raise Stop("CODEX_EXECUTABLE_AMBIGUOUS")
+        if not candidates:
+            raise Stop("CODEX_EXECUTABLE_NOT_FOUND")
+        return str(candidates[0]), "BOUNDED_WINDOWS_INSTALLATION"
+    except Stop as exc:
+        if str(exc) in {"CODEX_EXECUTABLE_NOT_FOUND", "CODEX_EXECUTABLE_AMBIGUOUS", "CODEX_EXECUTABLE_INVALID"}:
+            raise
+        raise Stop("CODEX_EXECUTABLE_INVALID") from None
+    except (OSError, ValueError, TypeError):
+        raise Stop("CODEX_EXECUTABLE_INVALID") from None
+
+
+def codex_preflight(executable, env):
     for args in (["--version"], ["login", "status"], ["exec", "--help"]):
         result = subprocess.run([executable, *args], env=env, shell=False,
                                 capture_output=True, text=True, timeout=30)
@@ -593,7 +649,15 @@ def run(argv):
         env = adapter._child_environment()
         config = baseline(expected, loader, env)
         checked = True
-        codex_preflight(config, env)
+        report["codex_executable_resolution"] = "FAILED"
+        try:
+            resolved_codex, resolution = resolve_codex_executable(config, env)
+        except Stop as exc:
+            if str(exc) == "CODEX_EXECUTABLE_AMBIGUOUS":
+                report["codex_executable_resolution"] = "AMBIGUOUS"
+            raise
+        report["codex_executable_resolution"] = resolution
+        codex_preflight(resolved_codex, env)
         system_preflight(env)
         report["auth"] = "READY"
         workspace, outside, probes = create_resources(owned, env)
@@ -611,7 +675,8 @@ def run(argv):
         result = None
         try:
             result = adapter.run_codex_task(repository_root=workspace, authorized_root=workspace,
-                                            instruction=prompt, execution_config=config, expected_commands=expectations)
+                                            instruction=prompt, execution_config=config, expected_commands=expectations,
+                                            resolved_executable=resolved_codex)
             report["telemetry"] = telemetry(result)
             report["adapter_state"] = "SUCCESS" if result.failure_category.value == "SUCCESS" else "FAILURE"
         except Exception:

@@ -58,6 +58,7 @@ class LauncherFlowTests(unittest.TestCase):
             "host_context": "NORMAL_USER", "interpreter_ok": True,
             "dependencies": (self.adapter, self.loader), "baseline": self.config,
             "codex_preflight": None,
+            "resolve_codex_executable": (str(Path("PRIVATE_CODEX.exe").absolute()), "FILTERED_PATH"),
             "system_preflight": None, "parent_done": "CREATED",
             "instruction": "BOUNDED_SYNTHETIC_INSTRUCTION",
             "wrapper_commands": tuple("PRIVATE_ABSOLUTE_COMMAND_" + str(i) for i in range(3)),
@@ -147,8 +148,25 @@ class LauncherFlowTests(unittest.TestCase):
         self.mocks["wrapper_commands"].return_value = tuple(
             str(Path("PRIVATE_ABSOLUTE_WORKSPACE").absolute() / name) for name in smoke.WRAPPERS)
         text = json.dumps(smoke.run(ARGS))
-        for prohibited in ("SECRET_SENTINEL", "ENCODED_BODY_SENTINEL", "PRIVATE_OUTSIDE_PATH", "PRIVATE_ABSOLUTE_WORKSPACE", str(smoke.APPROVED_PYTHON), "raw_payload"):
+        for prohibited in ("PRIVATE_CODEX", "SECRET_SENTINEL", "ENCODED_BODY_SENTINEL", "PRIVATE_OUTSIDE_PATH", "PRIVATE_ABSOLUTE_WORKSPACE", str(smoke.APPROVED_PYTHON), "raw_payload"):
             self.assertNotIn(prohibited, text)
+
+    def test_single_executable_binding_and_resolution_failures(self):
+        selected, category = self.mocks["resolve_codex_executable"].return_value
+        report = smoke.run(ARGS)
+        self.mocks["resolve_codex_executable"].assert_called_once()
+        self.assertIs(self.mocks["codex_preflight"].call_args.args[0], selected)
+        self.assertIs(self.adapter.run_codex_task.call_args.kwargs["resolved_executable"], selected)
+        self.assertEqual(report["codex_executable_resolution"], category)
+        for code in ("CODEX_EXECUTABLE_NOT_FOUND", "CODEX_EXECUTABLE_INVALID", "CODEX_EXECUTABLE_AMBIGUOUS"):
+            self.adapter.run_codex_task.reset_mock()
+            self.mocks["codex_preflight"].reset_mock()
+            self.mocks["resolve_codex_executable"].side_effect = smoke.Stop(code)
+            report = self.assert_blocked()
+            self.assertEqual(report["result"], code)
+            self.assertEqual(report["codex_executable_resolution"],
+                             "AMBIGUOUS" if code.endswith("AMBIGUOUS") else "FAILED")
+            self.mocks["codex_preflight"].assert_not_called()
 
     def test_schema_diagnostics_do_not_authorize_unmatched_commands(self):
         observed = result()
@@ -745,6 +763,88 @@ class NetworkLogicTests(unittest.TestCase):
                 self.assertEqual((workspace / "network_probe_result.txt").read_text(), expected)
 
 
+class ExecutableResolutionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.profile = Path(temporary.name)
+        self.bin = self.profile / "AppData/Local/OpenAI/Codex/bin"
+        self.bin.mkdir(parents=True)
+        self.env = {"USERPROFILE": str(self.profile), "PATH": "PRIVATE_FILTERED_PATH"}
+
+    def candidate(self, child="arbitrary-installation"):
+        path = self.bin / child / "codex.exe"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"synthetic, never executed")
+        return path
+
+    def resolve(self, found=None):
+        # Simulate only the platform selector, without replacing pathlib's OS.
+        with mock.patch.object(smoke, "os", SimpleNamespace(name="nt")), mock.patch.object(
+            smoke.shutil, "which", return_value=found
+        ) as which:
+            actual = smoke.resolve_codex_executable(agent_config(), self.env)
+            which.assert_called_once_with("codex", path=self.env["PATH"])
+            return actual
+
+    def test_filtered_path_preferred_and_environment_unchanged(self):
+        candidate = self.candidate()
+        self.candidate("another-installation")
+        before = dict(self.env)
+        self.assertEqual(self.resolve(str(candidate)), (str(candidate), "FILTERED_PATH"))
+        self.assertEqual(self.env, before)
+
+    def test_single_bounded_candidate_without_path(self):
+        candidate = self.candidate("not-a-version-or-hash")
+        before = dict(self.env)
+        self.assertEqual(self.resolve(), (str(candidate), "BOUNDED_WINDOWS_INSTALLATION"))
+        self.assertEqual(self.env, before)
+
+    def test_zero_multiple_missing_and_wrong_filename(self):
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_NOT_FOUND"):
+            self.resolve()
+        candidate = self.candidate()
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+            self.resolve(str(candidate.with_name("missing.exe")))
+        wrong = candidate.with_name("other.exe")
+        wrong.write_bytes(b"wrong")
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+            self.resolve(str(wrong))
+        self.candidate("second")
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_AMBIGUOUS"):
+            self.resolve()
+
+    def test_outside_and_deeper_candidates_not_accepted(self):
+        deeper = self.candidate("child/deeper")
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_NOT_FOUND"):
+            self.resolve()
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+            smoke.validate_codex_candidate(deeper, self.bin)
+        outside = self.profile / "codex.exe"
+        outside.write_bytes(b"outside")
+        with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+            smoke.validate_codex_candidate(outside, self.bin)
+
+    def test_file_child_and_bin_reparse_rejected(self):
+        candidate = self.candidate()
+        original = Path.lstat
+        for target in (candidate, candidate.parent, self.bin):
+            def lstat(path, *args, **kwargs):
+                info = original(path, *args, **kwargs)
+                if path == target:
+                    return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
+                return info
+            with self.subTest(target=target.name), mock.patch.object(Path, "lstat", lstat):
+                with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+                    self.resolve()
+
+    def test_relative_and_directory_candidates_rejected_without_fallback(self):
+        candidate = self.candidate()
+        for invalid in ("codex.exe", str(candidate.parent)):
+            with self.assertRaisesRegex(smoke.Stop, "CODEX_EXECUTABLE_INVALID"):
+                self.resolve(invalid)
+
+
 class AuthenticationPreflightTests(unittest.TestCase):
     def test_os_identity_classification_case_insensitive(self):
         for identity, expected in ((r"ANAP\CODEXSANDBOXOFFLINE", "CODEX_SANDBOX"),
@@ -755,12 +855,14 @@ class AuthenticationPreflightTests(unittest.TestCase):
 
     def test_filtered_env_and_no_raw_auth(self):
         env = {"SYSTEMROOT": "synthetic"}
-        with mock.patch.object(smoke.shutil, "which", return_value="codex"), mock.patch.object(
+        executable = str(Path("PRIVATE_CODEX.exe").absolute())
+        with mock.patch.object(smoke.shutil, "which", side_effect=AssertionError("second resolution")), mock.patch.object(
             smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Logged in using ChatGPT", "SECRET_SENTINEL")
         ) as process:
-            smoke.codex_preflight(agent_config(), env)
+            smoke.codex_preflight(executable, env)
         self.assertEqual(process.call_count, 3)
         for call in process.call_args_list:
+            self.assertIs(call.args[0][0], executable)
             self.assertIs(call.kwargs["env"], env)
             self.assertFalse(call.kwargs["shell"])
         self.assertEqual([call.args[0][1:] for call in process.call_args_list], [["--version"], ["login", "status"], ["exec", "--help"]])
@@ -769,7 +871,7 @@ class AuthenticationPreflightTests(unittest.TestCase):
         with mock.patch.object(smoke.shutil, "which", return_value="codex"), mock.patch.object(
             smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Not logged in", "")
         ) as process, self.assertRaises(smoke.Stop):
-            smoke.codex_preflight(agent_config(), {})
+            smoke.codex_preflight(str(Path("codex.exe").absolute()), {})
         self.assertEqual(process.call_count, 2)
 
 

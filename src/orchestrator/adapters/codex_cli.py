@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,7 +286,8 @@ def _parse_output(stdout: str, returncode: int,
 
 def run_codex_task(*, repository_root: Path, authorized_root: Path,
                    instruction: str, execution_config: dict[str, Any],
-                   expected_commands: tuple[CommandExpectation, ...] = ()) -> CodexResult:
+                   expected_commands: tuple[CommandExpectation, ...] = (),
+                   resolved_executable: str | Path | None = None) -> CodexResult:
     try:
         _validate_expectations(expected_commands)
         settings = validate_codex_execution_config(execution_config)
@@ -297,7 +299,24 @@ def run_codex_task(*, repository_root: Path, authorized_root: Path,
             return _result(CodexFailureCategory.UNKNOWN)
     except (ConfigError, OSError, ValueError, TypeError):
         return _result(CodexFailureCategory.UNKNOWN)
-    executable = shutil.which(execution_config["executable"])
+    if resolved_executable is None:
+        executable = shutil.which(execution_config["executable"])
+    else:
+        try:
+            candidate = Path(resolved_executable)
+            if not candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError
+            # Inspect lexical ancestors; do not resolve/follow links. Full
+            # installation provenance belongs to the trusted activation caller.
+            for part in (candidate, *candidate.parents):
+                info = part.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise ValueError
+            if not stat.S_ISREG(candidate.stat().st_mode):
+                raise ValueError
+            executable = str(resolved_executable)
+        except (OSError, ValueError, TypeError):
+            return _result(CodexFailureCategory.EXECUTABLE_UNAVAILABLE)
     if executable is None:
         return _result(CodexFailureCategory.EXECUTABLE_UNAVAILABLE)
     argv = [

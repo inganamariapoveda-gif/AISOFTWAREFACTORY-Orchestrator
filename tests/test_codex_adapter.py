@@ -202,6 +202,50 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertNotIn("--add-dir", args)
         process.assert_called_once()
 
+    def test_bound_executable_exact_no_resolution_and_no_failure_fallback(self):
+        candidate = self.root / "PRIVATE_BOUND_CODEX.exe"
+        candidate.write_bytes(b"synthetic; subprocess mocked")
+        for failure in (None, OSError("PRIVATE_PATH_ERROR")):
+            for supplied in (candidate, str(candidate)):
+                with mock.patch.object(codex_cli.shutil, "which", side_effect=AssertionError("unexpected resolution")) as which, mock.patch.object(
+                    codex_cli.subprocess, "run", side_effect=failure,
+                    return_value=subprocess.CompletedProcess([], 0, SUCCESS_OUTPUT, "")
+                ) as process:
+                    actual = codex_cli.run_codex_task(repository_root=self.root, authorized_root=self.root,
+                        instruction="bounded", execution_config=self.config, resolved_executable=supplied)
+                which.assert_not_called()
+                process.assert_called_once()
+                self.assertEqual(process.call_args.args[0][0], str(supplied))
+                self.assertFalse(process.call_args.kwargs["shell"])
+                self.assertEqual(actual.failure_category.value, "SUCCESS" if failure is None else "PROCESS_FAILURE")
+                self.assertNotIn("PRIVATE_BOUND_CODEX", repr(actual))
+                self.assertNotIn("PRIVATE_PATH_ERROR", repr(actual))
+                self.assertNotIn(str(candidate), repr(asdict(actual)))
+
+    def test_invalid_bound_executable_never_resolves_or_executes(self):
+        for supplied in ("relative.exe", self.root / "missing.exe", self.root, 123):
+            with mock.patch.object(codex_cli.shutil, "which") as which, mock.patch.object(codex_cli.subprocess, "run") as process:
+                actual = codex_cli.run_codex_task(repository_root=self.root, authorized_root=self.root,
+                    instruction="bounded", execution_config=self.config, resolved_executable=supplied)
+            which.assert_not_called()
+            process.assert_not_called()
+            self.assertEqual(actual.failure_category.value, "EXECUTABLE_UNAVAILABLE")
+
+    def test_bound_executable_reparse_rejected(self):
+        from types import SimpleNamespace
+        candidate = self.root / "codex.exe"
+        candidate.write_bytes(b"synthetic")
+        original = Path.lstat
+        for target in (candidate, candidate.parent):
+            def lstat(path, *args, **kwargs):
+                info = original(path, *args, **kwargs)
+                return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400) if path == target else info
+            with mock.patch.object(Path, "lstat", lstat), mock.patch.object(codex_cli.shutil, "which") as which, mock.patch.object(codex_cli.subprocess, "run") as process:
+                actual = codex_cli.run_codex_task(repository_root=self.root, authorized_root=self.root,
+                    instruction="bounded", execution_config=self.config, resolved_executable=candidate)
+            which.assert_not_called()
+            process.assert_not_called()
+            self.assertEqual(actual.failure_category.value, "EXECUTABLE_UNAVAILABLE")
     def test_child_environment_allowlist_and_no_secret_disclosure(self):
         safe = {"Path": "C:/runtime", "PathExt": ".EXE", "SystemRoot": "C:/Windows",
                 "USERPROFILE": "C:/Users/test", "HOME": "C:/Users/test",
