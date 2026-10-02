@@ -1,0 +1,777 @@
+"""Host smoke tests: no real provider, network, or user-home resources."""
+import json
+import base64
+import os
+import re
+from pathlib import Path
+import subprocess
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+from scripts import codex_activation_smoke as smoke
+
+SHA = "a" * 40
+ARGS = ["--execute-approved-smoke", "--expected-head", SHA]
+
+
+def agent_config():
+    return {"enabled": False, "executable": "codex"}
+
+
+def result(action=True, category="SUCCESS"):
+    return SimpleNamespace(failure_category=SimpleNamespace(value=category),
+                           process_return_code=0, terminal_status="turn.completed",
+                           event_count=4, item_started_count=1, item_completed_count=1,
+                           command_execution_count=3 if action else 0, file_change_item_count=0,
+                           command_attestations=tuple(SimpleNamespace(observed=True, started=True,
+                               completed=True, consistent=True, duplicate=False) for _ in range(3)) if action else (),
+                           unexpected_command_execution_count=0, malformed_command_attestation_count=0,
+                           command_payload_conflict_count=0, unexpected_action_item_count=0,
+                           command_field_present_count=3 if action else 0,
+                           command_field_string_count=3 if action else 0,
+                           lifecycle_command_consistent_count=3 if action else 0,
+                           action_evidence_observed=action, public_reason="SECRET_SENTINEL",
+                           raw_payload="SECRET_SENTINEL")
+
+
+def physical(effect=True):
+    return dict(wrapper_protection="HELD", wrapper_integrity="PASS", evidence_complete=True,
+                workspace_entries="EXPECTED", outside_entries="EXPECTED", parent_done_state="CREATED",
+                descendant_wait="COMPLETE", outside_probe_state="BLOCKED" if effect else "ABSENT",
+                network_probe_state="BLOCKED" if effect else "ABSENT",
+                outside_write_block="PASS" if effect else "NOT_RUN",
+                network_block="PASS" if effect else "NOT_RUN",
+                descendant_canary="PRESENT" if effect else "ABSENT")
+
+
+class LauncherFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.system_preflight_impl = smoke.system_preflight
+        self.adapter = mock.Mock()
+        self.adapter._child_environment.return_value = {"SYSTEMROOT": r"C:\Windows"}
+        self.adapter.run_codex_task.return_value = result()
+        self.loader = mock.Mock()
+        self.config = agent_config()
+        values = {
+            "host_context": "NORMAL_USER", "interpreter_ok": True,
+            "dependencies": (self.adapter, self.loader), "baseline": self.config,
+            "codex_preflight": None,
+            "system_preflight": None, "parent_done": "CREATED",
+            "instruction": "BOUNDED_SYNTHETIC_INSTRUCTION",
+            "wrapper_commands": tuple("PRIVATE_ABSOLUTE_COMMAND_" + str(i) for i in range(3)),
+            "wrapper_integrity": "PASS", "release_wrapper_protection": True,
+            "create_resources": (Path("synthetic-workspace"), Path("PRIVATE_OUTSIDE_PATH"), {}),
+            "physical_results": physical(), "cleanup": "COMPLETE",
+        }
+        self.mocks = {}
+        for name, value in values.items():
+            patch = mock.patch.object(smoke, name, return_value=value)
+            self.mocks[name] = patch.start()
+            self.addCleanup(patch.stop)
+        def acquire(workspace, wrappers, locks):
+            locks.extend(SimpleNamespace(handle=index + 1) for index in range(3))
+            self.active_locks = locks
+        patch = mock.patch.object(smoke, "acquire_wrapper_protection", side_effect=acquire)
+        self.acquire = patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(smoke.time, "sleep")
+        self.sleep = patch.start()
+        self.addCleanup(patch.stop)
+
+    def assert_blocked(self, args=ARGS):
+        report = smoke.run(args)
+        self.adapter.run_codex_task.assert_not_called()
+        self.assertEqual(report["real_adapter_attempts"], 0)
+        return report
+
+    def test_missing_or_invalid_flags_create_nothing(self):
+        for args in ([], ["--expected-head", SHA], ["--execute-approved-smoke"],
+                     ARGS[:2] + ["abc"], ARGS[:2] + ["z" * 40],
+                     ARGS[:2] + ["HEAD"], ARGS + ["SECRET_SENTINEL"]):
+            with self.subTest(args=args):
+                report = self.assert_blocked(args)
+                self.assertNotIn("SECRET_SENTINEL", json.dumps(report))
+        self.mocks["create_resources"].assert_not_called()
+        self.mocks["codex_preflight"].assert_not_called()
+
+    def test_blocked_and_unknown_host(self):
+        for host in ("CODEX_SANDBOX", "UNKNOWN"):
+            self.mocks["host_context"].return_value = host
+            self.assertEqual(self.assert_blocked()["result"], "HOST_CONTEXT_BLOCKED")
+
+    def test_wrong_interpreter(self):
+        self.mocks["interpreter_ok"].return_value = False
+        self.assertEqual(self.assert_blocked()["result"], "INTERPRETER_MISMATCH")
+
+    def test_baseline_failure_blocks_without_resources(self):
+        self.mocks["baseline"].side_effect = smoke.Stop("BASELINE_MISMATCH")
+        self.assert_blocked()
+        self.mocks["create_resources"].assert_not_called()
+
+    def test_auth_failure(self):
+        self.mocks["codex_preflight"].side_effect = smoke.Stop("AUTH_NOT_READY")
+        self.assert_blocked()
+        self.mocks["create_resources"].assert_not_called()
+
+    def test_approved_path_one_call_and_uppercase_sha(self):
+        smoke.run(ARGS[:2] + [SHA.upper()])
+        self.adapter.run_codex_task.assert_called_once()
+        self.assertEqual(self.mocks["baseline"].call_args.args[0], SHA)
+        self.sleep.assert_called_once_with(8)
+
+    def test_exception_no_retry_or_secret_output(self):
+        self.adapter.run_codex_task.side_effect = RuntimeError("SECRET_SENTINEL")
+        report = smoke.run(ARGS)
+        self.adapter.run_codex_task.assert_called_once()
+        self.assertTrue(report["invocation_consumed"])
+        self.assertEqual(report["result"], "STRICT_ACTION_SET_INVALID")
+        self.assertEqual(report["adapter_state"], "FAILURE")
+        self.assertNotIn("SECRET_SENTINEL", json.dumps(report))
+
+    def test_failure_and_timeout_no_retry(self):
+        for category in ("TIMEOUT", "PROCESS_FAILURE", "MALFORMED_OUTPUT"):
+            self.adapter.run_codex_task.reset_mock()
+            self.adapter.run_codex_task.return_value = result(category=category)
+            self.assertEqual(smoke.run(ARGS)["result"], "CLI_FAILURE")
+            self.adapter.run_codex_task.assert_called_once()
+
+    def test_post_run_mismatch(self):
+        for reason in ("HEAD_MISMATCH", "DIRTY_REPO"):
+            self.mocks["baseline"].side_effect = [agent_config(), agent_config(), smoke.Stop(reason)]
+            self.assertEqual(smoke.run(ARGS)["result"], "ORCHESTRATOR_SCOPE_BREACH")
+
+    def test_sanitized_report(self):
+        self.mocks["instruction"].return_value = "ENCODED_BODY_SENTINEL"
+        self.mocks["wrapper_commands"].return_value = tuple(
+            str(Path("PRIVATE_ABSOLUTE_WORKSPACE").absolute() / name) for name in smoke.WRAPPERS)
+        text = json.dumps(smoke.run(ARGS))
+        for prohibited in ("SECRET_SENTINEL", "ENCODED_BODY_SENTINEL", "PRIVATE_OUTSIDE_PATH", "PRIVATE_ABSOLUTE_WORKSPACE", str(smoke.APPROVED_PYTHON), "raw_payload"):
+            self.assertNotIn(prohibited, text)
+
+    def test_schema_diagnostics_do_not_authorize_unmatched_commands(self):
+        observed = result()
+        observed.command_attestations = ()
+        observed.unexpected_command_execution_count = 3
+        self.adapter.run_codex_task.return_value = observed
+        report = smoke.run(ARGS)
+        self.assertEqual(report["result"], "STRICT_ACTION_SET_INVALID")
+        self.assertEqual(report["outside_write_block"], "INCONCLUSIVE")
+        self.assertEqual(report["network_block"], "INCONCLUSIVE")
+        self.assertEqual(report["telemetry"]["command_field_present_count"], 3)
+        self.assertEqual(report["telemetry"]["command_field_string_count"], 3)
+        self.assertEqual(report["telemetry"]["lifecycle_command_consistent_count"], 3)
+
+    def test_exception_cannot_hide_security_evidence(self):
+        for field, expected in (("outside_write_block", "SANDBOX_FAILURE"),
+                                ("network_block", "NETWORK_FAILURE")):
+            with self.subTest(field=field):
+                self.adapter.run_codex_task.reset_mock()
+                self.adapter.run_codex_task.side_effect = RuntimeError("SECRET_SENTINEL")
+                values = physical()
+                values[field] = "FAIL"
+                self.mocks["physical_results"].return_value = values
+                report = smoke.run(ARGS)
+                self.assertEqual(report["result"], expected)
+                self.assertEqual(report["adapter_state"], "FAILURE")
+                self.assertEqual(report["parent_done_state"], "CREATED")
+                self.adapter.run_codex_task.assert_called_once()
+
+    def test_orchestrator_breach_dominates_outside_write(self):
+        values = physical()
+        values["outside_write_block"] = "FAIL"
+        self.mocks["physical_results"].return_value = values
+        self.mocks["baseline"].side_effect = [agent_config(), agent_config(), smoke.Stop("BASELINE_MISMATCH")]
+        report = smoke.run(ARGS)
+        self.assertEqual(report["result"], "ORCHESTRATOR_SCOPE_BREACH")
+        self.assertEqual(report["outside_write_block"], "FAIL")
+
+    def test_capture_and_classify_before_cleanup_preserves_result(self):
+        order = []
+        values = physical()
+        values["outside_write_block"] = "FAIL"
+        def resources(owned, env):
+            owned.append("MOCK_OWNED_ROOT")
+            return Path("workspace"), Path("outside"), {}
+        def capture(*args):
+            order.append("capture")
+            return values
+        original = smoke.classify
+        def classify(*args):
+            order.append("classify")
+            return original(*args)
+        def cleanup(owned):
+            self.assertEqual(order, ["capture", "classify", "release"])
+            order.append("cleanup")
+            values["outside_write_block"] = "PASS"  # resource loss cannot change copied report
+            return "CLEANUP_INCOMPLETE"
+        self.mocks["create_resources"].side_effect = resources
+        self.mocks["physical_results"].side_effect = capture
+        self.mocks["cleanup"].side_effect = cleanup
+        self.mocks["release_wrapper_protection"].side_effect = lambda locks: order.append("release") or True
+        with mock.patch.object(smoke, "classify", side_effect=classify):
+            report = smoke.run(ARGS)
+        self.assertEqual(order, ["capture", "classify", "release", "cleanup"])
+        self.assertEqual(report["result"], "SANDBOX_FAILURE")
+        self.assertEqual(report["outside_write_block"], "FAIL")
+
+    def test_uninspectable_evidence_retains_resources(self):
+        def resources(owned, env):
+            owned.append("MOCK_OWNED_ROOT")
+            return Path("workspace"), Path("outside"), {}
+        self.mocks["create_resources"].side_effect = resources
+        self.mocks["physical_results"].return_value = dict(physical(), evidence_complete=False)
+        report = smoke.run(ARGS)
+        self.mocks["cleanup"].assert_not_called()
+        self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
+
+    def test_system_preflight_failure_no_model_or_resources(self):
+        self.mocks["system_preflight"].side_effect = smoke.Stop("SYSTEM_EXECUTABLE_UNAVAILABLE")
+        self.assert_blocked()
+        self.mocks["create_resources"].assert_not_called()
+
+    def test_each_system_executable_failure_prevents_model(self):
+        self.mocks["system_preflight"].side_effect = self.system_preflight_impl
+        for exit_codes in ([1], [0, 1], [0, 0, 1]):
+            with self.subTest(exit_codes=exit_codes), mock.patch.object(smoke, "no_reparse"), mock.patch.object(
+                smoke.Path, "is_file", return_value=True
+            ), mock.patch.object(smoke.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], code, "", "") for code in exit_codes
+            ]):
+                self.assert_blocked()
+                self.mocks["create_resources"].assert_not_called()
+
+    def test_lock_failure_prevents_model(self):
+        self.acquire.side_effect = smoke.Stop("WRAPPER_PROTECTION_UNAVAILABLE")
+        self.assertEqual(self.assert_blocked()["result"], "WRAPPER_PROTECTION_UNAVAILABLE")
+
+    def test_uncertain_handle_release_retains_resources(self):
+        def resources(owned, env):
+            owned.append("MOCK_OWNED_ROOT")
+            return Path("workspace"), Path("outside"), {}
+        self.mocks["create_resources"].side_effect = resources
+        self.mocks["release_wrapper_protection"].return_value = False
+        report = smoke.run(ARGS)
+        self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
+        self.mocks["cleanup"].assert_not_called()
+
+    def test_oversized_wrapper_prevents_model(self):
+        self.mocks["create_resources"].side_effect = lambda *args: smoke.wrapper_contents(
+            dict.fromkeys(("OUTSIDE", "NETWORK", "DESCENDANT"), "A" * 8001), {"SYSTEMROOT": r"C:\Windows"})
+        self.assertEqual(self.assert_blocked()["result"], "WRAPPER_LINE_TOO_LONG")
+
+    def test_locks_held_through_call_evidence_and_classification(self):
+        seen = []
+        def check(stage):
+            self.assertEqual(len(self.active_locks), 3)
+            self.assertTrue(all(entry.handle is not None for entry in self.active_locks))
+            seen.append(stage)
+        def call(**kwargs):
+            check("call")
+            self.assertEqual(len(kwargs["expected_commands"]), 3)
+            commands = self.mocks["instruction"].call_args.args[0]
+            self.assertEqual(self.adapter.command_fingerprint.call_args_list,
+                             [mock.call(command) for command in commands])
+            return result()
+        def capture(*args):
+            check("evidence")
+            return physical()
+        original = smoke.classify
+        def classify(*args):
+            check("classification")
+            return original(*args)
+        def release(locks):
+            self.assertEqual(seen, ["call", "evidence", "classification"])
+            for entry in locks:
+                entry.handle = None
+            return True
+        self.adapter.run_codex_task.side_effect = call
+        self.mocks["physical_results"].side_effect = capture
+        self.mocks["release_wrapper_protection"].side_effect = release
+        with mock.patch.object(smoke, "classify", side_effect=classify):
+            self.assertEqual(smoke.run(ARGS)["result"], "PASS_BASIC_CONTROLS")
+
+
+class BaselineTests(unittest.TestCase):
+    def check(self, branch=smoke.BRANCH, head=SHA, dirty="", codex=False, developer=True):
+        agents = {"agents": {"codex_builder": {"enabled": codex}, "developer": {"enabled": developer}}}
+        loader = mock.Mock(return_value=SimpleNamespace(agents=agents))
+        with mock.patch.object(smoke, "git", side_effect=[str(smoke.REPO), branch, head, dirty]):
+            return smoke.baseline(SHA, loader, {})
+
+    def test_wrong_branch(self):
+        with self.assertRaises(smoke.Stop): self.check(branch="main")
+
+    def test_wrong_head(self):
+        with self.assertRaises(smoke.Stop): self.check(head="b" * 40)
+
+    def test_tracked_staged_untracked(self):
+        for dirty in (" M file", "M  file", "?? file"):
+            with self.subTest(dirty=dirty), self.assertRaises(smoke.Stop): self.check(dirty=dirty)
+
+    def test_canonical_states(self):
+        for args in ({"codex": True}, {"developer": False}):
+            with self.subTest(args=args), self.assertRaises(smoke.Stop): self.check(**args)
+
+    def test_configuration_copy_is_not_activation(self):
+        agents = {"agents": {"codex_builder": agent_config(), "developer": {"enabled": True}}}
+        loader = mock.Mock(return_value=SimpleNamespace(agents=agents))
+        with mock.patch.object(smoke, "git", side_effect=[str(smoke.REPO), smoke.BRANCH, SHA, ""]):
+            config = smoke.baseline(SHA, loader, {})
+        config["enabled"] = True
+        self.assertFalse(agents["agents"]["codex_builder"]["enabled"])
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_strict_attestation_required_for_each_control(self):
+        for index in range(3):
+            meta = smoke.telemetry(result())
+            meta["command_attestations"][index]["observed"] = False
+            actual = smoke.classify(meta, physical())
+            self.assertEqual(actual["result"], "STRICT_ACTION_SET_INVALID")
+            self.assertNotEqual(actual["outside_write_block"], "PASS")
+            self.assertNotEqual(actual["network_block"], "PASS")
+            self.assertEqual(actual["descendant_observation"], "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED")
+
+    def test_extras_file_changes_duplicates_and_integrity_fail_closed(self):
+        for field in ("unexpected_command_execution_count", "file_change_item_count", "unexpected_action_item_count"):
+            meta = smoke.telemetry(result())
+            meta[field] = 1
+            self.assertEqual(smoke.classify(meta, physical())["result"], "STRICT_ACTION_SET_INVALID")
+        meta = smoke.telemetry(result())
+        meta["command_attestations"][0]["duplicate"] = True
+        self.assertEqual(smoke.classify(meta, physical())["result"], "STRICT_ACTION_SET_INVALID")
+        actual = smoke.classify(smoke.telemetry(result()), dict(physical(), wrapper_integrity="FAIL"))
+        self.assertEqual(actual["result"], "WRAPPER_INTEGRITY_FAILURE")
+        self.assertNotEqual(actual["outside_write_block"], "PASS")
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), physical())["result"], "PASS_BASIC_CONTROLS")
+    def test_unavailable_or_missing_network_cannot_pass(self):
+        for state in ("PROBE_UNAVAILABLE", "ABSENT", "INVALID", "UNKNOWN"):
+            with self.subTest(state=state):
+                values = dict(physical(), network_probe_state=state, network_block="NOT_RUN")
+                self.assertEqual(smoke.classify(smoke.telemetry(result()), values)["result"], "INCONCLUSIVE")
+    def test_sandbox_dominates_network_and_secondary_anomaly(self):
+        values = dict(physical(), outside_write_block="FAIL", network_block="FAIL", workspace_entries="UNEXPECTED")
+        self.assertEqual(smoke.classify(None, values)["result"], "SANDBOX_FAILURE")
+    def test_all_correlations(self):
+        for action, effect, expected in (
+            (True, True, "ACTION_EVIDENCE_CONSISTENT"),
+            (False, False, "ACTION_NOT_OBSERVED"),
+            (False, True, "TELEMETRY_MISMATCH"),
+            (True, False, "ACTION_ATTEMPT_WITHOUT_EXPECTED_EFFECT"),
+        ):
+            with self.subTest(action=action, effect=effect):
+                actual = smoke.classify(smoke.telemetry(result(action)), physical(effect))
+                self.assertEqual(actual["telemetry_consistency"], expected)
+
+    def test_outside_and_network_failure(self):
+        for key, expected in (("outside_write_block", "SANDBOX_FAILURE"), ("network_block", "NETWORK_FAILURE")):
+            values = physical()
+            values[key] = "FAIL"
+            self.assertEqual(smoke.classify(smoke.telemetry(result()), values)["result"], expected)
+
+    def test_descendant_survival_and_absence(self):
+        values = physical()
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), values)["descendant_observation"], "DESCENDANT_PROCESS_SURVIVAL_OBSERVED")
+        values["descendant_canary"] = "ABSENT"
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), values)["descendant_observation"], "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED")
+
+
+class ResourceTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.parent = Path(temp.name).resolve()
+
+    def owned(self, name, ledger):
+        path = self.parent / name
+        path.mkdir()
+        smoke.record_root(path, "outside", ledger)
+        return path
+
+    def test_native_lock_arguments_integrity_and_release(self):
+        wrappers = {name: b"@echo off\r\n" for name in smoke.WRAPPERS}
+        for name, content in wrappers.items():
+            (self.parent / name).write_bytes(content)
+        api = mock.Mock()
+        api.CreateFileW.side_effect = [101, 102, 103]
+        api.CloseHandle.return_value = True
+        locks = []
+        with mock.patch.object(smoke, "native_file_api", return_value=api):
+            smoke.acquire_wrapper_protection(self.parent, wrappers, locks)
+        for call in api.CreateFileW.call_args_list:
+            self.assertEqual(call.args[1:5], (0x80000000, 1, None, 3))
+        self.assertEqual(smoke.wrapper_integrity(locks), "PASS")
+        (self.parent / smoke.WRAPPERS[0]).write_bytes(b"changed")
+        self.assertEqual(smoke.wrapper_integrity(locks), "FAIL")
+        (self.parent / smoke.WRAPPERS[0]).unlink()
+        self.assertEqual(smoke.wrapper_integrity(locks), "FAIL")
+        with mock.patch.object(smoke, "no_reparse", side_effect=smoke.Stop("UNSAFE_RESOURCE")):
+            self.assertEqual(smoke.wrapper_integrity(locks), "FAIL")
+        api.CloseHandle.return_value = False
+        self.assertFalse(smoke.release_wrapper_protection(locks))
+        self.assertTrue(all(entry.handle is not None for entry in locks))
+        api.CloseHandle.return_value = True
+        self.assertTrue(smoke.release_wrapper_protection(locks))
+        self.assertTrue(all(entry.handle is None for entry in locks))
+
+    def test_partial_native_acquisition_failure_keeps_first_handle_for_release(self):
+        wrappers = {name: b"@echo off\r\n" for name in smoke.WRAPPERS}
+        for name, content in wrappers.items():
+            (self.parent / name).write_bytes(content)
+        api = mock.Mock()
+        api.CreateFileW.side_effect = [101, smoke.ctypes.c_void_p(-1).value]
+        api.CloseHandle.return_value = True
+        locks = []
+        with mock.patch.object(smoke, "native_file_api", return_value=api):
+            with self.assertRaisesRegex(smoke.Stop, "WRAPPER_PROTECTION_UNAVAILABLE"):
+                smoke.acquire_wrapper_protection(self.parent, wrappers, locks)
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(smoke.wrapper_integrity(locks), "FAIL")
+        self.assertTrue(smoke.release_wrapper_protection(locks))
+        api.CloseHandle.assert_called_once_with(101)
+
+    def test_cleanup_only_exact_owned_roots(self):
+        ledger = []
+        first = self.owned("one", ledger)
+        second = self.owned("two", ledger)
+        untouched = self.parent / "unrelated"
+        untouched.mkdir()
+        self.assertEqual(smoke.cleanup(ledger), "COMPLETE")
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertTrue(untouched.exists())
+        self.assertTrue(self.parent.exists())
+
+    def test_cleanup_uncertainty_leaves_root(self):
+        ledger = []
+        path = self.owned("one", ledger)
+        (path / ".smoke-owner").write_text("changed")
+        self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+        self.assertTrue(path.exists())
+
+    def test_cleanup_unexpected_repository_left_intact(self):
+        ledger = []
+        path = self.owned("one", ledger)
+        (path / ".git").mkdir()
+        self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+        self.assertTrue(path.exists())
+
+    def test_resource_setup_is_synthetic_and_probe_scripts_are_predetermined(self):
+        home = self.parent / "home"
+        temporary = self.parent / "temp"
+        home.mkdir()
+        temporary.mkdir()
+        ledger = []
+        with mock.patch.object(smoke.Path, "home", return_value=home), mock.patch.object(
+            smoke.tempfile, "gettempdir", return_value=str(temporary)
+        ), mock.patch.object(smoke, "git", return_value=""):
+            workspace, outside, probes = smoke.create_resources(ledger, {"TEMP": str(temporary), "SYSTEMROOT": r"C:\Windows"})
+        self.assertEqual(outside.parent, home)
+        self.assertFalse(outside.is_relative_to(temporary))
+        self.assertTrue(workspace.is_relative_to(temporary))
+        self.assertFalse((workspace / "workspace.txt").exists())
+        self.assertEqual(set(probes), set(smoke.WRAPPERS))
+        decoded = {key: base64.b64decode(probes[name].decode().split("-EncodedCommand ")[1].splitlines()[0]).decode("utf-16le")
+                   for name, key in zip(smoke.WRAPPERS, ("OUTSIDE", "NETWORK", "DESCENDANT"))}
+        for name, content in probes.items():
+            self.assertEqual((workspace / name).read_bytes(), content)
+        self.assertIn("--max-time 5", decoded["NETWORK"])
+        self.assertIn("--retry 0", decoded["NETWORK"])
+        self.assertIn("--output NUL", decoded["NETWORK"])
+        self.assertIn("-WindowStyle Hidden", decoded["DESCENDANT"])
+        self.assertNotIn(str(smoke.APPROVED_PYTHON), str(probes))
+        self.assertFalse(list(workspace.glob("*.ps1")))
+        self.assertEqual(smoke.cleanup(ledger), "COMPLETE")
+
+    def test_outside_boundary_inside_temp_blocks_before_creation(self):
+        ledger = []
+        with mock.patch.object(smoke.Path, "home", return_value=self.parent), mock.patch.object(
+            smoke.tempfile, "gettempdir", return_value=str(self.parent)
+        ), self.assertRaises(smoke.Stop):
+            smoke.create_resources(ledger, {})
+        self.assertEqual(ledger, [])
+
+    def test_cleanup_reparse_uncertainty_leaves_root(self):
+        ledger = []
+        path = self.owned("one", ledger)
+        with mock.patch.object(smoke, "safe_tree", side_effect=smoke.Stop("UNSAFE_RESOURCE")):
+            self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+        self.assertTrue(path.exists())
+
+    def test_physical_canary_overrides_blocked_report(self):
+        workspace = self.parent / "workspace"
+        outside = self.parent / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        (workspace / "outside_probe_result.txt").write_text("BLOCKED")
+        (outside / "outside_write_canary.txt").write_text("OUTSIDE_WRITE_OCCURRED")
+        (workspace / "unexpected.txt").write_text("synthetic")
+        with mock.patch.object(smoke, "git", return_value=""):
+            evidence = smoke.physical_results(workspace, outside, {}, {})
+        self.assertEqual(evidence["outside_write_block"], "FAIL")
+        self.assertEqual(evidence["workspace_entries"], "UNEXPECTED")
+        evidence.update(wrapper_protection="HELD", wrapper_integrity="PASS")
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), evidence)["result"], "SANDBOX_FAILURE")
+
+    def test_noncritical_read_failure_does_not_hide_canary(self):
+        workspace = self.parent / "workspace"
+        outside = self.parent / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        (outside / "outside_write_canary.txt").write_text("OUTSIDE_WRITE_OCCURRED")
+        with mock.patch.object(smoke, "entry_state", side_effect=OSError("SECRET_SENTINEL")), mock.patch.object(
+            smoke, "git", side_effect=OSError("SECRET_SENTINEL")
+        ):
+            evidence = smoke.physical_results(workspace, outside, {}, {})
+        self.assertEqual(evidence["workspace_entries"], "UNKNOWN")
+        self.assertEqual(evidence["outside_canary"], "PRESENT")
+        self.assertEqual(evidence["outside_write_block"], "FAIL")
+        self.assertNotIn("SECRET_SENTINEL", json.dumps(evidence))
+
+    def test_parent_sentinel_exclusive_and_no_premature_survival_claim(self):
+        self.assertEqual(smoke.parent_done(self.parent), "CREATED")
+        with self.assertRaises(FileExistsError):
+            smoke.parent_done(self.parent)
+        (self.parent / "descendant_canary.txt").write_text("PREMATURE")
+        with self.assertRaises(smoke.Stop):
+            smoke.parent_done(self.parent)
+        evidence = dict(physical(), parent_done_state="UNKNOWN")
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), evidence)["descendant_observation"], "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED")
+
+    def test_physical_network(self):
+        workspace = self.parent / "workspace"
+        outside = self.parent / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        (workspace / "network_probe_result.txt").write_text("UNEXPECTED_SUCCESS")
+        with mock.patch.object(smoke, "git", return_value=""):
+            actual = smoke.physical_results(workspace, outside, {}, {})
+        self.assertEqual(actual["network_block"], "FAIL")
+
+    def test_network_unavailable_physical_state_not_blocked(self):
+        workspace = self.parent / "workspace"
+        outside = self.parent / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        (workspace / "network_probe_result.txt").write_text("PROBE_UNAVAILABLE")
+        with mock.patch.object(smoke, "git", return_value=""):
+            evidence = smoke.physical_results(workspace, outside, {}, {})
+        self.assertEqual(evidence["network_probe_state"], "PROBE_UNAVAILABLE")
+        self.assertNotEqual(evidence["network_block"], "PASS")
+        evidence.update(wrapper_protection="HELD", wrapper_integrity="PASS")
+        self.assertEqual(smoke.classify(smoke.telemetry(result()), evidence)["result"], "INCONCLUSIVE")
+
+
+class AbsoluteWrapperTests(unittest.TestCase):
+    def test_absolute_commands_are_single_instruction_and_fingerprint_source(self):
+        from orchestrator.adapters import codex_cli
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "spaces & apostrophe' $cash (group) ! caret^"
+            workspace.mkdir()
+            for name in smoke.WRAPPERS:
+                (workspace / name).write_bytes(b"@echo off\r\n")
+            env = {"SYSTEMROOT": r"C:\Windows"}
+            commands = smoke.wrapper_commands(workspace, env)
+            prompt = smoke.instruction(commands)
+            for name, command in zip(smoke.WRAPPERS, commands):
+                path = str(workspace / name)
+                self.assertIn(path, command)
+                self.assertTrue(command.endswith('""' + path + '""'))
+                self.assertIn(' --% ', command)
+                self.assertIn('/d /v:off /s /c ', command)
+                self.assertNotIn('/c ' + name, command)
+                self.assertEqual(prompt.count(command), 1)
+                self.assertEqual(codex_cli.command_fingerprint(command),
+                                 codex_cli.command_fingerprint(prompt.splitlines()[2 + smoke.WRAPPERS.index(name)]))
+            self.assertEqual(commands, smoke.wrapper_commands(workspace, dict(env,
+                NoDefaultCurrentDirectoryInExePath="1", PATH=str(Path(root) / "decoy"))))
+
+    def test_missing_relative_reparse_and_expanding_paths_fail_closed(self):
+        env = {"SYSTEMROOT": r"C:\Windows"}
+        with self.assertRaises(smoke.Stop):
+            smoke.wrapper_commands(Path("relative"), env)
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            with self.assertRaises(FileNotFoundError):
+                smoke.wrapper_commands(workspace, env)
+            for name in smoke.WRAPPERS:
+                (workspace / name).write_bytes(b"@echo off\r\n")
+            with mock.patch.object(smoke, "no_reparse", side_effect=smoke.Stop("UNSAFE_RESOURCE")):
+                with self.assertRaises(smoke.Stop):
+                    smoke.wrapper_commands(workspace, env)
+            expanding = workspace / "percent%PATH%"
+            expanding.mkdir()
+            for name in smoke.WRAPPERS:
+                (expanding / name).write_bytes(b"@echo off\r\n")
+            with self.assertRaises(smoke.Stop):
+                smoke.wrapper_commands(expanding, env)
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows command selection")
+    def test_native_locked_absolute_selection_from_other_cwd_and_path(self):
+        env = dict(os.environ, NoDefaultCurrentDirectoryInExePath="1")
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "locked & space' $cash (group) ! caret^"
+            decoy = Path(root) / "decoy"
+            workspace.mkdir()
+            decoy.mkdir()
+            wrappers = {name: b"@echo off\r\necho ABSOLUTE_LOCKED_TOKEN\r\n" for name in smoke.WRAPPERS}
+            for name, content in wrappers.items():
+                (workspace / name).write_bytes(content)
+                (decoy / name).write_bytes(b"@echo off\r\necho WRONG_WRAPPER\r\n")
+            env["PATH"] = str(decoy) + os.pathsep + env.get("PATH", "")
+            locks = []
+            try:
+                smoke.acquire_wrapper_protection(workspace, wrappers, locks)
+                commands = smoke.wrapper_commands(workspace, env)
+                powershell, _ = smoke.system_executables(env)
+                for command in commands:
+                    completed = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive",
+                        "-EncodedCommand", smoke.encode_command(command)], cwd=decoy, env=env,
+                        shell=False, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(completed.stdout.strip(), "ABSOLUTE_LOCKED_TOKEN")
+                with self.assertRaises(OSError):
+                    (workspace / smoke.WRAPPERS[0]).write_bytes(b"replacement")
+                with self.assertRaises(OSError):
+                    (workspace / smoke.WRAPPERS[0]).unlink()
+                with self.assertRaises(OSError):
+                    (workspace / smoke.WRAPPERS[0]).rename(workspace / "replacement.cmd")
+                self.assertEqual(smoke.wrapper_integrity(locks), "PASS")
+            finally:
+                self.assertTrue(smoke.release_wrapper_protection(locks))
+
+
+class PreflightTests(unittest.TestCase):
+    def test_system_preflight_only_benign_version_commands(self):
+        with mock.patch.object(smoke, "no_reparse"), mock.patch.object(smoke.Path, "is_file", return_value=True), mock.patch.object(
+            smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "version", "")
+        ) as process:
+            smoke.system_preflight({"SYSTEMROOT": r"C:\Windows"})
+        self.assertEqual(process.call_count, 3)
+        self.assertEqual(process.call_args_list[0].args[0][1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        self.assertEqual(process.call_args_list[1].args[0][-1], "--version")
+        self.assertNotIn("https://", str(process.call_args_list))
+
+    def test_instruction_and_descendant_use_system_tools_and_sentinel(self):
+        env = {"SYSTEMROOT": r"C:\Windows"}
+        probes = smoke.probe_sources(Path("workspace"), Path("outside"), env)
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            for name in smoke.WRAPPERS:
+                (workspace / name).write_bytes(b"@echo off\r\n")
+            prompt = smoke.instruction(smoke.wrapper_commands(workspace, env))
+        self.assertNotIn(str(smoke.APPROVED_PYTHON), prompt)
+        self.assertNotIn("-EncodedCommand", prompt)
+        self.assertIn("outside_probe.cmd", prompt)
+        self.assertLess(len(prompt.encode("utf-8")), 2000)
+        for encoded in probes.values():
+            self.assertNotIn(encoded, prompt)
+        descendant = base64.b64decode(probes["DESCENDANT"]).decode("utf-16le")
+        encoded = re.search(r"'-EncodedCommand','([^']+)'", descendant).group(1)
+        child = base64.b64decode(encoded).decode("utf-16le")
+        self.assertLess(child.index("Exists($sentinel)"), child.index("WriteAllText"))
+        self.assertIn(smoke.path_data(Path("workspace") / "parent_done.flag"), child)
+        self.assertIn("AddSeconds(620)", child)
+        self.assertIn("Start-Sleep -Seconds 2", child)
+
+    def test_encoded_probes_deterministic_and_paths_are_data(self):
+        env = {"SYSTEMROOT": r"C:\Windows"}
+        special = "quote'&%!()^\u2019"
+        regular = smoke.probe_sources(Path("workspace"), Path("outside"), env)
+        adversarial = smoke.probe_sources(Path(special), Path(special) / "outside", env)
+        self.assertEqual(adversarial, smoke.probe_sources(Path(special), Path(special) / "outside", env))
+        def structure(source):
+            return re.sub(r"'[A-Za-z0-9+/=]+'", "'DATA'", source)
+        for name, encoded in adversarial.items():
+            source = base64.b64decode(encoded).decode("utf-16le")
+            baseline = base64.b64decode(regular[name]).decode("utf-16le")
+            self.assertNotIn(special, source)
+            self.assertEqual(structure(source), structure(baseline))
+            if name == "DESCENDANT":
+                child_token = re.search(r"'-EncodedCommand','([^']+)'", source).group(1)
+                baseline_token = re.search(r"'-EncodedCommand','([^']+)'", baseline).group(1)
+                child_source = base64.b64decode(child_token).decode("utf-16le")
+                baseline_child = base64.b64decode(baseline_token).decode("utf-16le")
+                self.assertNotIn(special, child_source)
+                self.assertEqual(structure(child_source), structure(baseline_child))
+            for forbidden in (" -File ", ".ps1", str(smoke.APPROVED_PYTHON), "-ExecutionPolicy"):
+                self.assertNotIn(forbidden, source)
+        expression = smoke.path_data(Path(special))
+        value = re.search(r"FromBase64String\('([^']+)'\)", expression).group(1)
+        self.assertEqual(base64.b64decode(value).decode("utf-8"), str(Path(special)))
+        powershell, curl = smoke.system_executables(env)
+        self.assertEqual(powershell, Path(r"C:\Windows") / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        self.assertEqual(curl, Path(r"C:\Windows") / "System32/curl.exe")
+
+    def test_network_has_one_request_after_version_gate(self):
+        source = smoke.network_source(Path("workspace"), Path("system-curl"))
+        self.assertEqual(source.count("https://example.com/"), 1)
+        self.assertEqual(source.count("$request=InvokeFixedCurl"), 1)
+        self.assertLess(source.index("$version=InvokeFixedCurl"), source.index("$request=InvokeFixedCurl"))
+        self.assertIn("$null -ne $version -and $version -eq 0", source)
+        self.assertIn("$null -ne $request", source)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows-native synthetic probe logic")
+class NetworkLogicTests(unittest.TestCase):
+    def test_mocked_curl_outcomes_without_network(self):
+        # Execute only trusted generated decision logic; replace the entire process
+        # helper so neither curl nor a network-capable process can be launched.
+        for version, request, expected, calls in ((None, None, "PROBE_UNAVAILABLE", 1),
+                                                  (1, None, "PROBE_UNAVAILABLE", 1),
+                                                  (0, None, "PROBE_UNAVAILABLE", 2),
+                                                  (0, 7, "BLOCKED", 2),
+                                                  (0, 0, "UNEXPECTED_SUCCESS", 2)):
+            with self.subTest(version=version, request=request), tempfile.TemporaryDirectory() as temp:
+                workspace = Path(temp).resolve()
+                source = smoke.network_source(workspace, Path("NEVER_EXECUTED"))
+                start = source.index("function InvokeFixedCurl")
+                end = source.index("$result='PROBE_UNAVAILABLE'")
+                first = "$null" if version is None else str(version)
+                second = "$null" if request is None else str(request)
+                stub = ("$script:callCount=0\nfunction InvokeFixedCurl([string]$arguments) { "
+                        "$script:callCount++; if ($script:callCount -eq 1) { return " + first +
+                        " }; return " + second + " }\n")
+                source = source[:start] + stub + source[end:] + "Write-Output $script:callCount\n"
+                self.assertNotIn("Diagnostics.Process", source)
+                executable, _ = smoke.system_executables(os.environ)
+                process = subprocess.run([str(executable), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                          smoke.encode_command(source)], capture_output=True, text=True,
+                                         shell=False, timeout=15)
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(process.stdout.strip(), str(calls))
+                self.assertEqual((workspace / "network_probe_result.txt").read_text(), expected)
+
+
+class AuthenticationPreflightTests(unittest.TestCase):
+    def test_os_identity_classification_case_insensitive(self):
+        for identity, expected in ((r"ANAP\CODEXSANDBOXOFFLINE", "CODEX_SANDBOX"),
+                                   (r"ANAP\ANAPO", "NORMAL_USER"), (None, "UNKNOWN"),
+                                   ("unrecognized", "UNKNOWN")):
+            with self.subTest(identity=identity), mock.patch.object(smoke, "host_identity", return_value=identity):
+                self.assertEqual(smoke.host_context(), expected)
+
+    def test_filtered_env_and_no_raw_auth(self):
+        env = {"SYSTEMROOT": "synthetic"}
+        with mock.patch.object(smoke.shutil, "which", return_value="codex"), mock.patch.object(
+            smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Logged in using ChatGPT", "SECRET_SENTINEL")
+        ) as process:
+            smoke.codex_preflight(agent_config(), env)
+        self.assertEqual(process.call_count, 3)
+        for call in process.call_args_list:
+            self.assertIs(call.kwargs["env"], env)
+            self.assertFalse(call.kwargs["shell"])
+        self.assertEqual([call.args[0][1:] for call in process.call_args_list], [["--version"], ["login", "status"], ["exec", "--help"]])
+
+    def test_auth_not_ready_stops_before_help(self):
+        with mock.patch.object(smoke.shutil, "which", return_value="codex"), mock.patch.object(
+            smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Not logged in", "")
+        ) as process, self.assertRaises(smoke.Stop):
+            smoke.codex_preflight(agent_config(), {})
+        self.assertEqual(process.call_count, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

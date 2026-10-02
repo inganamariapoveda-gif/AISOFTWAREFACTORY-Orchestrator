@@ -37,6 +37,123 @@ SUCCESS_OUTPUT = jsonl(
 
 
 class CodexAdapterTests(unittest.TestCase):
+    def test_strict_schema_diagnostics_are_unique_private_and_non_authoritative(self):
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("PRIVATE_EXACT")),)
+        for fields, present, string, matched in (({}, 0, 0, False),
+                ({"command": None}, 1, 0, False), ({"command": ["PRIVATE_ARGV"]}, 1, 0, False),
+                ({"command": "PRIVATE_OUTER_COMMAND"}, 1, 1, False),
+                ({"command": "PRIVATE_EXACT"}, 1, 1, True)):
+            with self.subTest(present=present, string=string, matched=matched):
+                item = dict(id="PRIVATE_DIAGNOSTIC_ID", type="command_execution", **fields)
+                output = jsonl({"type": "turn.started"}, *(
+                    {"type": kind, "item": item} for kind in ("item.started", "item.updated", "item.completed")),
+                    {"type": "turn.completed"})
+                actual, _ = self.call(output=output, expected_commands=expected)
+                self.assertEqual(actual.command_execution_count, 1)
+                self.assertEqual(actual.command_field_present_count, present)
+                self.assertEqual(actual.command_field_string_count, string)
+                self.assertEqual(actual.lifecycle_command_consistent_count, string)
+                self.assertEqual(actual.command_attestations[0].observed, matched)
+                self.assertEqual(actual.unexpected_command_execution_count, int(bool(string and not matched)))
+                public = repr(asdict(actual))
+                for private in ("PRIVATE_EXACT", "PRIVATE_OUTER_COMMAND", "PRIVATE_ARGV", "PRIVATE_DIAGNOSTIC_ID"):
+                    self.assertNotIn(private, public)
+                neutral, _ = self.call(output=output)
+                self.assertEqual(neutral.command_field_present_count, 0)
+                self.assertEqual(neutral.command_field_string_count, 0)
+                self.assertEqual(neutral.lifecycle_command_consistent_count, 0)
+
+    def test_schema_diagnostics_conflict_and_missing_event_still_fail_closed(self):
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("EXACT")),)
+        first = dict(id="PRIVATE_ID", type="command_execution", command="EXACT")
+        for last in (dict(first, command="CHANGED"), dict(id="PRIVATE_ID", type="command_execution")):
+            actual, _ = self.call(output=jsonl({"type": "turn.started"},
+                {"type": "item.started", "item": first}, {"type": "item.completed", "item": last},
+                {"type": "turn.completed"}), expected_commands=expected)
+            self.assertEqual(actual.command_field_present_count, 1)
+            self.assertEqual(actual.command_field_string_count, 1)
+            self.assertEqual(actual.lifecycle_command_consistent_count, 0)
+            self.assertFalse(actual.command_attestations[0].consistent)
+            self.assertEqual(actual.command_payload_conflict_count, int("command" in last))
+            self.assertEqual(actual.malformed_command_attestation_count, int("command" not in last))
+
+    def test_strict_command_attestation_matrix(self):
+        commands = ("OUTSIDE_EXACT", "NETWORK_EXACT", "DESCENDANT_EXACT")
+        expectations = tuple(codex_cli.CommandExpectation(codex_cli.command_fingerprint(value)) for value in commands)
+        def item(identity, command, kind="command_execution"):
+            return {"id": identity, "type": kind, "command": command}
+        def stream(items):
+            return jsonl({"type": "turn.started"}, *items, {"type": "turn.completed"})
+        events = []
+        for index, command in enumerate(commands):
+            payload = item(f"PRIVATE_ITEM_ID_{index}", command)
+            events.extend({"type": kind, "item": payload} for kind in ("item.started", "item.updated", "item.completed"))
+        result, _ = self.call(output=stream(events), expected_commands=expectations)
+        self.assertEqual(result.command_execution_count, 3)
+        self.assertTrue(all(value.observed and value.started and value.completed and value.consistent and not value.duplicate
+                            for value in result.command_attestations))
+        self.assertEqual(result.unexpected_command_execution_count, 0)
+        public = repr(asdict(result))
+        self.assertNotIn("PRIVATE_ITEM_ID_", public)
+        for value in commands:
+            self.assertNotIn(value, public)
+            self.assertNotIn(codex_cli.command_fingerprint(value).hex(), public)
+            self.assertNotIn(repr(codex_cli.command_fingerprint(value)), public)
+        for extra, field in ((item("extra", "UNEXPECTED"), "unexpected_command_execution_count"),
+                             (item("file", "unused", "file_change"), "file_change_item_count"),
+                             (item("tool", "unused", "mcp_tool_call"), "unexpected_action_item_count")):
+            actual, _ = self.call(output=stream(events + [{"type": "item.completed", "item": extra}]), expected_commands=expectations)
+            self.assertEqual(getattr(actual, field), 1)
+        duplicate = item("different-id", commands[0])
+        actual, _ = self.call(output=stream(events + [{"type": "item.started", "item": duplicate},
+            {"type": "item.completed", "item": duplicate}]), expected_commands=expectations)
+        self.assertTrue(actual.command_attestations[0].duplicate)
+        self.assertFalse(actual.command_attestations[0].consistent)
+
+    def test_strict_missing_nonstring_and_lifecycle(self):
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("EXACT")),)
+        for value in (None, [], 5):
+            payload = {"id": "PRIVATE_ID", "type": "command_execution", "command": value}
+            actual, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "item.completed", "item": payload},
+                {"type": "turn.completed"}), expected_commands=expected)
+            self.assertEqual(actual.malformed_command_attestation_count, 1)
+            self.assertFalse(actual.command_attestations[0].consistent)
+        payload = {"id": "PRIVATE_ID", "type": "command_execution", "command": "EXACT"}
+        for kind in ("item.started", "item.completed"):
+            actual, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": kind, "item": payload},
+                {"type": "turn.completed"}), expected_commands=expected)
+            self.assertFalse(actual.command_attestations and all(v.started and v.completed for v in actual.command_attestations))
+        missing = {"id": "PRIVATE_ID", "type": "command_execution"}
+        actual, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "item.completed", "item": missing},
+            {"type": "turn.completed"}), expected_commands=expected)
+        self.assertEqual(actual.malformed_command_attestation_count, 1)
+
+    def test_strict_payload_conflict_and_exact_representation(self):
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("EXACT")),)
+        first = {"id": "PRIVATE_ID", "type": "command_execution", "command": "EXACT"}
+        for changed in ("EXACT ", "exact", "prefix EXACT suffix"):
+            last = dict(first, command=changed)
+            actual, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "item.started", "item": first},
+                {"type": "item.completed", "item": last}, {"type": "turn.completed"}), expected_commands=expected)
+            self.assertEqual(actual.command_payload_conflict_count, 1)
+            self.assertFalse(actual.command_attestations[0].consistent)
+        failed_command = dict(first, status="failed", exit_code=1)
+        actual, _ = self.call(output=jsonl({"type": "turn.started"}, {"type": "item.started", "item": first},
+            {"type": "item.completed", "item": failed_command}, {"type": "turn.completed"}), expected_commands=expected)
+        self.assertTrue(actual.command_attestations[0].completed)
+        self.assertFalse(hasattr(actual.command_attestations[0], "succeeded"))
+
+    def test_strict_default_neutral_invalid_expectations_and_malformed_stream(self):
+        actual, _ = self.call()
+        self.assertEqual(actual.command_attestations, ())
+        expected = codex_cli.CommandExpectation(codex_cli.command_fingerprint("PRIVATE_COMMAND"))
+        for expectations in ((expected, expected), (codex_cli.CommandExpectation(b"bad"),)):
+            actual, process = self.call(expected_commands=expectations)
+            process.assert_not_called()
+        actual, _ = self.call(output="not-json", expected_commands=(expected,))
+        self.assertEqual(actual.failure_category.value, "MALFORMED_OUTPUT")
+        self.assertEqual(actual.command_attestations, ())
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

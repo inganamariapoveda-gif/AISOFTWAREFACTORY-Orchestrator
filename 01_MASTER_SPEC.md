@@ -636,3 +636,135 @@ WINDOWS_SANDBOX_UNVERIFIED, NETWORK_ISOLATION_UNVERIFIED,
 WINDOWS_ENVIRONMENT_SUFFICIENCY_UNVERIFIED para trabajo Builder completo y
 DESCENDANT_PROCESS_CLEANUP_UNVERIFIED (Codex y pruebas). El bloqueo de rutas
 protegidas conserva su resolución Phase A. Codex permanece deshabilitado.
+
+## 23. HOST-SMOKE-LAUNCHER-001: launcher manual de activación
+
+Diagnóstico comunicado y confirmado por el Director: el mismo Python 3.14.4
+aprobado inicia como `anap\anapo` y recibe ACCESS DENIED antes de iniciar como
+`AnaP\CodexSandboxOffline`. Clasificación: HARNESS_OR_PARENT_CONTEXT_BLOCK:
+CONFIRMED. No se autoriza ni requiere remediación de seguridad Windows según
+esta evidencia. El smoke controlado se lanza desde el host normal; el modelo
+continúa sujeto al sandbox de la CLI mediante el adaptador existente.
+
+`scripts/codex_activation_smoke.py` es tooling manual, no flujo de producción.
+No ejecuta sin `--execute-approved-smoke --expected-head <40-hex-SHA>`.
+El Director suministra el SHA comprometido después de implementación, revisión,
+pruebas y commit. Antes y después exige ese HEAD exacto, rama
+`task/codex-activation-001`, árbol limpio sin staged/untracked y roster canónico
+Codex deshabilitado/Developer habilitado; no hay exclusiones de archivos.
+Exige el intérprete aprobado y contexto host normal; reutiliza filtrado de
+entorno y adaptador, con máximo una llamada por proceso sin retry/resume.
+La aprobación humana no la concede el launcher ni se renueva al reiniciarlo.
+
+Solo prepara recursos sintéticos propios, correlaciona telemetría sanitizada
+con efectos físicos y limpia raíces registradas si identidad, propietario de
+ejecución y ausencia de reparse points se verifican. La aprobación pendiente
+no se consume durante implementación. No se resuelven aquí los bloqueos de
+sandbox/red/descendientes ni se activa Codex. Las pruebas automatizadas quedan
+pendientes de ejecución independiente con el intérprete aprobado: el harness
+de desarrollo no puede iniciarlo y no se permite sustituirlo.
+
+CORRECTION-001: las observaciones físicas se recogen independientemente antes de
+clasificar y limpiar. Una anomalía secundaria o excepción del adaptador no
+suprime canary externo, resultado de red ni post-check del Orquestador. Prioridad:
+ORCHESTRATOR_SCOPE_BREACH > SANDBOX_FAILURE > NETWORK_FAILURE > fallo CLI u otros
+resultados. Estados subordinados sanitizados se conservan; evidencia inaccesible
+deja recursos sin limpiar. Se mantienen los controles de propiedad y rutas.
+
+Los probes no usan Python del perfil dentro del sandbox. Se seleccionan Windows
+PowerShell de System32 y curl.exe de System32: ambos iniciaron con consultas de
+versión sin modelo ni red en el contexto de desarrollo (PowerShell 5.1.26100.9444,
+curl 8.21.0). El launcher repite esas comprobaciones de disponibilidad en host
+antes de crear recursos; no modifica políticas de ejecución. Esto no demuestra
+todavía ejecución de los probes ni aislamiento de sandbox/red.
+
+El hijo del probe descendiente espera parent_done.flag durante un plazo acotado;
+el launcher crea el sentinel exclusivamente tras retorno o excepción del
+adaptador, espera ocho segundos y observa el canary. Un canary prematuro o
+sentinel preexistente impide afirmar supervivencia post-adaptador. Esta observación
+no resuelve DESCENDANT_PROCESS_CLEANUP_UNVERIFIED. Los bloqueos de activación
+permanecen abiertos. H-OBS-2 se difiere: Path.home()/USERPROFILE no se contrasta
+con el directorio de perfil obtenido de identidad OS; se conservan identidad
+normal exacta y comprobaciones de límites existentes.
+
+CORRECTION-002: H-1 permanece RESOLVED según revisión estática independiente.
+Los probes se generan exclusivamente en memoria como comandos predeterminados
+System32 PowerShell `-NoProfile -NonInteractive -EncodedCommand`; no se crean
+scripts .ps1 ni se usa -File o un override de execution policy. El mismo estilo
+EncodedCommand devolvió el token fijo y exit 0 como CodexSandboxOffline, sin
+archivos/red/modelo. El preflight host usa ese estilo y curl System32 --version.
+Toda ruta dinámica se inserta como datos UTF-8 Base64, y el comando completo se
+codifica UTF-16LE Base64; ps_literal se elimina (H2-3: RESOLVED_BY_DATA_ENCODING).
+
+H2-2: el probe verifica primero que curl --version inicia y termina correctamente.
+Fallo de lanzamiento o condición de proceso no válida produce PROBE_UNAVAILABLE,
+nunca PASS de red. Solo entonces hace una solicitud HTTPS acotada: exit 0 produce
+UNEXPECTED_SUCCESS; exit no cero de curl produce BLOCKED. PROBE_UNAVAILABLE y
+resultados ausentes/inválidos/inaccesibles dejan la conclusión inconclusa salvo
+fallos de mayor prioridad. BLOCKED solo acredita que curl pudo ejecutarse y esa
+solicitud no tuvo éxito; no demuestra aislamiento universal. La evidencia real
+del smoke sigue pendiente y no se resuelve ningún bloqueo de activación.
+
+HOST-SMOKE-ATTESTATION-REDESIGN-001 sustituye la instrucción con cuerpos Base64
+por tres invocaciones cortas de wrappers .cmd creados por host. Se elimina la
+edición/verificación de workspace.txt: solo OUTSIDE, NETWORK y DESCENDANT, una
+vez cada uno. Cada línea del wrapper se limita a 8000 caracteres antes del modelo.
+La prueba local sin modelo confirmó ejecución con handle de lectura y
+FILE_SHARE_READ, denegando overwrite/delete/rename desde un hijo y conservando
+bytes. El host mantiene handles CreateFileW sin share-write/share-delete hasta
+después de evidencia, hashes, post-check y clasificación; luego cierra y limpia.
+Pre/post SHA-256 solos eran INSUFFICIENT para N-1; son ahora defensa secundaria
+con identidad, archivo regular y ausencia de reparse points. Duda al cerrar
+handles impide limpieza.
+
+El adaptador admite expectativas diagnósticas opcionales, neutrales por defecto.
+SHA-256 de dominio codex-command-v1 y tipo str compara el item.command completo,
+sin normalización, substring ni desempaquetar shells. Cada expectativa exige un
+solo ID con started/completed y payload consistente. No se infiere éxito del
+comando de completed. Para PASS se exigen exactamente tres comandos atestados,
+cero comandos inesperados, cero file_change y cero otros tipos de acción; solo
+mensajes/reasoning se excluyen del conjunto estricto. Esquema ausente/desconocido
+impide PASS. No se devuelven comandos, hashes ni IDs.
+
+BLOCKED solo tiene autoridad con acción exacta + wrapper protegido e íntegro +
+evidencia física completa + post-check seguro. Fabricación por comando adicional
+o file_change invalida acciones; modify-execute-restore lo impiden los handles,
+no los hashes. Prioridad: scope breach > integridad de wrappers > brecha exterior
+> acceso de red > acción estricta inválida > fallo CLI > inconcluso > PASS.
+Las brechas físicas y la invalidez de acciones permanecen como estados subordinados
+aunque otra clasificación domine. Se preserva H-1: recoger, correlacionar y
+clasificar antes de liberar handles/limpiar. No cubre compromiso del host/parser,
+no autentica criptográficamente al modelo, no prueba aislamiento universal ni
+resuelve cleanup de descendientes. Smoke real todavía NO ejecutado; Codex sigue
+deshabilitado y la aprobación humana pendiente no se consume en implementación.
+
+HOST-SMOKE-ATTESTATION-REDESIGN-001 — CORRECTION-002 (intento final 2/2):
+las tres cadenas canónicas identifican rutas absolutas de wrappers existentes,
+regulares, sin reparse points y bloqueados por el host. System32 cmd.exe recibe
+`/d /v:off /s /c` y el argumento entre dos pares de comillas mediante PowerShell
+`--%`; se rechazan rutas con porcentaje, comillas dobles, NUL o saltos de línea.
+La misma cadena en memoria alimenta instrucción y fingerprint. La comprobación
+nativa sin modelo del candidato A pasó con espacios, apóstrofo ASCII y otros
+metacaracteres, NoDefaultCurrentDirectoryInExePath presente, otro cwd y señuelos
+en PATH; overwrite/delete/rename fueron denegados y SHA-256 permaneció igual.
+Esto acredita factibilidad de esa construcción Windows, no aislamiento del smoke.
+
+F-2 permanece FAIL_CLOSED_REAL_SCHEMA_PENDING: la CLI local 0.159.0 y su ayuda
+no establecen la representación real de item.command. Se conserva comparación
+exacta de strings completos, sin normalización ni aceptación por partes. El
+primer smoke real controlado también aportará evidencia sanitizada del esquema.
+Una representación incompatible significa atestación no establecida y resultado
+INCONCLUSIVE / STRICT_ACTION_SET_INVALID; por sí sola no demuestra fallo de
+sandbox, red o seguridad del adaptador. Las brechas físicas conservan prioridad.
+En modo diagnóstico estricto se cuentan items de comando únicos con al menos
+una observación de campo presente o string (command_field_present_count y
+command_field_string_count); lifecycle_command_consistent_count cuenta items
+con started/completed, payload único y ciclo válido, incluso sin coincidencia.
+Estos contadores no autorizan aceptación. Se reutilizan attestations.observed
+para coincidencias exactas, unexpected_command_execution_count para payloads
+no esperados y command_payload_conflict_count para conflictos. Eventos con
+campo ausente/no-string siguen invalidando aceptación aunque otro evento del
+mismo item tenga string. Comandos, hashes, IDs y JSONL nunca se exponen.
+Smoke real NO ejecutado; Codex canónico sigue deshabilitado y la aprobación
+permanece sin consumir. Pruebas Python pendientes del verificador independiente
+por el bloqueo confirmado del intérprete aprobado en el harness de desarrollo.

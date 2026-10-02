@@ -7,6 +7,7 @@ and effective Windows sandbox boundaries remain activation-review limitations.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import os
 import shutil
@@ -53,6 +54,98 @@ class CodexFailureCategory(str, enum.Enum):
 
 
 @dataclass(frozen=True)
+class CommandExpectation:
+    fingerprint: bytes
+
+
+@dataclass(frozen=True)
+class CommandAttestation:
+    observed: bool = False
+    started: bool = False
+    completed: bool = False
+    consistent: bool = False
+    duplicate: bool = False
+
+
+def command_fingerprint(command: str) -> bytes:
+    if type(command) is not str:
+        raise ValueError("invalid diagnostic command")
+    return hashlib.sha256(b"codex-command-v1\0str\0" + command.encode("utf-8")).digest()
+
+
+def _validate_expectations(expectations):
+    if not isinstance(expectations, tuple) or any(
+        not isinstance(value, CommandExpectation) or type(value.fingerprint) is not bytes
+        or len(value.fingerprint) != 32 for value in expectations
+    ) or len({value.fingerprint for value in expectations}) != len(expectations):
+        raise ValueError("invalid command expectations")
+
+
+class _CommandTracker:
+    """Private transient state: IDs/digests never leave this parser helper."""
+    def __init__(self, expectations):
+        self.expected = tuple(value.fingerprint for value in expectations)
+        self.items = {}
+        self.other_ids = set()
+        self.types = {}
+        self.malformed = 0
+        self.conflicts = 0
+
+    def observe(self, kind, item):
+        identity, item_type = item["id"], item["type"]
+        if identity in self.types and self.types[identity] != item_type:
+            self.conflicts += 1
+        self.types[identity] = item_type
+        if item_type != "command_execution":
+            if item_type not in {"agent_message", "reasoning", "file_change"}:
+                self.other_ids.add(identity)
+            return
+        state = self.items.setdefault(identity, dict(digests=set(), started=False, completed=False, valid=True,
+                                                     field_present=False, field_string=False))
+        # Diagnostic counts are unique command items with at least one suitable
+        # observation, not event counts. Acceptance still validates every event.
+        state["field_present"] |= "command" in item
+        state["field_string"] |= type(item.get("command")) is str
+        if type(item.get("command")) is not str:
+            self.malformed += 1
+            state["valid"] = False
+        else:
+            digest = command_fingerprint(item["command"])
+            if state["digests"] and digest not in state["digests"]:
+                self.conflicts += 1
+                state["valid"] = False
+            state["digests"].add(digest)
+        if kind == "item.started":
+            if state["started"] or state["completed"]:
+                state["valid"] = False
+            state["started"] = True
+        elif kind == "item.completed":
+            state["completed"] = True
+        elif state["completed"]:
+            state["valid"] = False
+
+    def summary(self):
+        attestations = []
+        for digest in self.expected:
+            matches = [state for state in self.items.values() if digest in state["digests"]]
+            unique = len(matches) == 1
+            state = matches[0] if unique else {}
+            attestations.append(CommandAttestation(bool(matches), state.get("started", False),
+                state.get("completed", False), unique and state["valid"] and self.conflicts == 0,
+                len(matches) > 1))
+        return dict(command_attestations=tuple(attestations),
+            command_field_present_count=sum(state["field_present"] for state in self.items.values()),
+            command_field_string_count=sum(state["field_string"] for state in self.items.values()),
+            lifecycle_command_consistent_count=sum(state["valid"] and state["started"]
+                and state["completed"] and len(state["digests"]) == 1 for state in self.items.values()),
+            unexpected_command_execution_count=sum(
+                bool(state["digests"] - set(self.expected)) for state in self.items.values()),
+            malformed_command_attestation_count=self.malformed,
+            command_payload_conflict_count=self.conflicts,
+            unexpected_action_item_count=len(self.other_ids))
+
+
+@dataclass(frozen=True)
 class CodexResult:
     """SUCCESS means turn completion at the adapter boundary, not task approval."""
     completed: bool
@@ -68,6 +161,14 @@ class CodexResult:
     command_execution_count: int = 0
     file_change_item_count: int = 0
     action_evidence_observed: bool = False
+    command_attestations: tuple[CommandAttestation, ...] = ()
+    unexpected_command_execution_count: int = 0
+    malformed_command_attestation_count: int = 0
+    command_payload_conflict_count: int = 0
+    unexpected_action_item_count: int = 0
+    command_field_present_count: int = 0
+    command_field_string_count: int = 0
+    lifecycle_command_consistent_count: int = 0
 
 
 def _result(category: CodexFailureCategory, code: int | None = None,
@@ -102,7 +203,8 @@ def _reject_constant(value: str) -> None:
     raise ValueError("non-JSON constant")
 
 
-def _parse_output(stdout: str, returncode: int) -> CodexResult:
+def _parse_output(stdout: str, returncode: int,
+                  expected_commands: tuple[CommandExpectation, ...] = ()) -> CodexResult:
     # No reliable structured auth/capacity/resource marker has been verified.
     # Those enum values are reserved; free-form stderr is never classified.
     if returncode != 0:
@@ -114,6 +216,7 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
     counts = dict(event_count=0, item_started_count=0, item_completed_count=0,
                   command_execution_count=0, file_change_item_count=0)
     action_ids: dict[str, str] = {}
+    tracker = _CommandTracker(expected_commands) if expected_commands else None
     try:
         for line in stdout.splitlines():
             if not line.strip():
@@ -146,6 +249,8 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
                 item_type = item.get("type")
                 if not isinstance(item_type, str) or not item["id"]:
                     raise ValueError
+                if tracker is not None:
+                    tracker.observe(kind, item)
                 if item_type in {"command_execution", "file_change"}:
                     previous = action_ids.get(item["id"])
                     if previous is not None and previous != item_type:
@@ -166,20 +271,23 @@ def _parse_output(stdout: str, returncode: int) -> CodexResult:
                     pending_items.discard(item["id"])
             else:
                 raise ValueError
-    except (ValueError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError, UnicodeError):
         return _result(CodexFailureCategory.MALFORMED_OUTPUT, returncode)
     if not seen or terminal is None:
         return _result(CodexFailureCategory.MALFORMED_OUTPUT, returncode)
+    diagnostic = tracker.summary() if tracker is not None else {}
     if terminal == "turn.failed":
         return _result(CodexFailureCategory.UNKNOWN, returncode, terminal,
-                       **counts, action_evidence_observed=bool(action_ids))
+                       **counts, action_evidence_observed=bool(action_ids), **diagnostic)
     return _result(CodexFailureCategory.SUCCESS, returncode, terminal,
-                   **counts, action_evidence_observed=bool(action_ids))
+                   **counts, action_evidence_observed=bool(action_ids), **diagnostic)
 
 
 def run_codex_task(*, repository_root: Path, authorized_root: Path,
-                   instruction: str, execution_config: dict[str, Any]) -> CodexResult:
+                   instruction: str, execution_config: dict[str, Any],
+                   expected_commands: tuple[CommandExpectation, ...] = ()) -> CodexResult:
     try:
+        _validate_expectations(expected_commands)
         settings = validate_codex_execution_config(execution_config)
         root = Path(repository_root).resolve(strict=True)
         allowed = Path(authorized_root).resolve(strict=True)
@@ -221,4 +329,4 @@ def run_codex_task(*, repository_root: Path, authorized_root: Path,
         return _result(CodexFailureCategory.MALFORMED_OUTPUT)
     except OSError:
         return _result(CodexFailureCategory.PROCESS_FAILURE)
-    return _parse_output(completed.stdout, completed.returncode)
+    return _parse_output(completed.stdout, completed.returncode, expected_commands)
