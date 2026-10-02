@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -28,6 +29,9 @@ def result(action=True, category="SUCCESS"):
     return SimpleNamespace(failure_category=SimpleNamespace(value=category),
                            process_return_code=0, terminal_status="turn.completed",
                            event_count=4, item_started_count=1, item_completed_count=1,
+                           item_type_counts={"agent_message": 1, "reasoning": 0, "command_execution": 3 if action else 0,
+                                             "file_change": 0, "mcp_tool_call": 0, "collab_tool_call": 0,
+                                             "web_search": 0, "todo_list": 0},
                            command_execution_count=3 if action else 0, file_change_item_count=0,
                            command_attestations=tuple(SimpleNamespace(observed=True, started=True,
                                completed=True, consistent=True, duplicate=False) for _ in range(3)) if action else (),
@@ -360,7 +364,7 @@ class LauncherFlowTests(unittest.TestCase):
                     self.mocks["cleanup"].side_effect = self.cleanup_impl
                     with mock.patch.object(smoke.shutil, "rmtree", side_effect=error) as delete:
                         report = smoke.run(ARGS)
-                    delete.assert_called_once_with(path)
+                    delete.assert_called_once_with(path, onexc=mock.ANY)
                     self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
                     self.assertEqual(report["cleanup_detail"], category)
                     for output in (json.dumps(report), repr(report)):
@@ -435,6 +439,24 @@ class BaselineTests(unittest.TestCase):
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_item_counts_are_reported_but_do_not_authorize_actions(self):
+        from orchestrator.adapters import codex_cli
+        events = [{"type": "turn.started"}]
+        for kind in ("reasoning", "agent_message"):
+            events.append({"type": "item.completed", "item": {
+                "id": "PRIVATE_" + kind, "type": kind, "text": "PRIVATE_MODEL_CONTENT"}})
+        events.append({"type": "turn.completed"})
+        parsed = codex_cli._parse_output("\n".join(json.dumps(event) for event in events), 0)
+        meta = smoke.telemetry(parsed)
+        self.assertEqual(meta["item_type_counts"]["reasoning"], 1)
+        self.assertEqual(meta["item_type_counts"]["agent_message"], 1)
+        self.assertFalse(smoke.strict_actions(meta))
+        without_counts = dict(meta)
+        without_counts.pop("item_type_counts")
+        self.assertEqual(smoke.classify(meta, physical()), smoke.classify(without_counts, physical()))
+        self.assertNotIn("PRIVATE_", json.dumps(meta))
+        self.assertNotIn("PRIVATE_", repr(meta))
+
     def test_strict_attestation_required_for_each_control(self):
         for index in range(3):
             meta = smoke.telemetry(result())
@@ -555,6 +577,142 @@ class ResourceTests(unittest.TestCase):
         self.assertTrue(untouched.exists())
         self.assertTrue(self.parent.exists())
 
+    @unittest.skipUnless(os.name == "nt", "Windows read-only Git objects")
+    def test_real_git_readonly_objects_owned_cleanup(self):
+        ledger = []
+        root = self.parent / "owned-git"
+        root.mkdir()
+        smoke.record_root(root, "temp", ledger)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        hooks = workspace / "_tmp"
+        hooks.mkdir()
+        from orchestrator.adapters import codex_cli
+        env = dict(codex_cli._child_environment(), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_COUNT="0")
+        smoke.git(workspace, "init", env=env)
+        (workspace / "fixture.txt").write_text("harmless cleanup fixture", encoding="ascii")
+        smoke.git(workspace, "add", "--", "fixture.txt", env=env)
+        smoke.git(workspace, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                  "-c", "core.hooksPath=" + str(hooks), "-c", "commit.gpgsign=false",
+                  "commit", "-m", "fixture", env=env)
+        objects = [path for path in (workspace / ".git" / "objects").glob("*/*") if path.is_file()]
+        self.assertTrue(objects)
+        if not any(path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY for path in objects):
+            os.chmod(objects[0], stat.S_IREAD)
+        readonly = next(path for path in objects if path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+        with self.assertRaises(PermissionError):
+            os.unlink(readonly)
+        external = self.parent / "external.txt"
+        external.write_text("unchanged")
+        with mock.patch.object(smoke.os, "chmod", side_effect=AssertionError("attribute mutation")) as attributes, \
+                mock.patch.object(smoke.os, "fchmod", side_effect=AssertionError("attribute mutation")) as fd_attributes:
+            self.assertEqual(smoke.cleanup(ledger), ("COMPLETE", "COMPLETE"))
+        self.assertFalse(root.exists())
+        attributes.assert_not_called()
+        fd_attributes.assert_not_called()
+        self.assertEqual(external.read_text(), "unchanged")
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only attribute")
+    def test_readonly_retry_is_once_and_non_readonly_denial_is_not_retried(self):
+        ledger = []
+        root = self.owned("retry", ledger)
+        record = ledger[0]
+        record = smoke.OwnedRoot(root, record.parent, record.token, record.identity, "temp")
+        target = root / "workspace" / ".git" / "objects" / "aa" / "object"
+        target.parent.mkdir(parents=True)
+        target.write_text("fixture")
+        retry = smoke.readonly_git_cleanup_retry(record)
+        with mock.patch.object(smoke, "_delete_readonly_git_object", side_effect=OSError("PRIVATE_ERROR")) as delete:
+            with self.assertRaises(PermissionError):
+                retry(os.unlink, str(target), PermissionError("PRIVATE_ERROR"))
+            delete.assert_not_called()
+            os.chmod(target, stat.S_IREAD)
+            with self.assertRaises(OSError):
+                retry(os.unlink, str(target), PermissionError("PRIVATE_ERROR"))
+            delete.assert_called_once()
+            with self.assertRaises(PermissionError):
+                retry(os.unlink, str(target), PermissionError("PRIVATE_ERROR"))
+            delete.assert_called_once()
+
+    def test_readonly_callback_rejects_external_and_reparse_targets(self):
+        ledger = []
+        root = self.owned("bounded", ledger)
+        initial = ledger[0]
+        record = smoke.OwnedRoot(root, initial.parent, initial.token, initial.identity, "temp")
+        external = self.parent / "external"
+        external.write_text("untouched")
+        target = root / "workspace" / ".git" / "objects" / "aa" / "object"
+        target.parent.mkdir(parents=True)
+        target.write_text("fixture")
+        unlink, attributes = mock.Mock(), mock.Mock()
+        fake_os = SimpleNamespace(name="nt", unlink=unlink, chmod=attributes)
+        with mock.patch.object(smoke, "os", fake_os):
+            with self.assertRaises(smoke.Stop):
+                smoke.readonly_git_cleanup_retry(record)(unlink, str(external), PermissionError())
+            real_lstat = Path.lstat
+            def reparse(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if path == target.parent:
+                    return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
+                return info
+            with mock.patch.object(Path, "lstat", reparse):
+                with self.assertRaises(smoke.Stop):
+                    smoke.readonly_git_cleanup_retry(record)(unlink, str(target), PermissionError())
+            changed_root = smoke.OwnedRoot(root, record.parent, record.token,
+                                          (record.identity[0], record.identity[1] + 1), "temp")
+            with self.assertRaises(smoke.Stop):
+                smoke.readonly_git_cleanup_retry(changed_root)(unlink, str(target), PermissionError())
+            def hardlinked(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if path == target:
+                    return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0, st_nlink=2)
+                return info
+            with mock.patch.object(Path, "lstat", hardlinked):
+                with self.assertRaises(smoke.Stop):
+                    smoke.readonly_git_cleanup_retry(record)(unlink, str(target), PermissionError())
+        attributes.assert_not_called()
+        unlink.assert_not_called()
+        self.assertEqual(external.read_text(), "untouched")
+
+    def test_readonly_callback_unsafe_target_reports_safety_failure(self):
+        ledger = []
+        root = self.owned("callback-safety", ledger)
+        original = ledger[0]
+        ledger[0] = smoke.OwnedRoot(root, original.parent, original.token, original.identity, "temp")
+        external = self.parent / "external-callback"
+        external.write_text("untouched")
+        def delete(path, *, onexc):
+            with mock.patch.object(smoke, "os", SimpleNamespace(name="nt", unlink=os.unlink)):
+                onexc(os.unlink, str(external), PermissionError())
+        with mock.patch.object(smoke.shutil, "rmtree", side_effect=delete), \
+                mock.patch.object(os, "chmod") as attributes:
+            self.assertEqual(smoke.cleanup(ledger),
+                             ("CLEANUP_INCOMPLETE", "CLEANUP_SAFETY_CHECK_FAILURE"))
+        attributes.assert_not_called()
+        self.assertEqual(external.read_text(), "untouched")
+        self.assertTrue(root.exists())
+
+    def test_invalid_ownership_and_identity_never_reach_attribute_handler(self):
+        for case in ("owner", "identity"):
+            ledger = []
+            root = self.owned(case, ledger)
+            if case == "owner":
+                (root / ".smoke-owner").write_text("invalid")
+            else:
+                original = ledger[0]
+                ledger[0] = smoke.OwnedRoot(root, original.parent, original.token,
+                                          (original.identity[0], original.identity[1] + 1), "temp")
+            with mock.patch.object(smoke, "readonly_git_cleanup_retry") as handler, \
+                    mock.patch.object(smoke.os, "chmod") as attributes:
+                status, detail = smoke.cleanup(ledger)
+            self.assertEqual(status, "CLEANUP_INCOMPLETE")
+            self.assertEqual(detail, "OWNERSHIP_VALIDATION_FAILURE" if case == "owner"
+                             else "RESOURCE_IDENTITY_MISMATCH")
+            handler.assert_not_called()
+            attributes.assert_not_called()
+            self.assertTrue(root.exists())
+
     def test_cleanup_uncertainty_leaves_root(self):
         ledger = []
         path = self.owned("one", ledger)
@@ -639,7 +797,7 @@ class ResourceTests(unittest.TestCase):
                             (path / ".smoke-owner").write_text("invalid")
                         elif category == "CLEANUP_SAFETY_CHECK_FAILURE":
                             (path / ".git").mkdir()
-                    def delete(path):
+                    def delete(path, **kwargs):
                         if paths[path] == "DELETE_ACCESS_DENIED":
                             raise PermissionError("SECRET_SENTINEL")
                         if paths[path] == "DELETE_OTHER_FAILURE":
@@ -757,6 +915,213 @@ class ResourceTests(unittest.TestCase):
         self.assertNotEqual(evidence["network_block"], "PASS")
         evidence.update(wrapper_protection="HELD", wrapper_integrity="PASS")
         self.assertEqual(smoke.classify(smoke.telemetry(result()), evidence)["result"], "INCONCLUSIVE")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows handle-bound deletion")
+class HandleDeleteTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.parent = Path(temporary.name).resolve()
+        root = self.parent / "owned"
+        root.mkdir()
+        ledger = []
+        smoke.record_root(root, "temp", ledger)
+        self.record = ledger[0]
+        self.target = root / "workspace" / ".git" / "objects" / "aa" / "object"
+        self.target.parent.mkdir(parents=True)
+        self.target.write_bytes(b"harmless fixture")
+        os.chmod(self.target, stat.S_IREAD)
+        info = self.target.stat()
+        self.identity = (info.st_dev, info.st_ino)
+
+    def fake_api(self, failure=None):
+        api = mock.Mock()
+        api.CreateFileW.return_value = 123
+        api.CloseHandle.return_value = True
+        api.GetFileType.return_value = 1
+        def query(handle, kind, pointer, size):
+            if failure == "query" or failure == "query" + str(kind):
+                return False
+            value = pointer._obj
+            if kind == 18:
+                value.volume = self.identity[0]
+                identity = self.identity[1] + (1 if failure == "identity" else 0)
+                value.identifier[:] = identity.to_bytes(16, "little")
+            elif kind == 9:
+                value.attributes = 1 | (0x400 if failure == "reparse" else 0)
+                if failure == "not-readonly":
+                    value.attributes = 0
+            elif kind == 1:
+                value.links = 2 if failure == "hardlink" else 1
+                value.directory = failure == "directory"
+            else:
+                self.fail("Unexpected information class")
+            return True
+        def final(handle, buffer, size, flags):
+            if failure == "final-query":
+                return 0
+            path = self.parent / "external" if failure == "escape" else self.target
+            buffer.value = "\\\\?\\" + str(path)
+            return len(buffer.value)
+        api.GetFileInformationByHandleEx.side_effect = query
+        api.GetFinalPathNameByHandleW.side_effect = final
+        api.SetFileInformationByHandle.return_value = failure != "disposition"
+        if failure == "open":
+            api.CreateFileW.return_value = None
+        if failure == "close":
+            api.CloseHandle.return_value = False
+        if failure == "file-type":
+            api.GetFileType.return_value = 3
+        return api
+
+    def test_handle_identity_flags_rights_and_no_attribute_mutation(self):
+        api = self.fake_api()
+        flags_seen = []
+        api.SetFileInformationByHandle.side_effect = lambda handle, kind, pointer, size: (
+            flags_seen.append((kind, pointer._obj.value, size)) or True)
+        with mock.patch.object(smoke, "_cleanup_file_api", return_value=api), \
+                mock.patch.object(os, "chmod") as chmod, mock.patch.object(os, "fchmod") as fchmod, \
+                mock.patch.object(os, "unlink") as unlink:
+            smoke.readonly_git_cleanup_retry(self.record)(unlink, str(self.target), PermissionError())
+        api.CreateFileW.assert_called_once_with(str(self.target), 0x10080, 1, None, 3, 0x200000, None)
+        self.assertEqual([call.args[1] for call in api.GetFileInformationByHandleEx.call_args_list], [18, 9, 1])
+        self.assertEqual(flags_seen, [(21, 0x11, 4)])
+        api.CloseHandle.assert_called_once_with(123)
+        chmod.assert_not_called()
+        fchmod.assert_not_called()
+        unlink.assert_not_called()
+
+    def test_failures_preserve_candidate_and_close_once_without_fallback(self):
+        for failure in ("open", "query18", "query9", "query1", "identity", "reparse", "hardlink",
+                        "directory", "file-type", "not-readonly", "final-query", "escape", "disposition", "close"):
+            with self.subTest(failure=failure):
+                api = self.fake_api(failure)
+                with mock.patch.object(smoke, "_cleanup_file_api", return_value=api), \
+                        mock.patch.object(os, "chmod") as chmod, mock.patch.object(os, "fchmod") as fchmod:
+                    with self.assertRaises((smoke.Stop, OSError)):
+                        smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+                if failure == "open":
+                    api.CloseHandle.assert_not_called()
+                else:
+                    api.CloseHandle.assert_called_once_with(123)
+                if failure not in {"disposition", "close"}:
+                    api.SetFileInformationByHandle.assert_not_called()
+                self.assertTrue(self.target.exists())
+                chmod.assert_not_called()
+                fchmod.assert_not_called()
+        with mock.patch.object(smoke, "_cleanup_file_api", side_effect=AttributeError("unavailable")), \
+                mock.patch.object(os, "chmod") as chmod:
+            with self.assertRaises(AttributeError):
+                smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+        chmod.assert_not_called()
+
+    def test_swap_to_external_hardlink_before_open_is_rejected(self):
+        victim = self.parent / "victim"
+        victim.write_bytes(b"external fixture")
+        os.chmod(victim, stat.S_IREAD)
+        original_attributes = victim.stat().st_file_attributes
+        api = smoke._cleanup_file_api()
+        proxy = mock.Mock(wraps=api)
+        def swap(*args):
+            self.target.rename(self.target.with_name("saved"))
+            os.link(victim, self.target)
+            return api.CreateFileW(*args)
+        proxy.CreateFileW.side_effect = swap
+        with mock.patch.object(smoke, "_cleanup_file_api", return_value=proxy), \
+                mock.patch.object(os, "chmod") as chmod, mock.patch.object(os, "fchmod") as fchmod:
+            with self.assertRaises(smoke.Stop):
+                smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+        proxy.SetFileInformationByHandle.assert_not_called()
+        proxy.CloseHandle.assert_called_once()
+        self.assertEqual(victim.read_bytes(), b"external fixture")
+        self.assertEqual(victim.stat().st_file_attributes, original_attributes)
+        self.assertTrue(self.target.exists())
+        chmod.assert_not_called()
+        fchmod.assert_not_called()
+
+    def test_existing_hardlink_rejected_before_open(self):
+        external = self.parent / "link"
+        os.link(self.target, external)
+        with mock.patch.object(smoke, "_cleanup_file_api") as api:
+            with self.assertRaises(smoke.Stop):
+                smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+        api.assert_not_called()
+        self.assertTrue(external.exists())
+
+    def test_intermediate_junction_external_target_is_preserved(self):
+        external_dir = self.parent / "outside-objects"
+        external_dir.mkdir()
+        victim = external_dir / "object"
+        victim.write_bytes(b"external junction fixture")
+        os.chmod(victim, stat.S_IREAD)
+        attributes = victim.stat().st_file_attributes
+        self.target.parent.rename(self.target.parent.with_name("saved"))
+        junction = self.target.parent
+        cmd = str(Path(os.environ["SYSTEMROOT"]) / "System32" / "cmd.exe")
+        created = subprocess.run([cmd, "/d", "/c", "mklink", "/J", str(junction), str(external_dir)],
+                                 capture_output=True, shell=False, timeout=15)
+        self.assertEqual(created.returncode, 0)
+        try:
+            with mock.patch.object(smoke, "_cleanup_file_api") as unopened:
+                with self.assertRaises(smoke.Stop):
+                    smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+            unopened.assert_not_called()
+            # Race equivalent: path checks passed earlier; open traverses the new
+            # intermediate junction. Real handle final-path containment must reject it.
+            info = victim.stat()
+            api = smoke._cleanup_file_api()
+            proxy = mock.Mock(wraps=api)
+            with mock.patch.object(smoke, "_cleanup_file_api", return_value=proxy), \
+                    mock.patch.object(smoke, "no_reparse"), mock.patch.object(os, "chmod") as chmod, \
+                    mock.patch.object(os, "fchmod") as fchmod:
+                with self.assertRaises(smoke.Stop):
+                    smoke._delete_readonly_git_object(self.record, self.target, (info.st_dev, info.st_ino))
+            proxy.GetFinalPathNameByHandleW.assert_called_once()
+            proxy.SetFileInformationByHandle.assert_not_called()
+            proxy.CloseHandle.assert_called_once()
+            chmod.assert_not_called()
+            fchmod.assert_not_called()
+            self.assertEqual(victim.read_bytes(), b"external junction fixture")
+            self.assertEqual(victim.stat().st_file_attributes, attributes)
+        finally:
+            # Removes only the fixture junction, never the external target tree.
+            os.rmdir(junction)
+
+    def test_late_hardlink_survives_disposition_without_metadata_change(self):
+        # Read-only security descriptor snapshot; never changes owner or ACL.
+        import ctypes
+        from ctypes import wintypes
+        security = ctypes.WinDLL("advapi32", use_last_error=True).GetFileSecurityW
+        security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p,
+                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        security.restype = wintypes.BOOL
+        def descriptor(path):
+            required = wintypes.DWORD()
+            security(str(path), 7, None, 0, ctypes.byref(required))
+            self.assertGreater(required.value, 0)
+            buffer = ctypes.create_string_buffer(required.value)
+            self.assertTrue(security(str(path), 7, buffer, len(buffer), ctypes.byref(required)))
+            return buffer.raw
+        external = self.parent / "late-link"
+        original_attributes = self.target.stat().st_file_attributes
+        before = descriptor(self.target)
+        api = smoke._cleanup_file_api()
+        proxy = mock.Mock(wraps=api)
+        def disposition(*args):
+            os.link(self.target, external)
+            return api.SetFileInformationByHandle(*args)
+        proxy.SetFileInformationByHandle.side_effect = disposition
+        with mock.patch.object(smoke, "_cleanup_file_api", return_value=proxy), \
+                mock.patch.object(os, "chmod") as chmod, mock.patch.object(os, "fchmod") as fchmod:
+            smoke.readonly_git_cleanup_retry(self.record)(os.unlink, str(self.target), PermissionError())
+        self.assertFalse(self.target.exists())
+        self.assertEqual(external.read_bytes(), b"harmless fixture")
+        self.assertEqual(external.stat().st_file_attributes, original_attributes)
+        self.assertEqual(descriptor(external), before)
+        proxy.CloseHandle.assert_called_once()
+        chmod.assert_not_called()
+        fchmod.assert_not_called()
 
 
 class AbsoluteWrapperTests(unittest.TestCase):

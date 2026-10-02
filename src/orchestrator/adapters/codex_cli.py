@@ -13,7 +13,7 @@ import os
 import shutil
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +151,10 @@ class _CommandTracker:
             unexpected_action_item_count=len(self.other_ids))
 
 
+ITEM_TYPES = ("agent_message", "reasoning", "command_execution", "file_change",
+              "mcp_tool_call", "collab_tool_call", "web_search", "todo_list")
+
+
 @dataclass(frozen=True)
 class CodexResult:
     """SUCCESS means turn completion at the adapter boundary, not task approval."""
@@ -175,6 +179,7 @@ class CodexResult:
     command_field_present_count: int = 0
     command_field_string_count: int = 0
     lifecycle_command_consistent_count: int = 0
+    item_type_counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(ITEM_TYPES, 0))
 
 
 def _result(category: CodexFailureCategory, code: int | None = None,
@@ -222,6 +227,8 @@ def _parse_output(stdout: str, returncode: int,
     counts = dict(event_count=0, item_started_count=0, item_completed_count=0,
                   command_execution_count=0, file_change_item_count=0)
     action_ids: dict[str, str] = {}
+    # Transient IDs only; report unique items per known type, not lifecycle events.
+    typed_ids = {kind: set() for kind in ITEM_TYPES}
     tracker = _CommandTracker(expected_commands) if expected_commands else None
     try:
         for line in stdout.splitlines():
@@ -255,6 +262,8 @@ def _parse_output(stdout: str, returncode: int,
                 item_type = item.get("type")
                 if not isinstance(item_type, str) or not item["id"]:
                     raise ValueError
+                if item_type in typed_ids:
+                    typed_ids[item_type].add(item["id"])
                 if tracker is not None:
                     tracker.observe(kind, item)
                 if item_type in {"command_execution", "file_change"}:
@@ -282,6 +291,7 @@ def _parse_output(stdout: str, returncode: int,
     if not seen or terminal is None:
         return _result(CodexFailureCategory.MALFORMED_OUTPUT, returncode)
     diagnostic = tracker.summary() if tracker is not None else {}
+    diagnostic["item_type_counts"] = {kind: len(ids) for kind, ids in typed_ids.items()}
     if terminal == "turn.failed":
         return _result(CodexFailureCategory.UNKNOWN, returncode, terminal,
                        **counts, action_evidence_observed=bool(action_ids), **diagnostic)

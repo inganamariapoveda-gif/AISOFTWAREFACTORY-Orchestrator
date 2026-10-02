@@ -545,6 +545,7 @@ def telemetry(result):
                 terminal_event_type=result.terminal_status, event_count=result.event_count,
                 item_started_count=result.item_started_count, item_completed_count=result.item_completed_count,
                 command_execution_count=result.command_execution_count, file_change_item_count=result.file_change_item_count,
+                item_type_counts=dict(result.item_type_counts),
                 action_evidence_observed=result.action_evidence_observed,
                 command_attestations=[dict(observed=value.observed, started=value.started,
                     completed=value.completed, consistent=value.consistent, duplicate=value.duplicate)
@@ -627,6 +628,114 @@ def classify(meta, physical, orchestrator="UNCHANGED", adapter_state=None):
                 descendant_observation="DESCENDANT_PROCESS_SURVIVAL_OBSERVED" if quality and physical["descendant_canary"] == "PRESENT" else "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED")
 
 
+class _FileIdInfo(ctypes.Structure):
+    _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
+
+
+class _FileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+
+
+class _FileStandardInfo(ctypes.Structure):
+    _fields_ = [("allocation", ctypes.c_longlong), ("size", ctypes.c_longlong),
+                ("links", wintypes.DWORD), ("pending", ctypes.c_ubyte), ("directory", ctypes.c_ubyte)]
+
+
+def _cleanup_file_api():
+    api = native_file_api()
+    api.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    api.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    api.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    api.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    api.GetFileType.argtypes = [wintypes.HANDLE]
+    api.GetFileType.restype = wintypes.DWORD
+    api.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    api.SetFileInformationByHandle.restype = wintypes.BOOL
+    return api
+
+
+def _delete_readonly_git_object(record, target, expected):
+    api = _cleanup_file_api()
+    # DELETE | FILE_READ_ATTRIBUTES; share read only, OPEN_EXISTING, open reparse point.
+    handle = api.CreateFileW(str(target), 0x00010080, 1, None, 3, 0x00200000, None)
+    if handle in (None, 0, ctypes.c_void_p(-1).value):
+        raise OSError("CLEANUP_HANDLE_OPEN_FAILED")
+    try:
+        identity, attributes, standard = _FileIdInfo(), _FileAttributeTagInfo(), _FileStandardInfo()
+        for info_class, value in ((18, identity), (9, attributes), (1, standard)):
+            if not api.GetFileInformationByHandleEx(handle, info_class, ctypes.byref(value), ctypes.sizeof(value)):
+                raise Stop("UNSAFE_CLEANUP")
+        if ((identity.volume, int.from_bytes(bytes(identity.identifier), "little")) != expected
+                or api.GetFileType(handle) != 1 or standard.directory or standard.links != 1
+                or attributes.attributes & (0x10 | 0x400) or attributes.tag
+                or not attributes.attributes & stat.FILE_ATTRIBUTE_READONLY):
+            raise Stop("UNSAFE_CLEANUP")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = api.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise Stop("UNSAFE_CLEANUP")
+        final = buffer.value
+        if final.startswith("\\\\?\\UNC\\"):
+            final = "\\\\" + final[8:]
+        elif final.startswith("\\\\?\\"):
+            final = final[4:]
+        else:
+            raise Stop("UNSAFE_CLEANUP")
+        final = Path(final)
+        no_reparse(record.path)
+        no_reparse(target)
+        root_info = record.path.stat()
+        objects = record.path / "workspace" / ".git" / "objects"
+        if (record.kind != "temp" or (root_info.st_dev, root_info.st_ino) != record.identity
+                or not final.is_absolute() or ".." in final.parts
+                or final == objects or not final.is_relative_to(objects.resolve(strict=True))
+                or final != target.resolve(strict=True)):
+            raise Stop("UNSAFE_CLEANUP")
+        # FileDispositionInfoEx: DELETE | IGNORE_READONLY_ATTRIBUTE. No attribute mutation.
+        flags = wintypes.DWORD(0x11)
+        if not api.SetFileInformationByHandle(handle, 21, ctypes.byref(flags), ctypes.sizeof(flags)):
+            raise OSError("CLEANUP_DISPOSITION_FAILED")
+    finally:
+        if not api.CloseHandle(handle):
+            raise OSError("CLEANUP_HANDLE_CLOSE_FAILED")
+
+
+def readonly_git_cleanup_retry(record):
+    """rmtree callback, used only after the root's ownership checks succeeded."""
+    retried = set()
+
+    def retry(operation, failed_path, error):
+        if os.name != "nt" or operation is not os.unlink or not isinstance(error, PermissionError):
+            raise error
+        target = Path(failed_path)
+        root = record.path
+        # The owner marker may already have been deleted by rmtree. Preserve the
+        # validated root identity, and recheck target/ancestor safety instead.
+        try:
+            if record.kind != "temp" or not target.is_absolute() or ".." in target.parts:
+                raise Stop("UNSAFE_CLEANUP")
+            no_reparse(target)
+            root_info = root.stat()
+            if (root_info.st_dev, root_info.st_ino) != record.identity:
+                raise Stop("UNSAFE_CLEANUP")
+            objects = root / "workspace" / ".git" / "objects"
+            if target == objects or not target.is_relative_to(objects):
+                raise Stop("UNSAFE_CLEANUP")
+            if not target.resolve(strict=True).is_relative_to(objects.resolve(strict=True)):
+                raise Stop("UNSAFE_CLEANUP")
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise Stop("UNSAFE_CLEANUP")
+        except (OSError, ValueError):
+            raise Stop("UNSAFE_CLEANUP") from None
+        if not getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY or target in retried:
+            raise error
+        retried.add(target)
+        _delete_readonly_git_object(record, target, (info.st_dev, info.st_ino))
+
+    return retry
+
+
 def cleanup(owned):
     # Diagnostic precedence only; every root still receives the same checks.
     precedence = ("RESOURCE_IDENTITY_MISMATCH", "OWNERSHIP_VALIDATION_FAILURE",
@@ -653,8 +762,10 @@ def cleanup(owned):
                 if ".git" in dirs + files and not (record.kind == "temp" and Path(parent) == path / "workspace"):
                     raise Stop("UNSAFE_CLEANUP")
             failure = "DELETE_OTHER_FAILURE"
-            shutil.rmtree(path)
+            shutil.rmtree(path, onexc=readonly_git_cleanup_retry(record))
         except Exception as exc:
+            if failure == "DELETE_OTHER_FAILURE" and isinstance(exc, Stop):
+                failure = "CLEANUP_SAFETY_CHECK_FAILURE"
             if failure == "DELETE_OTHER_FAILURE" and isinstance(exc, PermissionError):
                 failure = "DELETE_ACCESS_DENIED"
             if precedence.index(failure) < precedence.index(detail):

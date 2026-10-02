@@ -37,6 +37,42 @@ SUCCESS_OUTPUT = jsonl(
 
 
 class CodexAdapterTests(unittest.TestCase):
+    def test_fixed_item_type_counts_unique_and_content_free(self):
+        kinds = ("agent_message", "reasoning", "command_execution", "file_change",
+                 "mcp_tool_call", "collab_tool_call", "web_search", "todo_list")
+        events = [{"type": "turn.started"}]
+        for index, kind in enumerate(kinds):
+            item = dict(id="PRIVATE_ID_" + str(index), type=kind, text="PRIVATE_TEXT",
+                        command="PRIVATE_COMMAND", output="PRIVATE_OUTPUT", reasoning="PRIVATE_REASONING")
+            events.extend({"type": event, "item": item}
+                          for event in ("item.started", "item.updated", "item.completed"))
+        events.append({"type": "turn.completed"})
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("PRIVATE_COMMAND")),)
+        actual, _ = self.call(output=jsonl(*events), expected_commands=expected)
+        self.assertTrue(actual.completed)
+        self.assertEqual(actual.item_type_counts, dict.fromkeys(kinds, 1))
+        self.assertEqual(actual.command_execution_count, 1)
+        self.assertEqual(actual.file_change_item_count, 1)
+        self.assertEqual(actual.unexpected_action_item_count, 4)
+        self.assertEqual(actual.item_started_count, 8)
+        self.assertEqual(actual.item_completed_count, 8)
+        self.assertNotIn("PRIVATE_", json.dumps(asdict(actual)))
+        self.assertNotIn("PRIVATE_", repr(actual))
+
+    def test_item_diagnostics_preserve_unknown_event_and_action_semantics(self):
+        expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("expected")),)
+        actual, _ = self.call(output=jsonl({"type": "turn.started"},
+                             {"type": "PRIVATE_UNKNOWN_EVENT"}, {"type": "turn.completed"}))
+        self.assertEqual(actual.failure_category.value, "MALFORMED_OUTPUT")
+        self.assertEqual(actual.item_type_counts, dict.fromkeys(codex_cli.ITEM_TYPES, 0))
+        actual, _ = self.call(output=jsonl({"type": "turn.started"},
+                             {"type": "item.completed", "item": {"id": "PRIVATE_ID", "type": "PRIVATE_UNKNOWN_TYPE",
+                                                                   "text": "PRIVATE_CONTENT"}},
+                             {"type": "turn.completed"}), expected_commands=expected)
+        self.assertEqual(actual.unexpected_action_item_count, 1)
+        self.assertEqual(actual.item_type_counts, dict.fromkeys(codex_cli.ITEM_TYPES, 0))
+        self.assertNotIn("PRIVATE_", json.dumps(asdict(actual)))
+
     def test_strict_schema_diagnostics_are_unique_private_and_non_authoritative(self):
         expected = (codex_cli.CommandExpectation(codex_cli.command_fingerprint("PRIVATE_EXACT")),)
         for fields, present, string, matched in (({}, 0, 0, False),
