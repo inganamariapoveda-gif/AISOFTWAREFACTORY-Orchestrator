@@ -628,24 +628,38 @@ def classify(meta, physical, orchestrator="UNCHANGED", adapter_state=None):
 
 
 def cleanup(owned):
-    complete = True
+    # Diagnostic precedence only; every root still receives the same checks.
+    precedence = ("RESOURCE_IDENTITY_MISMATCH", "OWNERSHIP_VALIDATION_FAILURE",
+                  "CLEANUP_SAFETY_CHECK_FAILURE", "DELETE_ACCESS_DENIED",
+                  "DELETE_OTHER_FAILURE", "COMPLETE")
+    detail = "COMPLETE"
     for record in reversed(owned):
+        failure = "CLEANUP_SAFETY_CHECK_FAILURE"
         try:
             path = record.path
             if path.parent != record.parent or path == REPO or REPO.is_relative_to(path) or path.is_relative_to(REPO):
                 raise Stop("UNSAFE_CLEANUP")
             safe_tree(path)
             info = path.stat()
-            if (info.st_dev, info.st_ino) != record.identity or not exact_file(path / ".smoke-owner", record.token):
+            if (info.st_dev, info.st_ino) != record.identity:
+                failure = "RESOURCE_IDENTITY_MISMATCH"
                 raise Stop("UNSAFE_CLEANUP")
+            failure = "OWNERSHIP_VALIDATION_FAILURE"
+            if not exact_file(path / ".smoke-owner", record.token):
+                raise Stop("UNSAFE_CLEANUP")
+            failure = "CLEANUP_SAFETY_CHECK_FAILURE"
             # Only the synthetic workspace may contain a Git repository.
             for parent, dirs, files in os.walk(path):
                 if ".git" in dirs + files and not (record.kind == "temp" and Path(parent) == path / "workspace"):
                     raise Stop("UNSAFE_CLEANUP")
+            failure = "DELETE_OTHER_FAILURE"
             shutil.rmtree(path)
-        except Exception:
-            complete = False
-    return "COMPLETE" if complete else "CLEANUP_INCOMPLETE"
+        except Exception as exc:
+            if failure == "DELETE_OTHER_FAILURE" and isinstance(exc, PermissionError):
+                failure = "DELETE_ACCESS_DENIED"
+            if precedence.index(failure) < precedence.index(detail):
+                detail = failure
+    return ("COMPLETE" if detail == "COMPLETE" else "CLEANUP_INCOMPLETE", detail)
 
 
 def run(argv):
@@ -654,7 +668,7 @@ def run(argv):
                   real_adapter_attempts=0, action_evidence="NOT_RUN", real_jsonl_action_contract="NOT_RUN",
                   outside_write_block="NOT_RUN", network_block="NOT_RUN",
                   descendant_canary="NOT_RUN", basic_windows_execution_environment="NOT_DEMONSTRATED",
-                  telemetry_consistency="NOT_EVALUABLE", cleanup="NOT_NEEDED")
+                  telemetry_consistency="NOT_EVALUABLE", cleanup="NOT_NEEDED", cleanup_detail="NOT_RUN")
     # Strict parsing avoids argparse echoing arbitrary input into the report.
     if len(argv) != 3 or argv[0] != "--execute-approved-smoke" or argv[1] != "--expected-head" or not re.fullmatch(r"[0-9a-fA-F]{40}", argv[2]):
         report["result"] = "EXPLICIT_FLAGS_REQUIRED"
@@ -745,10 +759,14 @@ def run(argv):
         handles_closed = release_wrapper_protection(locks)
         if not handles_closed:
             report["cleanup"] = "CLEANUP_INCOMPLETE"
+            report["cleanup_detail"] = "HANDLE_RELEASE_FAILURE"
         elif owned:
             # Unknown observations may hide evidence: retain resources for review.
-            report["cleanup"] = (cleanup(owned) if physical is None or physical.get("evidence_complete", False)
-                                 else "CLEANUP_INCOMPLETE")
+            if physical is None or physical.get("evidence_complete", False):
+                report["cleanup"], report["cleanup_detail"] = cleanup(owned)
+            else:
+                report["cleanup"] = "CLEANUP_INCOMPLETE"
+                report["cleanup_detail"] = "EXPECTED_SAFE_PRESERVATION"
     return report
 
 

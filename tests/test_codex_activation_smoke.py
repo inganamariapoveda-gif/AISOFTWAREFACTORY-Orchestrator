@@ -49,6 +49,7 @@ def physical(effect=True):
 class LauncherFlowTests(unittest.TestCase):
     def setUp(self):
         self.system_preflight_impl = smoke.system_preflight
+        self.cleanup_impl = smoke.cleanup
         self.adapter = mock.Mock()
         self.adapter._child_environment.return_value = {"SYSTEMROOT": r"C:\Windows"}
         self.adapter.run_codex_task.return_value = result()
@@ -65,7 +66,7 @@ class LauncherFlowTests(unittest.TestCase):
             "wrapper_commands": tuple("PRIVATE_ABSOLUTE_COMMAND_" + str(i) for i in range(3)),
             "wrapper_integrity": "PASS", "release_wrapper_protection": True,
             "create_resources": (Path("synthetic-workspace"), Path("PRIVATE_OUTSIDE_PATH"), {}),
-            "physical_results": physical(), "cleanup": "COMPLETE",
+            "physical_results": physical(), "cleanup": ("COMPLETE", "COMPLETE"),
         }
         self.mocks = {}
         for name, value in values.items():
@@ -94,6 +95,7 @@ class LauncherFlowTests(unittest.TestCase):
                      ARGS[:2] + ["HEAD"], ARGS + ["SECRET_SENTINEL"]):
             with self.subTest(args=args):
                 report = self.assert_blocked(args)
+                self.assertEqual(report["cleanup_detail"], "NOT_RUN")
                 self.assertNotIn("SECRET_SENTINEL", json.dumps(report))
         self.mocks["create_resources"].assert_not_called()
         self.mocks["codex_preflight"].assert_not_called()
@@ -241,7 +243,7 @@ class LauncherFlowTests(unittest.TestCase):
             self.assertEqual(order, ["capture", "classify", "release"])
             order.append("cleanup")
             values["outside_write_block"] = "PASS"  # resource loss cannot change copied report
-            return "CLEANUP_INCOMPLETE"
+            return ("CLEANUP_INCOMPLETE", "DELETE_OTHER_FAILURE")
         self.mocks["create_resources"].side_effect = resources
         self.mocks["physical_results"].side_effect = capture
         self.mocks["cleanup"].side_effect = cleanup
@@ -261,6 +263,7 @@ class LauncherFlowTests(unittest.TestCase):
         report = smoke.run(ARGS)
         self.mocks["cleanup"].assert_not_called()
         self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
+        self.assertEqual(report["cleanup_detail"], "EXPECTED_SAFE_PRESERVATION")
 
     def test_system_preflight_failure_no_model_or_resources(self):
         self.mocks["system_preflight"].side_effect = smoke.Stop("SYSTEM_EXECUTABLE_UNAVAILABLE")
@@ -288,9 +291,42 @@ class LauncherFlowTests(unittest.TestCase):
             return Path("workspace"), Path("outside"), {}
         self.mocks["create_resources"].side_effect = resources
         self.mocks["release_wrapper_protection"].return_value = False
+        self.mocks["physical_results"].return_value = dict(physical(), evidence_complete=False)
         report = smoke.run(ARGS)
         self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
+        self.assertEqual(report["cleanup_detail"], "HANDLE_RELEASE_FAILURE")
         self.mocks["cleanup"].assert_not_called()
+
+    def test_complete_cleanup_detail_after_successful_release(self):
+        def resources(owned, env):
+            owned.append("MOCK_OWNED_ROOT")
+            return Path("workspace"), Path("outside"), {}
+        self.mocks["create_resources"].side_effect = resources
+        report = smoke.run(ARGS)
+        self.assertEqual((report["cleanup"], report["cleanup_detail"]), ("COMPLETE", "COMPLETE"))
+        self.mocks["release_wrapper_protection"].assert_called_once()
+        self.mocks["cleanup"].assert_called_once()
+
+    def test_delete_exceptions_are_sanitized_in_final_report(self):
+        # Restore the actual cleanup implementation, keeping all model/probe work mocked.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve()
+            for error, category in ((PermissionError("SECRET_SENTINEL"), "DELETE_ACCESS_DENIED"),
+                                    (RuntimeError("SECRET_SENTINEL"), "DELETE_OTHER_FAILURE")):
+                with self.subTest(category=category):
+                    def resources(owned, env):
+                        smoke.record_root(path, "temp", owned)
+                        return path, path, {}
+                    self.mocks["create_resources"].side_effect = resources
+                    self.mocks["cleanup"].side_effect = self.cleanup_impl
+                    with mock.patch.object(smoke.shutil, "rmtree", side_effect=error) as delete:
+                        report = smoke.run(ARGS)
+                    delete.assert_called_once_with(path)
+                    self.assertEqual(report["cleanup"], "CLEANUP_INCOMPLETE")
+                    self.assertEqual(report["cleanup_detail"], category)
+                    for output in (json.dumps(report), repr(report)):
+                        for secret in ("SECRET_SENTINEL", str(path), (path / ".smoke-owner").read_text()):
+                            self.assertNotIn(secret, output)
 
     def test_oversized_wrapper_prevents_model(self):
         self.mocks["create_resources"].side_effect = lambda *args: smoke.wrapper_contents(
@@ -474,7 +510,7 @@ class ResourceTests(unittest.TestCase):
         second = self.owned("two", ledger)
         untouched = self.parent / "unrelated"
         untouched.mkdir()
-        self.assertEqual(smoke.cleanup(ledger), "COMPLETE")
+        self.assertEqual(smoke.cleanup(ledger), ("COMPLETE", "COMPLETE"))
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
         self.assertTrue(untouched.exists())
@@ -484,15 +520,99 @@ class ResourceTests(unittest.TestCase):
         ledger = []
         path = self.owned("one", ledger)
         (path / ".smoke-owner").write_text("changed")
-        self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+        self.assertEqual(smoke.cleanup(ledger), ("CLEANUP_INCOMPLETE", "OWNERSHIP_VALIDATION_FAILURE"))
         self.assertTrue(path.exists())
 
     def test_cleanup_unexpected_repository_left_intact(self):
         ledger = []
         path = self.owned("one", ledger)
         (path / ".git").mkdir()
-        self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+        self.assertEqual(smoke.cleanup(ledger), ("CLEANUP_INCOMPLETE", "CLEANUP_SAFETY_CHECK_FAILURE"))
         self.assertTrue(path.exists())
+
+    def test_release_attempts_every_handle_after_false_and_exception(self):
+        api = mock.Mock()
+        api.CloseHandle.side_effect = [False, OSError("SECRET_SENTINEL"), True]
+        locks = [SimpleNamespace(handle=value, api=api) for value in (101, 102, 103)]
+        self.assertFalse(smoke.release_wrapper_protection(locks))
+        self.assertEqual(api.CloseHandle.call_args_list, [mock.call(103), mock.call(102), mock.call(101)])
+        self.assertEqual([entry.handle for entry in locks], [None, 102, 103])
+
+    def test_missing_invalid_and_mismatched_markers_preserve_roots(self):
+        for name, content in (("missing", None), ("invalid", "invalid"), ("mismatch", "0" * 32)):
+            with self.subTest(case=name):
+                ledger = []
+                path = self.owned(name, ledger)
+                marker = path / ".smoke-owner"
+                if content is None:
+                    marker.unlink()
+                else:
+                    marker.write_text(content)
+                with mock.patch.object(smoke.shutil, "rmtree") as delete:
+                    self.assertEqual(smoke.cleanup(ledger),
+                                     ("CLEANUP_INCOMPLETE", "OWNERSHIP_VALIDATION_FAILURE"))
+                delete.assert_not_called()
+                self.assertTrue(path.exists())
+
+    def test_identity_and_parent_mismatch_preserve_roots(self):
+        for case in ("identity", "parent"):
+            with self.subTest(case=case):
+                ledger = []
+                path = self.owned(case, ledger)
+                record = ledger[0]
+                ledger[0] = smoke.OwnedRoot(
+                    path, record.parent / "different" if case == "parent" else record.parent,
+                    record.token, (record.identity[0], record.identity[1] + 1)
+                    if case == "identity" else record.identity, record.kind)
+                category = "RESOURCE_IDENTITY_MISMATCH" if case == "identity" else "CLEANUP_SAFETY_CHECK_FAILURE"
+                with mock.patch.object(smoke.shutil, "rmtree") as delete:
+                    self.assertEqual(smoke.cleanup(ledger), ("CLEANUP_INCOMPLETE", category))
+                delete.assert_not_called()
+                self.assertTrue(path.exists())
+
+    def test_missing_root_remains_incomplete(self):
+        ledger = []
+        path = self.owned("missing-root", ledger)
+        (path / ".smoke-owner").unlink()
+        path.rmdir()
+        with mock.patch.object(smoke.shutil, "rmtree") as delete:
+            self.assertEqual(smoke.cleanup(ledger),
+                             ("CLEANUP_INCOMPLETE", "CLEANUP_SAFETY_CHECK_FAILURE"))
+        delete.assert_not_called()
+
+    def test_multiple_roots_precedence_and_partial_cleanup_in_both_orders(self):
+        categories = ("RESOURCE_IDENTITY_MISMATCH", "OWNERSHIP_VALIDATION_FAILURE",
+                      "CLEANUP_SAFETY_CHECK_FAILURE", "DELETE_ACCESS_DENIED", "DELETE_OTHER_FAILURE")
+        original_delete = smoke.shutil.rmtree
+        for start, expected in enumerate(categories):
+            for reverse in (False, True):
+                with self.subTest(expected=expected, reverse=reverse):
+                    ledger = []
+                    paths = {}
+                    for category in (*categories[start:], "COMPLETE"):
+                        path = self.owned(str(start) + str(reverse) + category, ledger)
+                        paths[path] = category
+                        if category == "RESOURCE_IDENTITY_MISMATCH":
+                            record = ledger[-1]
+                            ledger[-1] = smoke.OwnedRoot(path, record.parent, record.token,
+                                                        (record.identity[0], record.identity[1] + 1), record.kind)
+                        elif category == "OWNERSHIP_VALIDATION_FAILURE":
+                            (path / ".smoke-owner").write_text("invalid")
+                        elif category == "CLEANUP_SAFETY_CHECK_FAILURE":
+                            (path / ".git").mkdir()
+                    def delete(path):
+                        if paths[path] == "DELETE_ACCESS_DENIED":
+                            raise PermissionError("SECRET_SENTINEL")
+                        if paths[path] == "DELETE_OTHER_FAILURE":
+                            raise OSError("SECRET_SENTINEL")
+                        self.assertEqual(paths[path], "COMPLETE")
+                        original_delete(path)
+                    with mock.patch.object(smoke.shutil, "rmtree", side_effect=delete):
+                        outcome = smoke.cleanup(list(reversed(ledger)) if reverse else ledger)
+                    self.assertEqual(outcome, ("CLEANUP_INCOMPLETE", expected))
+                    self.assertNotIn("SECRET_SENTINEL", repr(outcome))
+                    for path, category in paths.items():
+                        self.assertEqual(path.exists(), category != "COMPLETE")
 
     def test_resource_setup_is_synthetic_and_probe_scripts_are_predetermined(self):
         home = self.parent / "home"
@@ -519,7 +639,7 @@ class ResourceTests(unittest.TestCase):
         self.assertIn("-WindowStyle Hidden", decoded["DESCENDANT"])
         self.assertNotIn(str(smoke.APPROVED_PYTHON), str(probes))
         self.assertFalse(list(workspace.glob("*.ps1")))
-        self.assertEqual(smoke.cleanup(ledger), "COMPLETE")
+        self.assertEqual(smoke.cleanup(ledger), ("COMPLETE", "COMPLETE"))
 
     def test_outside_boundary_inside_temp_blocks_before_creation(self):
         ledger = []
@@ -533,7 +653,7 @@ class ResourceTests(unittest.TestCase):
         ledger = []
         path = self.owned("one", ledger)
         with mock.patch.object(smoke, "safe_tree", side_effect=smoke.Stop("UNSAFE_RESOURCE")):
-            self.assertEqual(smoke.cleanup(ledger), "CLEANUP_INCOMPLETE")
+            self.assertEqual(smoke.cleanup(ledger), ("CLEANUP_INCOMPLETE", "CLEANUP_SAFETY_CHECK_FAILURE"))
         self.assertTrue(path.exists())
 
     def test_physical_canary_overrides_blocked_report(self):
@@ -824,7 +944,7 @@ class WindowsBackendPreflightTests(unittest.TestCase):
                 self.assertEqual(len(owned), 1)
                 self.assertEqual(owned[0].kind, "backend")
                 self.assertTrue(owned[0].path.is_relative_to(Path(parent)))
-                self.assertEqual(smoke.cleanup(owned), "COMPLETE")
+                self.assertEqual(smoke.cleanup(owned), ("COMPLETE", "COMPLETE"))
 
 
 class ExecutableResolutionTests(unittest.TestCase):

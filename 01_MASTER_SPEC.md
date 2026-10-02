@@ -821,3 +821,32 @@ No está probado que la omisión anterior del backend causara el smoke inconclus
 La aprobación real previa está CONSUMED 1/1, restantes 0. No se efectuó inferencia
 en esta implementación; cualquier retry real requiere NUEVO Human Critical
 Approval. Codex canónico sigue deshabilitado.
+
+SMOKE-CLEANUP-OBSERVABILITY-001: `cleanup` conserva sus valores existentes
+NOT_NEEDED, COMPLETE y CLEANUP_INCOMPLETE. Se añade únicamente `cleanup_detail`,
+con enum cerrado: NOT_RUN, COMPLETE, EXPECTED_SAFE_PRESERVATION,
+HANDLE_RELEASE_FAILURE, OWNERSHIP_VALIDATION_FAILURE, RESOURCE_IDENTITY_MISMATCH,
+CLEANUP_SAFETY_CHECK_FAILURE, DELETE_ACCESS_DENIED, DELETE_OTHER_FAILURE, UNKNOWN.
+UNKNOWN queda reservado; las fases actuales siempre tienen una categoría fija.
+La clasificación es diagnóstica: no cambia elegibilidad, ownership, tokens,
+identidad, links, hard links, reglas .git, orden, protección/liberación de handles,
+evidence_complete, preservación ni comportamiento de shutil.rmtree.
+No expone rutas, nombres temporales, tokens, hashes, identidades, números Windows,
+excepciones, stderr, usuarios ni valores de entorno.
+
+Precedencia: HANDLE_RELEASE_FAILURE > RESOURCE_IDENTITY_MISMATCH >
+OWNERSHIP_VALIDATION_FAILURE > CLEANUP_SAFETY_CHECK_FAILURE > DELETE_ACCESS_DENIED >
+DELETE_OTHER_FAILURE > EXPECTED_SAFE_PRESERVATION > COMPLETE. El fallo de cierre
+impide intentar limpieza; evidencia incompleta preserva tras liberar handles.
+Entre raíces se conserva la categoría de fallo de mayor precedencia y se sigue
+intentando cada raíz en el orden previo, sin rollback de eliminaciones exitosas.
+PermissionError durante rmtree indica DELETE_ACCESS_DENIED; otras excepciones
+de borrado indican DELETE_OTHER_FAILURE. Fallos anteriores se clasifican por
+la comprobación activa. Una raíz ya ausente sigue produciendo incompleto con
+CLEANUP_SAFETY_CHECK_FAILURE: no se transforma en éxito ni se presume su causa.
+
+La causa histórica de CLEANUP_INCOMPLETE permanece UNKNOWN; el candidato con
+marcador de formato válido NO fue probado como perteneciente a aquella ejecución.
+La nueva evidencia permitirá distinguir clases de fallo en un smoke futuro,
+sin reconstruir la causa histórica. Aprobación previa CONSUMED 1/1, restantes 0;
+cualquier llamada real futura requiere NUEVO Human Critical Approval.
