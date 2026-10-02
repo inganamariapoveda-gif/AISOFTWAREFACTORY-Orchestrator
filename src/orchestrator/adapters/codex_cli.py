@@ -22,7 +22,7 @@ from ..config_loader import ConfigError, validate_codex_execution_config
 
 def windows_sandbox_args() -> list[str]:
     """Director-approved native Windows compatibility binding; no fallback."""
-    return ["-c", 'windows.sandbox="unelevated"'] if os.name == "nt" else []
+    return ["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []
 
 
 def _child_environment() -> dict[str, str]:

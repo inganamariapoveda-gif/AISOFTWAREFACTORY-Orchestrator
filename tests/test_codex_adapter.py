@@ -208,12 +208,14 @@ class CodexAdapterTests(unittest.TestCase):
         for platform in ("nt", "posix"):
             for failure in (None, OSError("PRIVATE_BACKEND_FAILURE"), subprocess.TimeoutExpired("private", 600)):
                 with mock.patch.object(codex_cli, "os", SimpleNamespace(
-                    name=platform, environ={"SYSTEMROOT": "C:/Windows"})):
+                    name=platform, environ={"SYSTEMROOT": "C:/Windows", "UNAPPROVED_SETTING": "PRIVATE_VALUE"})):
                     actual, process = self.call(error=failure)
                 process.assert_called_once()
                 argv = process.call_args.args[0]
-                selector = 'windows.sandbox="unelevated"'
+                selector = 'windows.sandbox="elevated"'
                 self.assertEqual(argv.count(selector), 1 if platform == "nt" else 0)
+                self.assertEqual(sum(arg.startswith("windows.sandbox=") for arg in argv),
+                                 1 if platform == "nt" else 0)
                 if platform == "nt":
                     self.assertEqual(argv[1:3], ["-c", selector])
                     self.assertLess(argv.index(selector), argv.index("exec"))
@@ -223,7 +225,10 @@ class CodexAdapterTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
                 self.assertEqual(argv[argv.index("-a") + 1], "never")
                 self.assertFalse(process.call_args.kwargs["shell"])
-                for forbidden in ('windows.sandbox="elevated"', "danger-full-access",
+                self.assertEqual(process.call_args.kwargs["env"], {"SYSTEMROOT": "C:/Windows"})
+                self.assertIn("sandbox_workspace_write.network_access=false", argv)
+                self.assertIn("tools.web_search=false", argv)
+                for forbidden in ('windows.sandbox="unelevated"', "danger-full-access",
                                   "--dangerously-bypass-approvals-and-sandbox", "--ignore-rules"):
                     self.assertNotIn(forbidden, argv)
                 self.assertEqual(actual.completed, failure is None)

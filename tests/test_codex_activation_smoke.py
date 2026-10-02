@@ -176,12 +176,47 @@ class LauncherFlowTests(unittest.TestCase):
             self.mocks["codex_preflight"].assert_not_called()
 
     def test_backend_preflight_failure_never_consumes_model(self):
+        self.adapter.windows_sandbox_args.return_value = ["-c", 'windows.sandbox="elevated"']
         self.mocks["windows_backend_preflight"].side_effect = smoke.Stop("WINDOWS_SANDBOX_BACKEND_PREFLIGHT_FAILED")
         report = self.assert_blocked()
         self.assertFalse(report["invocation_consumed"])
         self.assertEqual(report["windows_sandbox_backend_preflight"], "FAIL")
         self.mocks["create_resources"].assert_not_called()
         self.mocks["windows_backend_preflight"].assert_called_once()
+        self.assertEqual(self.mocks["windows_backend_preflight"].call_args.args[3],
+                         ["-c", 'windows.sandbox="elevated"'])
+        self.mocks["resolve_codex_executable"].assert_called_once()
+
+    def test_elevated_preflight_completes_before_single_bound_model_call(self):
+        from orchestrator.adapters import codex_cli
+        with mock.patch.object(codex_cli, "os", SimpleNamespace(name="nt")):
+            backend = codex_cli.windows_sandbox_args()
+        self.assertEqual(backend, ["-c", 'windows.sandbox="elevated"'])
+        self.adapter.windows_sandbox_args.return_value = backend
+        selected = self.mocks["resolve_codex_executable"].return_value[0]
+        env = self.adapter._child_environment.return_value
+        order = []
+        def preflight(executable, child_env, owned, backend_args):
+            self.adapter.run_codex_task.assert_not_called()
+            self.assertIs(executable, selected)
+            self.assertIs(child_env, env)
+            self.assertEqual(backend_args, backend)
+            order.append("preflight_complete")
+            return "PASS"
+        def model(**kwargs):
+            self.assertEqual(order, ["preflight_complete"])
+            self.assertIs(kwargs["resolved_executable"], selected)
+            order.append("model")
+            return result()
+        self.mocks["windows_backend_preflight"].side_effect = preflight
+        self.adapter.run_codex_task.side_effect = model
+        report = smoke.run(ARGS)
+        self.assertEqual(order, ["preflight_complete", "model"])
+        self.assertEqual(report["real_adapter_attempts"], 1)
+        self.assertEqual(report["windows_sandbox_backend_preflight"], "PASS")
+        self.mocks["resolve_codex_executable"].assert_called_once()
+        self.mocks["windows_backend_preflight"].assert_called_once()
+        self.adapter.run_codex_task.assert_called_once()
 
     def test_backend_pass_precedes_resources_and_model_consumption(self):
         self.mocks["create_resources"].side_effect = smoke.Stop("RESOURCE_STOP")
@@ -914,7 +949,7 @@ class WindowsBackendPreflightTests(unittest.TestCase):
 
     def test_fixed_control_exact_binding_output_and_owned_cleanup(self):
         executable = str(Path("PRIVATE_CODEX.exe").absolute())
-        backend = ["-c", 'windows.sandbox="unelevated"']
+        backend = ["-c", 'windows.sandbox="elevated"']
         env = {"SYSTEMROOT": "C:/Windows"}
         cases = ((0, "CODEX_BACKEND_PREFLIGHT_OK\r\n", None, True),
                  (1, "CODEX_BACKEND_PREFLIGHT_OK", None, False),
@@ -942,6 +977,9 @@ class WindowsBackendPreflightTests(unittest.TestCase):
                 self.assertNotIn("exec", argv)
                 self.assertEqual(argv[-4:], ["/d", "/c", "echo", "CODEX_BACKEND_PREFLIGHT_OK"])
                 self.assertEqual(argv.count(backend[1]), 1)
+                for forbidden in ('windows.sandbox="unelevated"', "danger-full-access",
+                                  "--dangerously-bypass-approvals-and-sandbox"):
+                    self.assertNotIn(forbidden, argv)
                 self.assertIs(process.call_args.kwargs["env"], env)
                 self.assertFalse(process.call_args.kwargs["shell"])
                 self.assertEqual(process.call_args.kwargs["timeout"], 60)

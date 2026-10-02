@@ -793,15 +793,18 @@ Los controles del smoke y el límite de una llamada no cambian. No se efectuó
 ninguna llamada real durante esta implementación; aprobación sin consumir y
 Codex canónico deshabilitado. Pruebas pendientes de verificación independiente.
 
-CODEX-WINDOWS-SANDBOX-BACKEND-001: por decisión del Director, el adaptador
-vincula explícitamente `windows.sandbox="unelevated"` mediante un único override
+CODEX-WINDOWS-SANDBOX-BACKEND-001, actualizado por la decisión aprobada
+CODEX-WINDOWS-ELEVATED-BACKEND-001: el adaptador vincula explícitamente
+`windows.sandbox="elevated"` mediante un único override
 global antes de `exec`, exclusivamente cuando el runtime es Windows nativo.
 El esquema cerrado actual no tiene campo de backend: se implementa como binding
 de compatibilidad de plataforma, sin ampliar configuración ni opciones de política.
 `--ignore-user-config` sigue siendo obligatorio junto con workspace-write,
 approval never y el filtro de entorno existente (incluido SYSTEMROOT). No se
-añade --ignore-rules ni fallback elevated/full-access o recarga de configuración.
+añade --ignore-rules ni fallback automático a unelevated, danger-full-access,
+ejecución sin sandbox o configuración de usuario, ni un segundo intento automático.
 Sin Windows no se añade selector. La identidad del ejecutable permanece única.
+Las restricciones de red y la telemetría/atestación estrictas permanecen intactas.
 
 Antes de consumir una llamada real, el launcher usa el mismo ejecutable y selector
 en un control sin modelo: `sandbox -P :workspace -C <workspace-propio>` ejecuta
