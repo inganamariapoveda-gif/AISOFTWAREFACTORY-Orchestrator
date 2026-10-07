@@ -261,7 +261,10 @@ class CodexAdapterTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
                 self.assertEqual(argv[argv.index("-a") + 1], "never")
                 self.assertFalse(process.call_args.kwargs["shell"])
-                self.assertEqual(process.call_args.kwargs["env"], {"SYSTEMROOT": "C:/Windows"})
+                expected_env = {"SYSTEMROOT": "C:/Windows"}
+                if platform == "nt":
+                    expected_env["SYSTEMDRIVE"] = "C:"
+                self.assertEqual(process.call_args.kwargs["env"], expected_env)
                 self.assertIn("sandbox_workspace_write.network_access=false", argv)
                 self.assertIn("tools.web_search=false", argv)
                 for forbidden in ('windows.sandbox="unelevated"', "danger-full-access",
@@ -328,7 +331,10 @@ class CodexAdapterTests(unittest.TestCase):
                     mock.patch.object(Path, "read_text", side_effect=AssertionError("no auth reads")):
                 result, process = self.call(error=error)
             child = process.call_args.kwargs["env"]
-            self.assertEqual(child, safe)
+            expected = dict(safe)
+            if codex_cli.os.name == "nt":
+                expected["SYSTEMDRIVE"] = "C:"
+            self.assertEqual(child, expected)
             self.assertIsNot(child, parent)
             self.assertEqual(parent, dict(safe, **secrets, COMSPEC="unused", APPDATA="unused"))
             self.assertEqual(process.call_args.kwargs["input"], "BOUNDED_INSTRUCTION_MARKER")
@@ -342,7 +348,37 @@ class CodexAdapterTests(unittest.TestCase):
         with mock.patch.object(codex_cli.os, "environ", {"SystemRoot": "C:/Windows"}):
             result, process = self.call()
         self.assertTrue(result.completed)
-        self.assertEqual(process.call_args.kwargs["env"], {"SystemRoot": "C:/Windows"})
+        expected = {"SystemRoot": "C:/Windows"}
+        if codex_cli.os.name == "nt":
+            expected["SYSTEMDRIVE"] = "C:"
+        self.assertEqual(process.call_args.kwargs["env"], expected)
+
+    def test_systemdrive_is_derived_only_from_governed_systemroot(self):
+        from types import SimpleNamespace
+        for root, drive in ((r"C:\Windows", "C:"), ("d:/Windows", "D:")):
+            parent = {"SystemRoot": root, "SystemDrive": "Z:", "SYSTEMDRIVE": "Y:",
+                      "APPDATA": "private", "LOCALAPPDATA": "private",
+                      "PROGRAMDATA": "private", "OPENAI_API_KEY": "private"}
+            with self.subTest(root=root), mock.patch.object(
+                codex_cli, "os", SimpleNamespace(name="nt", environ=parent)
+            ):
+                actual, process = self.call()
+            self.assertTrue(actual.completed)
+            self.assertEqual(process.call_args.kwargs["env"],
+                             {"SystemRoot": root, "SYSTEMDRIVE": drive})
+            self.assertEqual(parent["SystemDrive"], "Z:")
+
+    def test_invalid_systemroot_fails_before_subprocess(self):
+        from types import SimpleNamespace
+        for root in ("", "Windows", r"C:Windows", r"\Windows", r"\\host\share\Windows",
+                     r"\\?\C:\Windows", "1:/Windows", "C::/Windows", "C:/../Windows",
+                     "C:/Win\x00dows", "C:/Win*dows"):
+            with self.subTest(root=root), mock.patch.object(
+                codex_cli, "os", SimpleNamespace(name="nt", environ={"SYSTEMROOT": root})
+            ):
+                actual, process = self.call()
+            self.assertEqual(actual.failure_category.value, "PROCESS_FAILURE")
+            process.assert_not_called()
 
     def test_missing_windows_context_never_launches_or_inherits(self):
         for parent in ({}, {"SystemRoot": ""}, {"SYSTEMROOT": "C:/Windows", "Path": "a", "PATH": "b"}):

@@ -10,11 +10,12 @@ import enum
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from ..config_loader import ConfigError, validate_codex_execution_config
@@ -40,10 +41,14 @@ def _child_environment() -> dict[str, str]:
                 raise ValueError("ambiguous child environment")
             seen.add(normalized)
             child[key] = os.environ[key]
-    if os.name == "nt" and not any(
-        key.upper() == "SYSTEMROOT" and value.strip() for key, value in child.items()
-    ):
-        raise ValueError("missing Windows execution context")
+    if os.name == "nt":
+        root = next((value for key, value in child.items() if key.upper() == "SYSTEMROOT"), "")
+        path = PureWindowsPath(root)
+        if (not re.fullmatch(r"[A-Za-z]:", path.drive) or not path.is_absolute()
+                or not re.match(r"^[A-Za-z]:[\\/]", root) or ".." in path.parts
+                or any(character in root[2:] for character in ':*?"<>|\x00\r\n')):
+            raise ValueError("invalid Windows execution context")
+        child["SYSTEMDRIVE"] = path.drive.upper()
     return child
 
 

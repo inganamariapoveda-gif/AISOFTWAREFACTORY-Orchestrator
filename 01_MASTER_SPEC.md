@@ -494,7 +494,10 @@ por stdin. No se inyectan credenciales ni se leen archivos de autenticación.
 El hijo Codex recibe un entorno explícito por allowlist: PATH/PATHEXT para
 resolución de ejecutables, SYSTEMROOT para Windows, USERPROFILE/HOME/CODEX_HOME
 para ubicación del home y autenticación local, y TEMP/TMP para temporales.
-Solo se copian valores presentes, conservando casing; no se heredan variables
+Se copian valores presentes, conservando casing; en Windows se añade únicamente
+SYSTEMDRIVE derivado del drive válido de SYSTEMROOT, nunca del SYSTEMDRIVE ambiente.
+SYSTEMROOT ausente, relativo, UNC, de dispositivo o inválido falla cerrado.
+No se heredan variables
 de aplicación ni API keys. Contexto Windows esencial ausente bloquea sin fallback
 al entorno completo. No se registran valores ni se inspecciona el almacén auth.
 Los overrides de invocación excluyen raíces adicionales y temporales de escritura

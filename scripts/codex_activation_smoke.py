@@ -48,9 +48,9 @@ def host_context():
     identity = host_identity()
     if not isinstance(identity, str):
         return "UNKNOWN"
-    if identity.casefold() == r"anap\codexsandboxoffline":
+    if identity.casefold() == r"annie\codexsandboxoffline":
         return "CODEX_SANDBOX"
-    return "NORMAL_USER" if identity.casefold() == r"anap\anapo" else "UNKNOWN"
+    return "NORMAL_USER" if identity.casefold() == r"annie\anapo" else "UNKNOWN"
 
 
 def interpreter_ok():
@@ -419,6 +419,39 @@ def record_root(path, kind, owned):
     return path
 
 
+HOST_PENDING = "HOST_PENDING"
+EVIDENCE_FILES = ("outside_probe_result.txt", "network_probe_result.txt", "descendant_canary.txt")
+
+
+def precreate_evidence(workspace):
+    no_reparse(workspace)
+    identities = {}
+    for name in EVIDENCE_FILES:
+        path = workspace / name
+        with path.open("xb") as handle:
+            handle.write(HOST_PENDING.encode("ascii"))
+            info = os.fstat(handle.fileno())
+            identities[name] = (info.st_dev, info.st_ino)
+        no_reparse(path)
+    return identities
+
+
+def evidence_state(path, identities, final_values):
+    no_reparse(path)
+    with path.open("rb") as handle:
+        info = os.fstat(handle.fileno())
+        identity = (info.st_dev, info.st_ino)
+        if (identity != identities.get(path.name) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            raise Stop("UNSAFE_EVIDENCE")
+        values = (HOST_PENDING, *final_values)
+        content = handle.read(max(len(value.encode("ascii")) for value in values) + 1)
+    no_reparse(path)
+    after = path.stat()
+    if (after.st_dev, after.st_ino) != identity or after.st_nlink != 1:
+        raise Stop("UNSAFE_EVIDENCE")
+    return next((value for value in values if content == value.encode("ascii")), "INVALID")
+
+
 def create_resources(owned, env):
     temp_parent = Path(tempfile.gettempdir()).absolute()
     home = Path.home().absolute()
@@ -442,6 +475,7 @@ def create_resources(owned, env):
     workspace = temp_root / "workspace"
     workspace.mkdir()
     (workspace / "_tmp").mkdir()
+    evidence_files = precreate_evidence(workspace)
     probes = probe_sources(workspace, outside, env)
     wrappers = wrapper_contents(probes, env)
     for name, content in wrappers.items():
@@ -455,7 +489,7 @@ def create_resources(owned, env):
         raise Stop("UNSAFE_RESOURCE")
     safe_tree(temp_root)
     safe_tree(outside)
-    return workspace, outside, wrappers
+    return workspace, outside, wrappers, evidence_files
 
 
 def instruction(commands):
@@ -507,36 +541,46 @@ def entry_state(root, allowed):
     return "UNEXPECTED" if any(entry.name not in allowed for entry in root.iterdir()) else "EXPECTED"
 
 
-def parent_done(workspace):
+def parent_done(workspace, evidence_files):
     no_reparse(workspace)
-    if presence(workspace / "descendant_canary.txt") != "ABSENT":
+    state = evidence_state(workspace / "descendant_canary.txt", evidence_files, ("DESCENDANT_WRITE_OCCURRED",))
+    if state == "DESCENDANT_WRITE_OCCURRED":
         raise Stop("PREMATURE_DESCENDANT_CANARY")
+    if state != HOST_PENDING:
+        raise Stop("UNSAFE_EVIDENCE")
     # Never follow or overwrite a model-created sentinel.
     with (workspace / "parent_done.flag").open("xb") as handle:
         handle.write(b"ADAPTER_RETURNED")
     return "CREATED"
 
 
-def physical_results(workspace, outside, probes, env):
+def physical_results(workspace, outside, probes, env, evidence_files):
     # Every observable is independent: a secondary anomaly cannot erase evidence.
     allowed = {".git", "_tmp", "outside_probe_result.txt",
                "network_probe_result.txt", "descendant_canary.txt", "parent_done.flag", *WRAPPERS}
     observations = {
         "workspace_entries": lambda: entry_state(workspace, allowed),
         "outside_entries": lambda: entry_state(outside, {".smoke-owner", "outside_write_canary.txt"}),
-        "outside_probe_state": lambda: probe_state(workspace / "outside_probe_result.txt"),
+        "outside_probe_state": lambda: evidence_state(workspace / "outside_probe_result.txt", evidence_files,
+                                                       ("BLOCKED", "UNEXPECTED_SUCCESS", "PROBE_UNAVAILABLE")),
         "outside_canary": lambda: presence(outside / "outside_write_canary.txt"),
-        "network_probe_state": lambda: probe_state(workspace / "network_probe_result.txt"),
-        "descendant_canary": lambda: presence(workspace / "descendant_canary.txt"),
+        "network_probe_state": lambda: evidence_state(workspace / "network_probe_result.txt", evidence_files,
+                                                       ("BLOCKED", "UNEXPECTED_SUCCESS", "PROBE_UNAVAILABLE")),
+        "descendant_canary": lambda: evidence_state(workspace / "descendant_canary.txt", evidence_files,
+                                                      ("DESCENDANT_WRITE_OCCURRED",)),
     }
     evidence = {key: observe(operation) for key, operation in observations.items()}
+    # Retain the report's legacy PRESENT label only for the exact final marker.
+    if evidence["descendant_canary"] == "DESCENDANT_WRITE_OCCURRED":
+        evidence["descendant_canary"] = "PRESENT"
     evidence["outside_write_block"] = (
         "FAIL" if evidence["outside_canary"] == "PRESENT" or evidence["outside_probe_state"] == "UNEXPECTED_SUCCESS"
         else "PASS" if evidence["outside_canary"] == "ABSENT" and evidence["outside_probe_state"] == "BLOCKED"
         else "NOT_RUN")
     evidence["network_block"] = ("FAIL" if evidence["network_probe_state"] == "UNEXPECTED_SUCCESS"
                                   else "PASS" if evidence["network_probe_state"] == "BLOCKED" else "NOT_RUN")
-    evidence["evidence_complete"] = "UNKNOWN" not in evidence.values()
+    evidence["evidence_complete"] = (not any(value in {"UNKNOWN", "INVALID", HOST_PENDING}
+                                             for value in evidence.values()))
     return evidence
 
 
@@ -787,6 +831,7 @@ def run(argv):
         return report
     expected = argv[2].lower()
     owned = []
+    evidence_files = {}
     locks = []
     loader = env = None
     checked = False
@@ -816,7 +861,7 @@ def run(argv):
         report["windows_sandbox_backend_preflight"] = windows_backend_preflight(
             resolved_codex, env, owned, adapter.windows_sandbox_args())
         report["auth"] = "READY"
-        workspace, outside, probes = create_resources(owned, env)
+        workspace, outside, probes, evidence_files = create_resources(owned, env)
         acquire_wrapper_protection(workspace, probes, locks)
         if wrapper_integrity(locks) != "PASS":
             raise Stop("WRAPPER_INTEGRITY_FAILURE")
@@ -838,7 +883,7 @@ def run(argv):
         except Exception:
             report["adapter_state"] = "FAILURE"
         finally:
-            report["parent_done_state"] = observe(lambda: parent_done(workspace))
+            report["parent_done_state"] = observe(lambda: parent_done(workspace, evidence_files))
             report["descendant_wait"] = observe(lambda: (time.sleep(8), "COMPLETE")[1])
     except Stop as exc:
         report["result"] = str(exc)
@@ -846,7 +891,7 @@ def run(argv):
         report["result"] = "CLI_FAILURE" if report["invocation_consumed"] else "PREFLIGHT_FAILED"
     finally:
         if report["invocation_consumed"]:
-            physical = physical_results(workspace, outside, probes, env)
+            physical = physical_results(workspace, outside, probes, env, evidence_files)
             physical["parent_done_state"] = report.get("parent_done_state", "UNKNOWN")
             physical["descendant_wait"] = report.get("descendant_wait", "UNKNOWN")
             physical["wrapper_protection"] = "HELD" if len(locks) == 3 and all(entry.handle is not None for entry in locks) else "FAIL"

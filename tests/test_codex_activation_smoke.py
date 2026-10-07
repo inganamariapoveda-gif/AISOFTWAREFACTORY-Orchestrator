@@ -73,7 +73,7 @@ class LauncherFlowTests(unittest.TestCase):
             "instruction": "BOUNDED_SYNTHETIC_INSTRUCTION",
             "wrapper_commands": tuple("PRIVATE_ABSOLUTE_COMMAND_" + str(i) for i in range(3)),
             "wrapper_integrity": "PASS", "release_wrapper_protection": True,
-            "create_resources": (Path("synthetic-workspace"), Path("PRIVATE_OUTSIDE_PATH"), {}),
+            "create_resources": (Path("synthetic-workspace"), Path("PRIVATE_OUTSIDE_PATH"), {}, {}),
             "physical_results": physical(), "cleanup": ("COMPLETE", "COMPLETE"),
         }
         self.mocks = {}
@@ -274,7 +274,7 @@ class LauncherFlowTests(unittest.TestCase):
         values["outside_write_block"] = "FAIL"
         def resources(owned, env):
             owned.append("MOCK_OWNED_ROOT")
-            return Path("workspace"), Path("outside"), {}
+            return Path("workspace"), Path("outside"), {}, {}
         def capture(*args):
             order.append("capture")
             return values
@@ -300,7 +300,7 @@ class LauncherFlowTests(unittest.TestCase):
     def test_uninspectable_evidence_retains_resources(self):
         def resources(owned, env):
             owned.append("MOCK_OWNED_ROOT")
-            return Path("workspace"), Path("outside"), {}
+            return Path("workspace"), Path("outside"), {}, {}
         self.mocks["create_resources"].side_effect = resources
         self.mocks["physical_results"].return_value = dict(physical(), evidence_complete=False)
         report = smoke.run(ARGS)
@@ -331,7 +331,7 @@ class LauncherFlowTests(unittest.TestCase):
     def test_uncertain_handle_release_retains_resources(self):
         def resources(owned, env):
             owned.append("MOCK_OWNED_ROOT")
-            return Path("workspace"), Path("outside"), {}
+            return Path("workspace"), Path("outside"), {}, {}
         self.mocks["create_resources"].side_effect = resources
         self.mocks["release_wrapper_protection"].return_value = False
         self.mocks["physical_results"].return_value = dict(physical(), evidence_complete=False)
@@ -343,7 +343,7 @@ class LauncherFlowTests(unittest.TestCase):
     def test_complete_cleanup_detail_after_successful_release(self):
         def resources(owned, env):
             owned.append("MOCK_OWNED_ROOT")
-            return Path("workspace"), Path("outside"), {}
+            return Path("workspace"), Path("outside"), {}, {}
         self.mocks["create_resources"].side_effect = resources
         report = smoke.run(ARGS)
         self.assertEqual((report["cleanup"], report["cleanup_detail"]), ("COMPLETE", "COMPLETE"))
@@ -359,7 +359,7 @@ class LauncherFlowTests(unittest.TestCase):
                 with self.subTest(category=category):
                     def resources(owned, env):
                         smoke.record_root(path, "temp", owned)
-                        return path, path, {}
+                        return path, path, {}, {}
                     self.mocks["create_resources"].side_effect = resources
                     self.mocks["cleanup"].side_effect = self.cleanup_impl
                     with mock.patch.object(smoke.shutil, "rmtree", side_effect=error) as delete:
@@ -820,11 +820,17 @@ class ResourceTests(unittest.TestCase):
         with mock.patch.object(smoke.Path, "home", return_value=home), mock.patch.object(
             smoke.tempfile, "gettempdir", return_value=str(temporary)
         ), mock.patch.object(smoke, "git", return_value=""):
-            workspace, outside, probes = smoke.create_resources(ledger, {"TEMP": str(temporary), "SYSTEMROOT": r"C:\Windows"})
+            workspace, outside, probes, identities = smoke.create_resources(ledger, {"TEMP": str(temporary), "SYSTEMROOT": r"C:\Windows"})
         self.assertEqual(outside.parent, home)
         self.assertFalse(outside.is_relative_to(temporary))
         self.assertTrue(workspace.is_relative_to(temporary))
         self.assertFalse((workspace / "workspace.txt").exists())
+        self.assertEqual(set(identities), set(smoke.EVIDENCE_FILES))
+        for name in smoke.EVIDENCE_FILES:
+            self.assertEqual((workspace / name).read_bytes(), b"HOST_PENDING")
+            info = (workspace / name).stat()
+            self.assertEqual(identities[name], (info.st_dev, info.st_ino))
+        self.assertFalse((outside / "outside_write_canary.txt").exists())
         self.assertEqual(set(probes), set(smoke.WRAPPERS))
         decoded = {key: base64.b64decode(probes[name].decode().split("-EncodedCommand ")[1].splitlines()[0]).decode("utf-16le")
                    for name, key in zip(smoke.WRAPPERS, ("OUTSIDE", "NETWORK", "DESCENDANT"))}
@@ -858,11 +864,12 @@ class ResourceTests(unittest.TestCase):
         outside = self.parent / "outside"
         workspace.mkdir()
         outside.mkdir()
+        identities = smoke.precreate_evidence(workspace)
         (workspace / "outside_probe_result.txt").write_text("BLOCKED")
         (outside / "outside_write_canary.txt").write_text("OUTSIDE_WRITE_OCCURRED")
         (workspace / "unexpected.txt").write_text("synthetic")
         with mock.patch.object(smoke, "git", return_value=""):
-            evidence = smoke.physical_results(workspace, outside, {}, {})
+            evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
         self.assertEqual(evidence["outside_write_block"], "FAIL")
         self.assertEqual(evidence["workspace_entries"], "UNEXPECTED")
         evidence.update(wrapper_protection="HELD", wrapper_integrity="PASS")
@@ -873,34 +880,120 @@ class ResourceTests(unittest.TestCase):
         outside = self.parent / "outside"
         workspace.mkdir()
         outside.mkdir()
+        identities = smoke.precreate_evidence(workspace)
         (outside / "outside_write_canary.txt").write_text("OUTSIDE_WRITE_OCCURRED")
         with mock.patch.object(smoke, "entry_state", side_effect=OSError("SECRET_SENTINEL")), mock.patch.object(
             smoke, "git", side_effect=OSError("SECRET_SENTINEL")
         ):
-            evidence = smoke.physical_results(workspace, outside, {}, {})
+            evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
         self.assertEqual(evidence["workspace_entries"], "UNKNOWN")
         self.assertEqual(evidence["outside_canary"], "PRESENT")
         self.assertEqual(evidence["outside_write_block"], "FAIL")
         self.assertNotIn("SECRET_SENTINEL", json.dumps(evidence))
 
     def test_parent_sentinel_exclusive_and_no_premature_survival_claim(self):
-        self.assertEqual(smoke.parent_done(self.parent), "CREATED")
+        identities = smoke.precreate_evidence(self.parent)
+        self.assertEqual(smoke.parent_done(self.parent, identities), "CREATED")
         with self.assertRaises(FileExistsError):
-            smoke.parent_done(self.parent)
+            smoke.parent_done(self.parent, identities)
         (self.parent / "descendant_canary.txt").write_text("PREMATURE")
         with self.assertRaises(smoke.Stop):
-            smoke.parent_done(self.parent)
+            smoke.parent_done(self.parent, identities)
         evidence = dict(physical(), parent_done_state="UNKNOWN")
         self.assertEqual(smoke.classify(smoke.telemetry(result()), evidence)["descendant_observation"], "DESCENDANT_PROCESS_CLEANUP_UNVERIFIED")
+
+    def test_precreation_is_exclusive_and_preserves_existing_content(self):
+        path = self.parent / "outside_probe_result.txt"
+        path.write_bytes(b"EXISTING")
+        with self.assertRaises(FileExistsError):
+            smoke.precreate_evidence(self.parent)
+        self.assertEqual(path.read_bytes(), b"EXISTING")
+        self.assertFalse((self.parent / "network_probe_result.txt").exists())
+
+    def test_descendant_exact_content_and_parent_order(self):
+        identities = smoke.precreate_evidence(self.parent)
+        path = self.parent / "descendant_canary.txt"
+        for content in (b"", b"INVALID", b"HOST_PENDING\n",
+                        b"DESCENDANT_WRITE_OCCURRED\n", b"DESCENDANT_WRITE_OCCURRED"):
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                with self.assertRaises(smoke.Stop) as caught:
+                    smoke.parent_done(self.parent, identities)
+                expected = "PREMATURE_DESCENDANT_CANARY" if content == b"DESCENDANT_WRITE_OCCURRED" else "UNSAFE_EVIDENCE"
+                self.assertIn(expected, str(caught.exception))
+                self.assertFalse((self.parent / "parent_done.flag").exists())
+        path.write_bytes(b"HOST_PENDING")
+        self.assertEqual(smoke.parent_done(self.parent, identities), "CREATED")
+
+    def test_pending_and_invalid_evidence_never_imply_success(self):
+        workspace = self.parent / "workspace"
+        outside = self.parent / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        identities = smoke.precreate_evidence(workspace)
+        for content in (b"HOST_PENDING", b"", b"BLOCKED\n", b"UNKNOWN"):
+            for name in smoke.EVIDENCE_FILES:
+                (workspace / name).write_bytes(content)
+            with self.subTest(content=content), mock.patch.object(smoke, "git", return_value=""):
+                evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
+            self.assertFalse(evidence["evidence_complete"])
+            self.assertNotEqual(evidence["descendant_canary"], "PRESENT")
+            self.assertNotEqual(evidence["outside_write_block"], "PASS")
+            self.assertNotEqual(evidence["network_block"], "PASS")
+        (workspace / "outside_probe_result.txt").write_bytes(b"BLOCKED")
+        (workspace / "network_probe_result.txt").write_bytes(b"BLOCKED")
+        (workspace / "descendant_canary.txt").write_bytes(b"DESCENDANT_WRITE_OCCURRED")
+        with mock.patch.object(smoke, "git", return_value=""):
+            evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
+        self.assertEqual(evidence["descendant_canary"], "PRESENT")
+        self.assertEqual(evidence["outside_write_block"], "PASS")
+        self.assertEqual(evidence["network_block"], "PASS")
+        (workspace / "%SystemDrive%").mkdir()
+        with mock.patch.object(smoke, "git", return_value=""):
+            evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
+        self.assertEqual(evidence["workspace_entries"], "UNEXPECTED")
+
+    def test_missing_replaced_and_unreadable_evidence_fails_closed(self):
+        identities = smoke.precreate_evidence(self.parent)
+        path = self.parent / "descendant_canary.txt"
+        retained = self.parent / "original"
+        path.rename(retained)
+        with self.assertRaises(FileNotFoundError):
+            smoke.parent_done(self.parent, identities)
+        self.assertFalse(path.exists())
+        path.write_bytes(b"HOST_PENDING")
+        with self.assertRaises(smoke.Stop):
+            smoke.parent_done(self.parent, identities)
+        path.unlink()
+        retained.rename(path)
+        with mock.patch.object(Path, "open", side_effect=PermissionError("PRIVATE_ERROR")):
+            self.assertEqual(smoke.observe(lambda: smoke.evidence_state(path, identities, ())), "UNKNOWN")
+        self.assertFalse((self.parent / "parent_done.flag").exists())
+
+    def test_linked_evidence_is_rejected(self):
+        identities = smoke.precreate_evidence(self.parent)
+        path = self.parent / "descendant_canary.txt"
+        info = path.stat()
+        linked = SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino,
+                                 st_mode=info.st_mode, st_nlink=2)
+        with mock.patch.object(smoke.os, "fstat", return_value=linked), self.assertRaises(smoke.Stop):
+            smoke.evidence_state(path, identities, ())
+        original = Path.lstat
+        def reparse(candidate, *args, **kwargs):
+            current = original(candidate, *args, **kwargs)
+            return SimpleNamespace(st_mode=current.st_mode, st_file_attributes=0x400) if candidate == path else current
+        with mock.patch.object(Path, "lstat", reparse), self.assertRaises(smoke.Stop):
+            smoke.evidence_state(path, identities, ())
 
     def test_physical_network(self):
         workspace = self.parent / "workspace"
         outside = self.parent / "outside"
         workspace.mkdir()
         outside.mkdir()
+        identities = smoke.precreate_evidence(workspace)
         (workspace / "network_probe_result.txt").write_text("UNEXPECTED_SUCCESS")
         with mock.patch.object(smoke, "git", return_value=""):
-            actual = smoke.physical_results(workspace, outside, {}, {})
+            actual = smoke.physical_results(workspace, outside, {}, {}, identities)
         self.assertEqual(actual["network_block"], "FAIL")
 
     def test_network_unavailable_physical_state_not_blocked(self):
@@ -908,9 +1001,10 @@ class ResourceTests(unittest.TestCase):
         outside = self.parent / "outside"
         workspace.mkdir()
         outside.mkdir()
+        identities = smoke.precreate_evidence(workspace)
         (workspace / "network_probe_result.txt").write_text("PROBE_UNAVAILABLE")
         with mock.patch.object(smoke, "git", return_value=""):
-            evidence = smoke.physical_results(workspace, outside, {}, {})
+            evidence = smoke.physical_results(workspace, outside, {}, {}, identities)
         self.assertEqual(evidence["network_probe_state"], "PROBE_UNAVAILABLE")
         self.assertNotEqual(evidence["network_block"], "PASS")
         evidence.update(wrapper_protection="HELD", wrapper_integrity="PASS")
@@ -1438,8 +1532,8 @@ class ExecutableResolutionTests(unittest.TestCase):
 
 class AuthenticationPreflightTests(unittest.TestCase):
     def test_os_identity_classification_case_insensitive(self):
-        for identity, expected in ((r"ANAP\CODEXSANDBOXOFFLINE", "CODEX_SANDBOX"),
-                                   (r"ANAP\ANAPO", "NORMAL_USER"), (None, "UNKNOWN"),
+        for identity, expected in ((r"ANNIE\CODEXSANDBOXOFFLINE", "CODEX_SANDBOX"),
+                                   (r"ANNIE\ANAPO", "NORMAL_USER"), (None, "UNKNOWN"),
                                    ("unrecognized", "UNKNOWN")):
             with self.subTest(identity=identity), mock.patch.object(smoke, "host_identity", return_value=identity):
                 self.assertEqual(smoke.host_context(), expected)
