@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -16,8 +17,11 @@ from orchestrator.config_loader import (  # noqa: E402
     ConfigError,
     NotificationsConfig,
     load_core_config,
+    load_core_config_from_permissions_bytes,
+    load_permissions_from_yaml_bytes,
     load_notifications_config,
     load_project_rules,
+    load_project_rules_from_yaml_bytes,
     resolve_project_root,
 )
 
@@ -30,10 +34,14 @@ def _baseline_policies() -> dict:
         "version": 1,
         "prohibitions": {
             "production": True,
-            "git_push": True,
+            "uncontrolled_git_push": True,
             "git_merge": True,
             "irreversible_actions": True,
         },
+        "controlled_actions": {"git_publish_task_branch": {
+            "enabled": True, "classification": "AMARILLO",
+            "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED",
+        }},
         "attempts": {"max_correction_attempts": 3},
         "classification": {
             "levels": ["VERDE", "AMARILLO", "ROJO"],
@@ -121,7 +129,7 @@ def _baseline_gates() -> dict:
     return {
         "version": 1,
         "automatic_approval": {"verde": True},
-        "director_internal_gate": {"amarillo_contemplado": True},
+        "director_internal_gate": {"amarillo_contemplado": True, "git_publish_task_branch": True},
         "human_gates": [
             {"name": "HUMAN_UI_REVIEW"},
             {"name": "HUMAN_FUNCTIONAL_TEST"},
@@ -137,14 +145,24 @@ def _baseline_permissions() -> dict:
         "version": 1,
         "deny": {
             "production": True,
-            "git_push": True,
+            "uncontrolled_git_push": True,
             "git_merge": True,
             "irreversible_actions": True,
             "env_files": True,
             "secret_files": True,
         },
+        "git_publish": {
+            "enabled": True,
+            "remote_name": "origin",
+            "allowed_remote_urls": ["https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator.git"],
+            "branch_prefix": "task/", "forbidden_branches": ["main", "master"],
+            "allow_force": False, "allow_tags": False, "allow_delete": False,
+            "require_explicit_task_packet": True, "require_director_approval": True,
+            "require_clean_worktree": True, "refspec_mode": "current_branch_only",
+        },
+        "execution_controls": {"local_project_commands": False},
         "allowed_commands": [],
-        "role_capabilities": {"builder": ["implement_authorized_changes"]},
+        "role_capabilities": {"builder": ["implement_authorized_changes", "publish_authorized_task_branch"]},
     }
 
 
@@ -226,69 +244,13 @@ class MissingSecurityKeyTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
-    def test_policies_missing_git_push_prohibition_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            tmp = Path(tmp_str)
-            self._write(
-                tmp,
-                "POLICIES.yaml",
-                """
-version: 1
-prohibitions:
-  production: true
-  git_merge: true
-  irreversible_actions: true
-attempts:
-  max_correction_attempts: 3
-classification:
-  levels: ["VERDE", "AMARILLO", "ROJO"]
-fail_closed: true
-""",
-            )
-            self._write(
-                tmp,
-                "AGENTS.yaml",
-                """
-agents:
-  director:
-    enabled: false
-  developer:
-    enabled: false
-""",
-            )
-            self._write(
-                tmp,
-                "GATES.yaml",
-                """
-automatic_approval:
-  verde: true
-director_internal_gate:
-  amarillo_contemplado: true
-human_gates:
-  - name: HUMAN_UI_REVIEW
-  - name: HUMAN_FUNCTIONAL_TEST
-  - name: HUMAN_BUSINESS_DECISION
-  - name: HUMAN_CRITICAL_APPROVAL
-escalation:
-  decision_material_no_contemplada: "x"
-""",
-            )
-            self._write(
-                tmp,
-                "PERMISSIONS.yaml",
-                """
-deny:
-  production: true
-  git_push: true
-  git_merge: true
-  irreversible_actions: true
-  env_files: true
-  secret_files: true
-allowed_commands: []
-""",
-            )
-            with self.assertRaises(ConfigError):
-                load_core_config(tmp)
+    def test_policies_missing_uncontrolled_push_prohibition_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            policies = _baseline_policies()
+            del policies["prohibitions"]["uncontrolled_git_push"]
+            _write_core_config(Path(directory), policies=policies)
+            with self.assertRaisesRegex(ConfigError, "prohibitions.uncontrolled_git_push"):
+                load_core_config(directory)
 
     def test_production_prohibition_false_fails_closed(self) -> None:
         # Corrección BOOTSTRAP-001/CORRECTION-001 hallazgo 2: se construye un
@@ -305,15 +267,15 @@ allowed_commands: []
                 load_core_config(tmp)
             self.assertIn("prohibitions.production", str(ctx.exception))
 
-    def test_git_push_prohibition_false_fails_closed(self) -> None:
+    def test_uncontrolled_git_push_prohibition_false_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             policies = _baseline_policies()
-            policies["prohibitions"]["git_push"] = False
+            policies["prohibitions"]["uncontrolled_git_push"] = False
             _write_core_config(tmp, policies=policies)
             with self.assertRaises(ConfigError) as ctx:
                 load_core_config(tmp)
-            self.assertIn("prohibitions.git_push", str(ctx.exception))
+            self.assertIn("prohibitions.uncontrolled_git_push", str(ctx.exception))
 
     def test_git_merge_prohibition_false_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
@@ -828,6 +790,8 @@ class ProjectRulesCommandsTests(unittest.TestCase):
                 {
                     "version": 1,
                     "project_id": "X",
+                    "name": "Fixture",
+                    "autonomy_overrides": {},
                     "repo_path": ".",
                     "commands": commands,
                     "protected_paths": [],
@@ -1083,8 +1047,196 @@ class NotificationsConfigTests(unittest.TestCase):
             load_core_config(tmp)  # sin NOTIFICATIONS.yaml: no falla
 
 
-if __name__ == "__main__":
-    unittest.main()
+class GitPublishGovernanceTests(unittest.TestCase):
+    """Declarative validation only; no Git/network execution."""
+
+    def load(self, mutate=None):
+        policies = _baseline_policies()
+        permissions = _baseline_permissions()
+        gates = _baseline_gates()
+        if mutate:
+            mutate(policies, permissions, gates)
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_core_config(Path(tmp), policies=policies, permissions=permissions, gates=gates)
+            return load_core_config(tmp)
+
+    def reject(self, mutate):
+        with self.assertRaises(ConfigError):
+            self.load(mutate)
+
+    def test_canonical_publication_policy(self):
+        config = load_core_config(CONFIG_DIR)
+        self.assertEqual(config.policies["controlled_actions"], {
+            "git_publish_task_branch": {"enabled": True, "classification": "AMARILLO",
+                                       "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED"}})
+        self.assertEqual(config.permissions["git_publish"], _baseline_permissions()["git_publish"])
+        self.assertTrue(config.gates["director_internal_gate"]["git_publish_task_branch"])
+
+    def test_required_push_denials_missing(self):
+        self.reject(lambda p, r, g: p["prohibitions"].pop("uncontrolled_git_push"))
+        self.reject(lambda p, r, g: r["deny"].pop("uncontrolled_git_push"))
+
+    def test_required_denials_must_be_true(self):
+        for section, keys in (("policies", ("production", "uncontrolled_git_push", "git_merge", "irreversible_actions")),
+                              ("permissions", ("production", "uncontrolled_git_push", "git_merge",
+                                               "irreversible_actions", "env_files", "secret_files"))):
+            for key in keys:
+                for value in (False, 1, "true", None):
+                    with self.subTest(section=section, key=key, value=value):
+                        self.reject(lambda p, r, g: (p["prohibitions"] if section == "policies" else r["deny"]).update({key: value}))
+
+    def test_legacy_policy_cannot_replace_new_schema(self):
+        def legacy(p, r, g):
+            p["prohibitions"].pop("uncontrolled_git_push")
+            p["prohibitions"]["git_push"] = True
+            p.pop("controlled_actions")
+        self.reject(legacy)
+
+    def test_legacy_permission_cannot_replace_new_schema(self):
+        def legacy(p, r, g):
+            r["deny"].pop("uncontrolled_git_push")
+            r["deny"]["git_push"] = True
+            r.pop("git_publish")
+        self.reject(legacy)
+
+    def test_mixed_legacy_and_new_schema_rejected(self):
+        self.reject(lambda p, r, g: p["prohibitions"].update(git_push=True))
+        self.reject(lambda p, r, g: r["deny"].update(git_push=True))
+
+    def test_controlled_actions_missing_or_wrong_shape(self):
+        self.reject(lambda p, r, g: p.pop("controlled_actions"))
+        for value in (None, [], {}, {"another_action": {}}):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: p.update(controlled_actions=value))
+
+    def test_controlled_action_keys_closed(self):
+        self.reject(lambda p, r, g: p["controlled_actions"].update(other={}))
+        self.reject(lambda p, r, g: p["controlled_actions"]["git_publish_task_branch"].update(extra=True))
+        for key in ("enabled", "classification", "approval", "on_violation"):
+            with self.subTest(key=key):
+                self.reject(lambda p, r, g: p["controlled_actions"]["git_publish_task_branch"].pop(key))
+
+    def test_controlled_action_values_exact(self):
+        for key, value in (("classification", "VERDE"), ("approval", "AUTOMATIC"),
+                           ("on_violation", "ALLOW"), ("enabled", 1), ("enabled", "true")):
+            with self.subTest(key=key, value=value):
+                self.reject(lambda p, r, g: p["controlled_actions"]["git_publish_task_branch"].update({key: value}))
+
+    def test_git_publish_missing_or_wrong_shape(self):
+        self.reject(lambda p, r, g: r.pop("git_publish"))
+        for value in (None, [], True, "enabled"):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r.update(git_publish=value))
+
+    def test_git_publish_keys_closed(self):
+        self.reject(lambda p, r, g: r["git_publish"].update(extra=True))
+        for key in _baseline_permissions()["git_publish"]:
+            with self.subTest(key=key):
+                self.reject(lambda p, r, g: r["git_publish"].pop(key))
+
+    def test_enabled_requires_real_boolean(self):
+        for value in (1, 0, "true", None, []):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(enabled=value))
+
+    def test_disabled_blocks_still_validate_and_do_not_default(self):
+        result = self.load(lambda p, r, g: (
+            p["controlled_actions"]["git_publish_task_branch"].update(enabled=False),
+            r["git_publish"].update(enabled=False)))
+        self.assertIs(result.permissions["git_publish"]["enabled"], False)
+        self.reject(lambda p, r, g: r["git_publish"].update(enabled=False, allow_force=True))
+
+    def test_force_tags_delete_always_false(self):
+        for key in ("allow_force", "allow_tags", "allow_delete"):
+            for value in (True, 0, "false", None):
+                with self.subTest(key=key, value=value):
+                    self.reject(lambda p, r, g: r["git_publish"].update({key: value}))
+
+    def test_approval_packet_and_clean_worktree_always_required(self):
+        for key in ("require_explicit_task_packet", "require_director_approval", "require_clean_worktree"):
+            for value in (False, 1, "true", None):
+                with self.subTest(key=key, value=value):
+                    self.reject(lambda p, r, g: r["git_publish"].update({key: value}))
+
+    def test_refspec_mode_cannot_expand(self):
+        for value in ("all", "matching", "*", None):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(refspec_mode=value))
+
+    def test_remote_name_is_simple_identifier(self):
+        for value in ("", " ", "-origin", "origin x", "https://host", "*", [], None):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(remote_name=value))
+
+    def test_remote_urls_nonempty_unique_strings(self):
+        url = _baseline_permissions()["git_publish"]["allowed_remote_urls"][0]
+        for value in ([], "", None, [""], [1], [url, url], [[]]):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(allowed_remote_urls=value))
+
+    def test_remote_credentials_rejected_without_echo(self):
+        url = "https://synthetic-user:synthetic-password@github.com/example/repo.git"
+        with self.assertRaises(ConfigError) as caught:
+            self.load(lambda p, r, g: r["git_publish"].update(allowed_remote_urls=[url]))
+        self.assertNotIn(url, str(caught.exception))
+        self.assertNotIn("synthetic-password", str(caught.exception))
+
+    def test_remote_query_fragment_ssh_and_wildcards_rejected(self):
+        base = "https://github.com/example/repo.git"
+        for url in (base + "?x=1", base + "#ref", base + "?", base + "#",
+                    "git@github.com:example/repo.git", "ssh://github.com/example/repo.git",
+                    "https://*.github.com/example/repo.git", base + "\n",
+                    "https://github.com/example/*.git", "https://github.com:443/example/repo.git"):
+            with self.subTest(url=url):
+                self.reject(lambda p, r, g: r["git_publish"].update(allowed_remote_urls=[url]))
+
+    def test_branch_prefix_rejects_unsafe_values(self):
+        for value in ("", "/", "task", "../", "task/../", "task\\/", "task /", "task\n/",
+                      "task\x00/", "task/*/", "task/?/", "task//", "-task/", None, []):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(branch_prefix=value))
+
+    def test_forbidden_branches_are_explicit_unique_and_include_main_master(self):
+        for value in ([], "main", ["main"], ["master"], ["main", "master", "main"],
+                      ["main", "master", ""], ["main", "master", 1],
+                      ["main", "master", "*"], ["main", "master", "../x"], None):
+            with self.subTest(value=value):
+                self.reject(lambda p, r, g: r["git_publish"].update(forbidden_branches=value))
+
+    def test_publish_capability_builder_only(self):
+        from orchestrator.config_loader import require_builder_publish_capability, require_builder_capability
+        permissions = self.load().permissions
+        require_builder_publish_capability(permissions)
+        require_builder_capability(permissions)
+        for role in ("director", "verifier"):
+            with self.subTest(role=role):
+                self.reject(lambda p, r, g: r["role_capabilities"].update({role: ["publish_authorized_task_branch"]}))
+
+    def test_missing_publish_capability_is_not_inferred(self):
+        from orchestrator.config_loader import require_builder_publish_capability
+        permissions = _baseline_permissions()
+        permissions["role_capabilities"]["builder"] = ["implement_authorized_changes"]
+        with self.assertRaises(ConfigError):
+            require_builder_publish_capability(permissions)
+
+    def test_unknown_capability_rejected(self):
+        self.reject(lambda p, r, g: r["role_capabilities"]["builder"].append("publish_anything"))
+
+    def test_both_director_gates_required_true(self):
+        for key in ("amarillo_contemplado", "git_publish_task_branch"):
+            with self.subTest(key=key):
+                self.reject(lambda p, r, g: g["director_internal_gate"].pop(key))
+                for value in (False, 1, "true", None):
+                    self.reject(lambda p, r, g: g["director_internal_gate"].update({key: value}))
+
+    def test_concrete_destinations_live_in_yaml_not_loader(self):
+        config = self.load(lambda p, r, g: r["git_publish"].update(
+            remote_name="review", allowed_remote_urls=["https://example.org/team/review.git"],
+            branch_prefix="review/"))
+        self.assertEqual(config.permissions["git_publish"]["remote_name"], "review")
+        self.assertEqual(config.permissions["git_publish"]["branch_prefix"], "review/")
+        # Validation is not approval of these destinations for operational use.
+
 
 
 class RoleCapabilityConfigTests(unittest.TestCase):
@@ -1238,3 +1390,316 @@ class CodexConfigTests(unittest.TestCase):
                          lambda a: a.update(task_execution=[])):
             with self.assertRaises(ConfigError):
                 self.load(mutation)
+
+
+class LocalProjectCommandControlsTests(unittest.TestCase):
+    def load(self, permissions):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_core_config(Path(tmp), permissions=permissions)
+            return load_core_config(tmp)
+
+    def test_exact_false_accepted(self):
+        config = self.load(_baseline_permissions())
+        self.assertIs(config.permissions["execution_controls"]["local_project_commands"], False)
+
+    def test_missing_block_rejected(self):
+        permissions = _baseline_permissions()
+        del permissions["execution_controls"]
+        with self.assertRaises(ConfigError):
+            self.load(permissions)
+
+    def test_block_requires_mapping(self):
+        for value in (None, False, [], "false", 0):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                permissions = _baseline_permissions()
+                permissions["execution_controls"] = value
+                self.load(permissions)
+
+    def test_keys_closed_and_required(self):
+        for value in ({}, {"local_project_commands": False, "extra": False}):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                permissions = _baseline_permissions()
+                permissions["execution_controls"] = value
+                self.load(permissions)
+
+    def test_non_false_values_rejected_without_coercion(self):
+        for value in (True, 1, 0, "false", None):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                permissions = _baseline_permissions()
+                permissions["execution_controls"]["local_project_commands"] = value
+                self.load(permissions)
+
+
+class ProjectRulesAdmissionTests(unittest.TestCase):
+    def canonical(self):
+        return {"version": 1, "project_id": "X", "name": "Fixture", "repo_path": ".",
+                "commands": {"unit": ["python", "-B", "verify.py"]},
+                "protected_paths": ["**/.env*"], "autonomy_overrides": {}}
+
+    def parse(self, data):
+        return load_project_rules_from_yaml_bytes(
+            yaml.safe_dump(data).encode("utf-8"), Path("PROJECT_RULES.yaml")
+        )
+
+    def test_canonical_and_current_real_rules_are_valid(self):
+        self.assertEqual(self.parse(self.canonical()), self.canonical())
+        for project_id in ("SAMPLE", "DISPOSABLE", "AIP_ISO"):
+            with self.subTest(project_id=project_id):
+                rules = load_project_rules(REPO_ROOT / "projects" / project_id / "PROJECT_RULES.yaml")
+                self.assertEqual(rules["project_id"], project_id)
+                self.assertEqual(rules["autonomy_overrides"], {})
+
+    def test_closed_schema_rejects_missing_and_unknown_keys(self):
+        for key in self.canonical():
+            data = self.canonical()
+            del data[key]
+            with self.subTest(missing=key), self.assertRaises(ConfigError):
+                self.parse(data)
+        data = self.canonical()
+        data["unknown"] = True
+        with self.assertRaises(ConfigError):
+            self.parse(data)
+
+    def test_version_requires_real_integer_one(self):
+        for value in (True, False, 1.0, "1", 0, 2, None):
+            data = self.canonical()
+            data["version"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.parse(data)
+
+    def test_project_identity_name_and_path_validation(self):
+        for key in ("project_id", "name", "repo_path"):
+            for value in ("", None, 42, [], "bad\x00value"):
+                data = self.canonical()
+                data[key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                    self.parse(data)
+        for value in ("../X", "bad id", "/X", "X" * 65, "X\n"):
+            data = self.canonical()
+            data["project_id"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.parse(data)
+
+    def test_duplicate_top_level_keys_rejected(self):
+        raw = yaml.safe_dump(self.canonical())
+        for key, value in self.canonical().items():
+            duplicate = raw + yaml.safe_dump({key: value})
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                load_project_rules_from_yaml_bytes(duplicate.encode(), "fixture")
+
+    def test_duplicate_nested_keys_and_merge_collisions_rejected(self):
+        for raw in (
+            "commands: {unit: [a], unit: [b]}",
+            "autonomy_overrides: {a: {x: 1, x: 2}}",
+            "base: &base {x: 1}\nother: {<<: *base, x: 2}",
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ConfigError, "duplicate"):
+                load_project_rules_from_yaml_bytes(raw.encode(), "fixture")
+        # No global mutation of the general-purpose SafeLoader.
+        self.assertEqual(yaml.safe_load("x: 1\nx: 2"), {"x": 2})
+
+    def test_protected_paths_structure_and_duplicates_rejected(self):
+        for value in ({}, None, "x", [1], [""], ["a\x00b"], ["x", "x"]):
+            data = self.canonical()
+            data["protected_paths"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.parse(data)
+
+    def test_autonomy_overrides_must_be_empty_mapping(self):
+        for value in (None, [], "", True, {"level": "VERDE"}):
+            data = self.canonical()
+            data["autonomy_overrides"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.parse(data)
+        self.assertEqual(self.parse(self.canonical())["autonomy_overrides"], {})
+
+    def test_invalid_encoding_unsafe_tags_and_non_mapping_rejected(self):
+        for raw in (b"\xff", b"!!python/object/apply:os.system ['echo forbidden']",
+                    b"[]", b"null", b"", b"autonomy_overrides: &a {loop: *a}"):
+            with self.subTest(raw=raw), self.assertRaises(ConfigError):
+                load_project_rules_from_yaml_bytes(raw, "fixture")
+
+    def test_secret_keys_still_rejected(self):
+        raw = b"commands: {api_key: ['placeholder']}"
+        with self.assertRaisesRegex(ConfigError, "potential secret"):
+            load_project_rules_from_yaml_bytes(raw, "fixture")
+
+    def test_path_loader_reads_bytes_once_and_parser_never_opens_path(self):
+        raw = yaml.safe_dump(self.canonical()).encode()
+        with mock.patch.object(Path, "read_bytes", return_value=raw) as read:
+            self.assertEqual(load_project_rules("fixture"), self.canonical())
+        read.assert_called_once_with()
+        with mock.patch.object(Path, "open", side_effect=AssertionError("unexpected reopen")):
+            self.assertEqual(load_project_rules_from_yaml_bytes(raw, "fixture"), self.canonical())
+
+
+class PermissionsAdmissionTests(unittest.TestCase):
+    def parse(self, raw):
+        return load_permissions_from_yaml_bytes(raw, "PERMISSIONS.yaml")
+
+    def test_current_permissions_and_exact_byte_parser_valid(self):
+        raw = (CONFIG_DIR / "PERMISSIONS.yaml").read_bytes()
+        self.assertEqual(self.parse(raw), yaml.safe_load(raw))
+        self.assertIs(self.parse(raw)["execution_controls"]["local_project_commands"], False)
+
+    def test_invalid_encoding_tags_and_nonmapping_rejected(self):
+        for raw in (b"\xff", b"!!python/object/apply:os.system ['forbidden']", b"[]", b"null"):
+            with self.subTest(raw=raw), self.assertRaises(ConfigError):
+                self.parse(raw)
+
+    def test_duplicate_authority_keys_rejected_recursively(self):
+        for raw in (
+            b"version: 1\nversion: 1",
+            b"deny: {production: true, production: false}",
+            b"execution_controls: {local_project_commands: false, local_project_commands: true}",
+            b"git_publish: {allow_force: false, allow_force: true}",
+            b"role_capabilities: {builder: [], builder: [publish_authorized_task_branch]}",
+            b"nested: {inner: {value: 1, value: 2}}",
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ConfigError, "duplicate"):
+                self.parse(raw)
+
+    def test_alias_merge_collision_and_recursive_alias_rejected(self):
+        for raw in (
+            b"base: &base {x: 1}\nother: {<<: *base, x: 2}",
+            b"deny: &d {loop: *d}",
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ConfigError):
+                self.parse(raw)
+        self.assertEqual(yaml.safe_load("x: 1\nx: 2"), {"x": 2})
+
+    def test_unambiguous_alias_preserves_safe_yaml_semantics(self):
+        data = _baseline_permissions()
+        data["role_capabilities"]["verifier"] = []
+        data["role_capabilities"]["director"] = data["role_capabilities"]["verifier"]
+        raw = yaml.safe_dump(data).encode()
+        self.assertEqual(self.parse(raw), data)
+
+    def test_parser_does_not_reopen_source(self):
+        raw = yaml.safe_dump(_baseline_permissions()).encode()
+        with mock.patch.object(Path, "open", side_effect=AssertionError("unexpected reopen")):
+            self.assertEqual(self.parse(raw), _baseline_permissions())
+
+    def test_existing_validators_preserved(self):
+        for mutate in (
+            lambda p: p["deny"].update(production=False),
+            lambda p: p["execution_controls"].update(local_project_commands=True),
+            lambda p: p["git_publish"].update(allow_force=True),
+            lambda p: p["role_capabilities"].update(builder=["unknown"]),
+            lambda p: p.update(allowed_commands=["shell command"]),
+            lambda p: p.update(api_key="placeholder"),
+        ):
+            data = _baseline_permissions()
+            mutate(data)
+            with self.subTest(mutate=mutate), self.assertRaises(ConfigError):
+                self.parse(yaml.safe_dump(data).encode())
+
+    def test_core_config_uses_supplied_snapshot_without_permissions_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_core_config(root)
+            path = root / "PERMISSIONS.yaml"
+            raw = path.read_bytes()
+            path.unlink()
+            config = load_core_config_from_permissions_bytes(root, raw)
+            self.assertEqual(config.permissions, yaml.safe_load(raw))
+            with self.assertRaises(ConfigError):
+                load_core_config(root)
+
+
+class PublicationAuthorityFoundationTests(unittest.TestCase):
+    def parsers(self):
+        from orchestrator.config_loader import load_policies_from_yaml_bytes, load_gates_from_yaml_bytes
+        return (("POLICIES", load_policies_from_yaml_bytes), ("GATES", load_gates_from_yaml_bytes))
+
+    def test_current_bytes_without_open_and_global_loader_unchanged(self):
+        from unittest import mock
+        constructors = dict(yaml.SafeLoader.yaml_constructors)
+        mapping = yaml.SafeLoader.construct_mapping
+        for name, parser in self.parsers():
+            raw = (REPO_ROOT / "config" / (name + ".yaml")).read_bytes()
+            expected = yaml.safe_load(raw)
+            with self.subTest(name=name), mock.patch.object(Path, "open", side_effect=AssertionError("reopen")):
+                self.assertEqual(parser(raw, "absent.yaml"), expected)
+        self.assertEqual(yaml.SafeLoader.yaml_constructors, constructors)
+        self.assertIs(yaml.SafeLoader.construct_mapping, mapping)
+        self.assertEqual(yaml.safe_load("x: 1\nx: 2"), {"x": 2})
+
+    def test_encoding_tags_duplicates_merges_types_and_secrets(self):
+        for name, parser in self.parsers():
+            raw = (REPO_ROOT / "config" / (name + ".yaml")).read_bytes()
+            nested = (b"prohibitions: {production: true, production: true}\n" if name == "POLICIES"
+                      else b"director_internal_gate: {amarillo_contemplado: true, amarillo_contemplado: true}\n")
+            cases = [b"\xff", b"!!python/object:builtins.object {}", b"[]", b"null",
+                     raw + b"\nversion: 1\n", nested,
+                     b"x: &x {enabled: true}\ny: {<<: *x, enabled: false}\n",
+                     raw + b"\napi_key: forbidden\n", "not bytes", bytearray(raw)]
+            for invalid in cases:
+                with self.subTest(name=name, invalid=repr(invalid)[:80]), self.assertRaises(ConfigError):
+                    parser(invalid, "unused.yaml")
+
+    def test_existing_validator_semantics_and_alias_policy(self):
+        from orchestrator import config_loader as loader
+        for name, parser in self.parsers():
+            data = yaml.safe_load((REPO_ROOT / "config" / (name + ".yaml")).read_bytes())
+            validator = loader._validate_policies if name == "POLICIES" else loader._validate_gates
+            for key in tuple(data):
+                altered = dict(data)
+                del altered[key]
+                with self.subTest(name=name, removed=key):
+                    try:
+                        validator(altered, Path("unused.yaml"))
+                    except ConfigError:
+                        with self.assertRaises(ConfigError):
+                            parser(yaml.safe_dump(altered).encode(), "unused.yaml")
+                    else:
+                        self.assertEqual(parser(yaml.safe_dump(altered).encode(), "unused.yaml"), altered)
+            raw = yaml.safe_dump(data).encode()
+            self.assertIn("alias", parser(raw + b"\nbase: &base {ordinary: true}\nalias: *base\n", "unused.yaml"))
+            with self.assertRaises(ConfigError):
+                parser(raw + b"\ncycle: &cycle {child: *cycle}\n", "unused.yaml")
+
+    def test_duplicates_are_rejected_by_shared_mapping_loader(self):
+        for name, parser in self.parsers():
+            for raw in (
+                b"version: 1\nversion: 1\n",
+                b"controlled_actions: {git_publish_task_branch: {enabled: true, enabled: false}}\n",
+                b"director_internal_gate: {git_publish_task_branch: true, git_publish_task_branch: false}\n",
+                b"base: &base {enabled: true}\naction: {<<: *base, enabled: false}\n",
+            ):
+                with self.subTest(name=name, raw=raw), self.assertRaisesRegex(ConfigError, "duplicate"):
+                    parser(raw, "unused.yaml")
+
+    def test_intersection_requires_every_declarative_condition(self):
+        import copy
+        from orchestrator.config_loader import OrchestratorConfig, require_controlled_publication_authority
+        baseline = load_core_config(REPO_ROOT / "config")
+        before = copy.deepcopy(baseline)
+        self.assertIsNone(require_controlled_publication_authority(baseline))
+        self.assertEqual(baseline, before)
+        mutations = [
+            lambda c: c.permissions["git_publish"].update(enabled=False),
+            lambda c: c.permissions["role_capabilities"].update(builder=[]),
+            lambda c: c.policies["controlled_actions"]["git_publish_task_branch"].update(enabled=False),
+            lambda c: c.policies["controlled_actions"]["git_publish_task_branch"].update(classification="VERDE"),
+            lambda c: c.policies["controlled_actions"]["git_publish_task_branch"].update(approval="OTHER"),
+            lambda c: c.policies["controlled_actions"]["git_publish_task_branch"].update(on_violation="ALLOW"),
+            lambda c: c.gates["director_internal_gate"].update(amarillo_contemplado=False),
+            lambda c: c.gates["director_internal_gate"].update(git_publish_task_branch=False),
+            lambda c: c.permissions.pop("git_publish"),
+            lambda c: c.policies.pop("controlled_actions"),
+            lambda c: c.gates.pop("director_internal_gate"),
+            lambda c: c.permissions["git_publish"].update(enabled="true"),
+        ]
+        for index, mutate in enumerate(mutations):
+            config = copy.deepcopy(baseline)
+            mutate(config)
+            with self.subTest(index=index), self.assertRaises(ConfigError):
+                require_controlled_publication_authority(config)
+        for invalid in (None, {}, OrchestratorConfig({}, {}, {}, None)):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                require_controlled_publication_authority(invalid)
+
+
+if __name__ == "__main__":
+    unittest.main()

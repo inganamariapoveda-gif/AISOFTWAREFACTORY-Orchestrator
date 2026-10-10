@@ -43,10 +43,15 @@ Do not silently resolve conflicts or infer missing authorization.
 
 ## Git and deployment
 
-Do not push, merge, rebase, reset, clean, or deploy to production without
-express authorization. Authorization must also comply with canonical
-governance: its MVP prohibitions remain in force and are not overridden
-by this operating contract.
+Git push is denied by default. The only exception is controlled task-branch
+publication defined in the canonical YAML/spec, requiring an explicit Task
+Packet, Director approval, and every canonical restriction. The Builder must
+never infer authorization from its role or capability alone.
+Publishing main/master, force pushes, tags, remote deletion, and remotes or
+repositories outside the exact allowlist remain prohibited. Git merge and
+production remain absolutely prohibited. Do not rebase, reset, or clean
+without express authorization consistent with canonical governance.
+This section grants no independent exception; the canonical sources control.
 
 ## Verification and evidence
 

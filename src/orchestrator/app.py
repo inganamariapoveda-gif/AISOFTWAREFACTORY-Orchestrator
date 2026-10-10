@@ -12,6 +12,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 import shutil
 import subprocess
@@ -42,12 +43,15 @@ from .config_loader import (
     ConfigError,
     NotificationsConfig,
     OrchestratorConfig,
-    load_core_config,
+    load_core_config_from_authority_bytes,
+    load_core_config_from_permissions_bytes,
     load_notifications_config,
-    load_project_rules,
+    load_project_rules_from_yaml_bytes,
     resolve_project_root,
     resolve_builder,
     require_builder_capability,
+    require_controlled_publication_authority,
+    _safe_ref_component,
     validate_codex_execution_config,
 )
 from .evidence import EvidenceError
@@ -69,9 +73,8 @@ TASKS_DIR = REPO_ROOT / "tasks"
 SAMPLE_TASK_PACKET_PATH = TASKS_DIR / "SAMPLE_TASK.yaml"
 DEFAULT_DB_PATH = REPO_ROOT / "orchestrator.db"
 
-# TASK-EXECUTION-002: timeout fijo (segundos) para cada mandatory_test
-# resuelto/ejecutado por test_runner.run_mandatory_test(). No es específico
-# de PILOT-001 ni de ningún proyecto; un valor razonable de orquestador.
+# Metadata retained for a future isolated mandatory-test backend.
+# Local project-command execution is prohibited; this timeout cannot enable it.
 MANDATORY_TEST_TIMEOUT_SECONDS = 300
 
 # Estados deterministas del resultado de task-execution-probe (D-EXEC-002):
@@ -194,24 +197,55 @@ def _resolve_project_rules_path(project_id: str) -> Path:
 
 def _require_core_config() -> OrchestratorConfig:
     """Falla cerrado: ninguna operación de la CLI procede sin config core válida."""
-    return load_core_config(CONFIG_DIR)
+    return _admit_core_config_with_permissions_identity()[0]
 
 
-def _require_project_rules(project_id: str) -> dict:
-    """Falla cerrado: ninguna operación sobre un proyecto procede sin sus
-    PROJECT_RULES.yaml válidas, y sin que rules['project_id'] coincida
-    exactamente con el project_id solicitado. Sin esta comprobación,
-    PROJECT_RULES.yaml de un proyecto podría reescribirse para declarar el
-    project_id de otro y seguir siendo estructuralmente válido, permitiendo
-    que un proyecto opere con las reglas de otro (CORRECTION-002)."""
+def _read_authority_bytes(path: Path, boundary_dir: Path) -> bytes:
+    """Shared ordinary-file/descriptor checks for authority snapshots."""
+    try:
+        boundary = boundary_dir.resolve(strict=True)
+        for directory in dict.fromkeys((boundary_dir, path.parent)):
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise ConfigError(f"{path.name} directory is not an ordinary directory")
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode)
+                or getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+            raise ConfigError(f"{path.name} must be an ordinary file without redirection")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(boundary):
+            raise ConfigError(f"{path.name} escapes authority directory")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                    or getattr(opened, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise ConfigError(f"{path.name} file identity changed before read")
+            return stream.read()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"{path.name} path or file unavailable") from exc
+
+
+def _admit_project_rules(project_id: str) -> tuple[dict, str]:
+    """One ordinary-file snapshot supplies both authority data and identity."""
     rules_path = _resolve_project_rules_path(project_id)
-    rules = load_project_rules(rules_path)
+    raw = _read_authority_bytes(rules_path, PROJECTS_DIR)
+    digest = _sha256_hex(raw)
+    rules = load_project_rules_from_yaml_bytes(raw, rules_path)
     if rules["project_id"] != project_id:
         raise ConfigError(
             f"PROJECT_RULES.yaml project_id ({rules['project_id']!r}) does not "
             f"match requested project {project_id!r} ({rules_path})"
         )
-    return rules
+    return rules, digest
+
+
+def _require_project_rules(project_id: str) -> dict:
+    return _admit_project_rules(project_id)[0]
 
 
 def cmd_init_storage(args: argparse.Namespace) -> int:
@@ -636,18 +670,23 @@ def execute_task_packet(
 ) -> dict[str, Any]:
     """TASK-EXECUTION-002: compone el flujo mínimo seguro --
 
-        TaskPacket -> project authorization -> developer instruction ->
-        generic Claude adapter -> Git Evidence -> scope verification ->
-        mandatory test resolver/runner -> deterministic technical/security
-        gate -> HUMAN_FUNCTIONAL_TEST -> STOP
+        TaskPacket -> project authorization -> command data resolution ->
+        isolated backend required if mandatory_tests is nonempty ->
+        BLOCKED before Builder (no isolated backend integrated).
+
+    With no mandatory tests, Builder/evidence/review controls remain in force.
+    The downstream test-result reporting contract is retained for later isolated
+    integration and synthetic fixtures; it cannot execute project commands.
 
     -- SIN commit automático. Función determinista dado el mismo estado
     externo (Git real, subprocess mockeado en pruebas); NUNCA invoca
     git add/commit/reset/checkout/clean, NUNCA revierte nada. Claude nunca
-    es autoridad sobre éxito (D-EXEC-002): éxito real = Git Evidence +
-    scope validation + mandatory tests, evaluados aquí exclusivamente a
-    partir de evidencia ejecutable (evidence_mod/test_runner_mod), nunca de
-    la narrativa de run_developer_task().
+    es autoridad sobre éxito (D-EXEC-002): Git Evidence y scope validation
+    siguen siendo obligatorios. El contrato histórico de resultados de tests
+    se conserva para reporting sintético y futura integración aislada;
+    test_runner_mod solo resuelve/valida datos y rechaza ejecución local.
+    Mandatory tests no vacíos bloquean antes del Builder, nunca se aceptan
+    como evidencia la narrativa de run_developer_task() ni IDs autorizados.
 
     Cualquier fallo (repo sucio, developer con timeout/resultado
     malformado, cambio fuera de alcance, HEAD modificado, mandatory test
@@ -658,7 +697,7 @@ def execute_task_packet(
     commit_performed=False.
 
     CAPACITY-RESUME-EXECUTION-002 (parámetros keyword-only OPCIONALES; sin
-    ellos el comportamiento es EXACTAMENTE el de siempre y no hay Store):
+    ellos no hay Store; el gate de backend aislado se aplica igualmente):
     - `before`: el Git BEFORE ORIGINAL ya capturado (fresco) o reconstruido
       (resume). Es el ÚNICO baseline de toda la tarea: nunca se captura otro.
     - `resume`: True reanuda sobre ediciones parciales autorizadas -- no se
@@ -741,22 +780,28 @@ def execute_task_packet(
     # role boundary fija del motor) + adaptador genérico de Claude.
     instruction = _build_developer_execution_prompt(packet)
     run_id = None
-    if budget_store is not None:
-        # Reuse the runner's exact validators without executing a command.
-        try:
+    # Resolve data before any Builder invocation, including probe and resume.
+    try:
+        if budget_store is not None:
             if resolved_config["adapter"] == "claude_code_cli":
                 _validate_task_execution_config(developer_config)
             elif resolved_config["adapter"] == "codex_cli":
                 validate_codex_execution_config(developer_config)
             else:
                 raise ConfigError("unsupported execution adapter")
-            for test_id in packet.mandatory_tests:
-                test_runner_mod._validate_test_id(test_id)
-                if test_id not in permissions["allowed_commands"] or test_id not in project_rules["commands"]:
-                    raise test_runner_mod.TestRunnerError("mandatory command is not authorized")
-                test_runner_mod._validate_resolved_argv(project_rules["commands"][test_id], test_id)
-        except (ConfigError, DeveloperExecutionError, test_runner_mod.TestRunnerError):
-            return _blocked("local model execution preflight failed")
+        for test_id in packet.mandatory_tests:
+            test_runner_mod.resolve_mandatory_test(
+                test_id, project_commands=project_rules["commands"],
+                globally_allowed_ids=permissions["allowed_commands"],
+            )
+    except (ConfigError, DeveloperExecutionError, test_runner_mod.TestRunnerError):
+        return _blocked("local model execution preflight failed")
+    if packet.mandatory_tests:
+        try:
+            test_runner_mod.require_isolated_mandatory_test_backend()
+        except test_runner_mod.TestRunnerError:
+            return _blocked(test_runner_mod.ISOLATED_BACKEND_UNAVAILABLE)
+    if budget_store is not None:
         try:
             run_id = budget_store.reserve_agent_run(
                 packet.task_id, role=resolved_config["role"], agent=agent_id,
@@ -889,8 +934,8 @@ def execute_task_packet(
         budget_store.complete_agent_run(run_id, state="FAILED" if protected_reason else "SUCCEEDED")
 
     # 9-11. Git evidence PRE-TEST (contra el BEFORE original) + evaluación
-    # (HEAD unchanged, scope, forbidden_files). Debe pasar ANTES de
-    # ejecutar ningún mandatory test.
+    # (HEAD unchanged, scope, forbidden_files). Precede al reporting histórico
+    # de tests; el gate anterior impide ejecución local de comandos del proyecto.
     try:
         pre_test_change_evidence = evidence_mod.capture_change_evidence(
             before, packet.authorized_files
@@ -917,11 +962,11 @@ def execute_task_packet(
             **common_fields,
         )
 
-    # 12-14. mandatory tests: resolver/ejecutar cada uno; cualquier fallo ->
-    # STOP. La evidencia PRE-TEST ya pasó en este punto (pre_test_evidence_
-    # passed=True), pero POST-TEST todavía no se ha comprobado.
-    # REPORTING-001: resultados ACUMULADOS, en el orden de ejecución efectiva
-    # (nunca sobrescritos por iteración; un test no ejecutado no aparece).
+    # 12-14. Contrato histórico de reporting, cubierto con resultados sintéticos.
+    # Sin backend aislado, mandatory tests no vacíos ya bloquearon antes del Builder;
+    # run_mandatory_test también rechaza ejecución local en su API compatible.
+    # PRE-TEST pasó; POST-TEST sigue pendiente. REPORTING-001 acumula resultados
+    # en orden, sin sobrescribir ni inventar resultados ausentes.
     # Solo test_id/result/exit_code: nunca stdout, stderr, argv ni entorno.
     mandatory_test_results: list[dict[str, Any]] = []
     # Intervening Git evidence/scope checks are read-only: reuse AFTER BUILDER.
@@ -953,7 +998,8 @@ def execute_task_packet(
             mandatory_failure_reason = f"mandatory test {test_id!r} failed"
             break
 
-    # Always inspect the test window, including nonzero/timeout/handled errors.
+    # Historical/synthetic reporting: inspect even after failure or handled error.
+    # This retained evidence contract does not authorize local test execution.
     try:
         protected_after_tests = _capture_protected_paths(project_root, project_rules["protected_paths"])
         protected_test_reason = (
@@ -963,11 +1009,10 @@ def execute_task_packet(
     except EvidenceError:
         protected_test_reason = "protected-path snapshot unavailable after mandatory tests"
 
-    # CORRECTION-001 (SECURITY_REVIEW: CHANGES_REQUESTED): un mandatory
-    # test preautorizado puede retornar exit code 0 y aun así mutar el
-    # repositorio (modificar forbidden_files, tocar un archivo fuera de
-    # alcance, crear un untracked inesperado, o incluso mover HEAD). El
-    # exit code del test NUNCA es autoridad suficiente por sí solo: se
+    # Contrato histórico CORRECTION-001, ejercitado con resultados y mutaciones
+    # sintéticos: autorizar un ID no autoriza ejecución ni confiere confianza
+    # en el código o sus efectos. La ejecución local sigue prohibida.
+    # Un resultado exit code 0 NUNCA es autoridad suficiente por sí solo: se
     # vuelve a capturar y evaluar evidencia -- SIEMPRE contra el mismo
     # `before` original, nunca un nuevo baseline post-Claude/post-test --
     # y debe pasar TAMBIÉN, o STOP. Sin rollback automático: nunca
@@ -1018,9 +1063,10 @@ def execute_task_packet(
             **common_fields,
         )
 
-    # 15-18. deterministic technical/security gate: PRE-TEST PASS + tests
-    # PASS + POST-TEST PASS -> HUMAN_GATE/HUMAN_FUNCTIONAL_TEST -> STOP.
-    # Nunca commit.
+    # 15-18. Retained review contract: PRE-TEST + results + POST-TEST must pass.
+    # Nonempty mandatory tests reach this only in synthetic reporting fixtures
+    # until isolated integration; empty mandatory tests keep the existing flow.
+    # HUMAN_GATE/HUMAN_FUNCTIONAL_TEST -> STOP. Nunca commit.
     return {
         "task_id": packet.task_id,
         "project_id": packet.project_id,
@@ -1135,27 +1181,436 @@ def _load_packet_with_identity(packet_path: Path, *, policies: dict[str, Any]) -
 
 
 def _load_project_rules_with_identity(project_id: str) -> tuple[dict, str]:
-    """Su loader lee por path: hash ANTES, carga, hash DESPUÉS; deben ser
-    iguales (si el archivo cambió durante la carga -> IdentityError)."""
-    rules_path = _resolve_project_rules_path(project_id)
-    hash_before = _file_sha256(rules_path)
-    rules = _require_project_rules(project_id)
-    hash_after = _file_sha256(rules_path)
-    if hash_before != hash_after:
-        raise IdentityError("PROJECT_RULES.yaml changed while it was being loaded")
-    return rules, hash_after
+    """Fresh admission on resume; the caller compares the persisted digest."""
+    return _admit_project_rules(project_id)
 
 
 def _load_core_config_with_identity() -> tuple[OrchestratorConfig, str]:
-    """Igual para PERMISSIONS.yaml. AGENTS.yaml y POLICIES.yaml NO se hashean
-    deliberadamente: la política de espera puede ajustarse legítimamente."""
-    permissions_path = CONFIG_DIR / "PERMISSIONS.yaml"
-    hash_before = _file_sha256(permissions_path)
-    config = _require_core_config()
-    hash_after = _file_sha256(permissions_path)
-    if hash_before != hash_after:
-        raise IdentityError("PERMISSIONS.yaml changed while it was being loaded")
-    return config, hash_after
+    return _admit_core_config_with_permissions_identity()
+
+
+@dataclass(frozen=True)
+class PublicationAuthoritySnapshot:
+    config: OrchestratorConfig
+    permissions_sha256: str
+    policies_sha256: str
+    gates_sha256: str
+
+
+class ControlledPublicationApprovalError(CliError):
+    """Invalid structure or binding; never a decision about issuer authenticity."""
+
+
+def _require_approval_digest(value: Any, length: int, label: str) -> None:
+    if (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{" + str(length) + r"}", value)
+            or value == "0" * length):
+        raise ControlledPublicationApprovalError(f"invalid {label} digest")
+
+
+@dataclass(frozen=True)
+class ControlledPublicationApproval:
+    """Data only. APPROVAL_RECORD_VALID != APPROVAL_SOURCE_AUTHENTICATED.
+
+    EXTERNAL_TRUSTED_DIRECTOR is a required provenance claim, not proof.
+    No publisher may consume this model for execution until trusted issuance
+    exists. Construction neither issues nor authenticates an approval.
+    """
+
+    approval_id: str
+    task_id: str
+    task_packet_sha256: str
+    action: str
+    builder_id: str
+    branch: str
+    candidate_head_sha: str
+    remote_name: str
+    effective_push_url: str
+    target_ref: str
+    permissions_sha256: str
+    policies_sha256: str
+    gates_sha256: str
+    approved_at: str
+    approval_source: str
+
+    def __post_init__(self) -> None:
+        self.validate_structure()
+
+    def validate_structure(self) -> None:
+        for label in ("approval_id", "task_id", "builder_id"):
+            value = getattr(self, label)
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+                raise ControlledPublicationApprovalError(f"invalid {label}")
+        if self.action != "git_publish_task_branch":
+            raise ControlledPublicationApprovalError("unsupported approval action")
+        if self.approval_source != "EXTERNAL_TRUSTED_DIRECTOR":
+            raise ControlledPublicationApprovalError("unsupported approval source claim")
+        for label in ("task_packet_sha256", "permissions_sha256", "policies_sha256", "gates_sha256"):
+            _require_approval_digest(getattr(self, label), 64, label)
+        # This repository uses SHA-1 Git object IDs; configuration identities use SHA-256.
+        _require_approval_digest(self.candidate_head_sha, 40, "candidate_head_sha")
+        if (not isinstance(self.branch, str) or not self.branch.startswith("task/")
+                or not all(_safe_ref_component(part) for part in self.branch.split("/"))):
+            raise ControlledPublicationApprovalError("invalid task branch")
+        if self.target_ref != "refs/heads/" + self.branch:
+            raise ControlledPublicationApprovalError("target ref does not match branch")
+        if (not isinstance(self.remote_name, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", self.remote_name)):
+            raise ControlledPublicationApprovalError("invalid remote name")
+        # Literal HTTPS identity only; no credentials, port, query, fragment or rewriting.
+        if (not isinstance(self.effective_push_url, str)
+                or not re.fullmatch(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.git",
+                                    self.effective_push_url)
+                or ".." in self.effective_push_url):
+            raise ControlledPublicationApprovalError("invalid effective publication URL")
+        if not isinstance(self.approved_at, str):
+            raise ControlledPublicationApprovalError("invalid approval timestamp")
+        try:
+            timestamp = datetime.fromisoformat(self.approved_at)
+        except ValueError as exc:
+            raise ControlledPublicationApprovalError("invalid approval timestamp") from exc
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ControlledPublicationApprovalError("approval timestamp requires timezone")
+
+
+def validate_controlled_publication_approval(
+    approval: ControlledPublicationApproval,
+    publication_authority_snapshot: PublicationAuthoritySnapshot,
+    task_packet: TaskPacket,
+    task_packet_sha256: str,
+    expected_builder_id: str,
+    candidate_head_sha: str,
+    remote_name: str,
+    effective_push_url: str,
+) -> None:
+    """Pure structure/binding check, NOT authenticated approval or execution.
+
+    Caller must supply the packet/digest from RAW admission and observations
+    from the future trusted preflight. No reads, Git, issuer or latest-wins
+    lookup. A changed binding requires another explicitly selected approval_id.
+    """
+    if not isinstance(approval, ControlledPublicationApproval):
+        raise ControlledPublicationApprovalError("specific approval record required")
+    if not isinstance(publication_authority_snapshot, PublicationAuthoritySnapshot):
+        raise ControlledPublicationApprovalError("publication authority snapshot required")
+    if not isinstance(task_packet, TaskPacket):
+        raise ControlledPublicationApprovalError("admitted task packet required")
+    approval.validate_structure()
+    snapshot = publication_authority_snapshot
+    require_controlled_publication_authority(snapshot.config)
+    if not task_packet.authorizes_action("git_publish_task_branch"):
+        raise ControlledPublicationApprovalError("packet does not explicitly authorize action")
+    expected = {
+        "task_id": task_packet.task_id,
+        "task_packet_sha256": task_packet_sha256,
+        "builder_id": expected_builder_id,
+        "branch": task_packet.preconditions.git.expected_branch,
+        "candidate_head_sha": candidate_head_sha,
+        "remote_name": remote_name,
+        "effective_push_url": effective_push_url,
+        "target_ref": "refs/heads/" + task_packet.preconditions.git.expected_branch,
+        "permissions_sha256": snapshot.permissions_sha256,
+        "policies_sha256": snapshot.policies_sha256,
+        "gates_sha256": snapshot.gates_sha256,
+    }
+    for label, value in expected.items():
+        if getattr(approval, label) != value:
+            raise ControlledPublicationApprovalError(f"approval binding mismatch: {label}")
+    limits = snapshot.config.permissions["git_publish"]
+    if (not approval.branch.startswith(limits["branch_prefix"])
+            or approval.branch in limits["forbidden_branches"]
+            or approval.remote_name != limits["remote_name"]
+            or approval.effective_push_url not in limits["allowed_remote_urls"]):
+        raise ControlledPublicationApprovalError("approval outside admitted publication bounds")
+
+
+@dataclass(frozen=True)
+class ControlledPublicationGitPreflight:
+    repo_root: Path
+    branch: str
+    head_sha: str
+    worktree_clean: bool
+    remote_name: str
+    effective_push_url: str
+    target_ref: str
+    git_config_sha256: str
+    rewrite_present: bool
+    rewrite_entries: tuple[tuple[str, str], ...]
+    mirror_enabled: bool
+    follow_tags_enabled: bool
+    recurse_submodules: str
+    push_options_present: bool
+    push_signing: str
+    pre_push_hook_present: bool
+    hooks_path: str
+    approval_id: str
+    task_packet_sha256: str
+    permissions_sha256: str
+    policies_sha256: str
+    gates_sha256: str
+    observed_at: str
+
+
+# Exact argv only. The remote query is added only after approval validation.
+_PUBLICATION_PREFLIGHT_GIT_COMMANDS = frozenset({
+    ("config", "--no-includes", "--file", "-", "--null", "--list"),
+    ("rev-parse", "--show-toplevel"),
+    ("rev-parse", "HEAD"),
+    ("symbolic-ref", "--quiet", "--short", "HEAD"),
+    ("ls-files", "--stage", "-z"),
+    ("check-attr", "--stdin", "-z", "filter"),
+    ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"),
+})
+
+
+def _preflight_ordinary_directory(path: Path) -> Path:
+    """Reject redirection on every path component before Git or file reads."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise ControlledPublicationApprovalError("preflight requires an absolute ordinary path")
+    try:
+        for component in reversed((path, *path.parents)):
+            if (sandbox_mod._is_link_like(component) or evidence_mod._is_reparse_point(component)
+                    or not stat.S_ISDIR(component.lstat().st_mode)):
+                raise ControlledPublicationApprovalError("redirected or non-directory preflight path")
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise ControlledPublicationApprovalError("preflight directory unavailable") from exc
+
+
+def _publication_preflight_environment(empty_global_config: Path) -> dict[str, str]:
+    """Engine-supplied ordinary empty file; never inherit Git config injection."""
+    _preflight_ordinary_directory(empty_global_config.parent)
+    if _read_authority_bytes(empty_global_config, empty_global_config.parent) != b"":
+        raise ControlledPublicationApprovalError("global config must be an empty trusted file")
+    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP", "TMPDIR"}
+    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(empty_global_config),
+               GIT_ATTR_NOSYSTEM="1",
+               GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+    return env
+
+
+def _run_publication_preflight_git(
+    executable: str, args: tuple[str, ...], *, repo: Path,
+    remote_name: str, env: dict[str, str], config_raw: bytes | None = None,
+) -> bytes:
+    if not isinstance(remote_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", remote_name):
+        raise ControlledPublicationApprovalError("invalid preflight remote")
+    remote_query = ("remote", "get-url", "--push", "--all", remote_name)
+    if args not in _PUBLICATION_PREFLIGHT_GIT_COMMANDS and args != remote_query:
+        raise ControlledPublicationApprovalError("Git command outside preflight allowlist")
+    try:
+        result = subprocess.run(
+            [executable, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+             "-c", "core.attributesFile=" + env["GIT_CONFIG_GLOBAL"],
+             "-c", "core.worktree=" + str(repo), *args],
+            cwd=str(repo), env=env, input=config_raw, capture_output=True,
+            timeout=15, shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ControlledPublicationApprovalError("Git preflight observation unavailable") from exc
+    if result.returncode != 0:
+        raise ControlledPublicationApprovalError("Git preflight observation failed")
+    return result.stdout
+
+
+def _preflight_config_entries(raw: bytes) -> tuple[tuple[str, str], ...]:
+    """Git's --null --list format is key LF value NUL; bare keys mean true."""
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ControlledPublicationApprovalError("invalid Git config output encoding") from exc
+    if text and not text.endswith("\0"):
+        raise ControlledPublicationApprovalError("incomplete Git config output")
+    entries = []
+    for record in text.split("\0")[:-1]:
+        key, separator, value = record.partition("\n")
+        if not key or "." not in key or any(c.isspace() or ord(c) < 32 for c in key):
+            raise ControlledPublicationApprovalError("invalid Git config key")
+        entries.append((key, value if separator else "true"))
+    return tuple(entries)
+
+
+def run_controlled_publication_git_preflight(
+    publication_authority_snapshot: PublicationAuthoritySnapshot,
+    approval: ControlledPublicationApproval, task_packet: TaskPacket,
+    task_packet_sha256: str, expected_builder_id: str, repo_path: Path | str,
+    *, empty_global_config: Path | str,
+) -> ControlledPublicationGitPreflight:
+    """Engine-owned observation only; no authenticated issuer or atomicity guarantee.
+
+    repo_path and the empty config path are engine-authorized inputs, not packet
+    claims. Mutable identities MUST be revalidated by the future executor.
+    """
+    if not isinstance(approval, ControlledPublicationApproval):
+        raise ControlledPublicationApprovalError("specific approval required before Git")
+    validate_controlled_publication_approval(
+        approval, publication_authority_snapshot, task_packet, task_packet_sha256,
+        expected_builder_id, approval.candidate_head_sha,
+        approval.remote_name, approval.effective_push_url,
+    )
+    repo = _preflight_ordinary_directory(Path(repo_path))
+    git_dir = _preflight_ordinary_directory(repo / ".git")
+
+    def reject_info_attributes() -> None:
+        # Endpoint checks are not continuous immutability (create/delete ABA).
+        info = git_dir / "info"
+        if os.path.lexists(info):
+            _preflight_ordinary_directory(info)
+        if os.path.lexists(info / "attributes"):
+            raise ControlledPublicationApprovalError("Git info attributes unsupported")
+
+    reject_info_attributes()
+    # Linked worktrees/common configuration are outside this MVP.
+    if any(os.path.lexists(git_dir / name) for name in ("commondir", "config.worktree")):
+        raise ControlledPublicationApprovalError("additional worktree config unsupported")
+    raw = _read_authority_bytes(git_dir / "config", git_dir)
+    config_sha = _sha256_hex(raw)
+    env = _publication_preflight_environment(Path(empty_global_config))
+    # PF-07: supported attribute sources cannot activate transient filter config.
+    # The engine-owned empty file and Git metadata still require future isolation.
+    env["GIT_ATTR_SOURCE"] = approval.candidate_head_sha
+    executable = evidence_mod._resolve_git_executable()
+
+    def observe(*args: str, config_raw: bytes | None = None) -> bytes:
+        return _run_publication_preflight_git(
+            executable, args, repo=repo, remote_name=approval.remote_name, env=env, config_raw=config_raw)
+
+    entries = _preflight_config_entries(observe(
+        "config", "--no-includes", "--file", "-", "--null", "--list", config_raw=raw))
+    config = {}
+    rewrites = []
+    for key, value in entries:
+        section = key.partition(".")[0]
+        if section.lower() in {"include", "includeif"}:
+            raise ControlledPublicationApprovalError("Git config includes unsupported")
+        if section.lower() == "filter":
+            raise ControlledPublicationApprovalError("local Git filters unsupported in read-only preflight")
+        if key.lower() in {"extensions.worktreeconfig", "core.worktree"}:
+            raise ControlledPublicationApprovalError("Git worktree configuration unsupported")
+        if section.lower() == "url" and key.rsplit(".", 1)[-1].lower() in {"insteadof", "pushinsteadof"}:
+            rewrites.append((key, value))
+        config.setdefault(key, []).append(value)
+
+    def single(key: str, default: str = "false") -> str:
+        values = config.get(key, [])
+        if len(values) > 1:
+            raise ControlledPublicationApprovalError("ambiguous Git push configuration")
+        return values[0] if values else default
+
+    def disabled(key: str) -> bool:
+        if single(key).lower() not in {"false", "no", "off", "0"}:
+            raise ControlledPublicationApprovalError("unsafe Git push configuration")
+        return False
+
+    mirror = disabled("remote." + approval.remote_name + ".mirror")
+    follow_tags = disabled("push.followtags")
+    disabled("push.recursesubmodules")
+    disabled("push.gpgsign")
+    if "remote." + approval.remote_name + ".push" in config or "push.pushoption" in config:
+        raise ControlledPublicationApprovalError("implicit Git push effects unsupported")
+    hooks_setting = single("core.hookspath", str(git_dir / "hooks"))
+    if not hooks_setting or hooks_setting.startswith("~"):
+        raise ControlledPublicationApprovalError("ambiguous hooks path")
+    hooks = Path(hooks_setting)
+    if not hooks.is_absolute():
+        hooks = repo / hooks
+    # Observe presence only, never open or execute hook content.
+    if ".." in hooks.parts or not hooks.is_relative_to(repo):
+        raise ControlledPublicationApprovalError("hooks path outside authorized repository")
+    for ancestor in hooks.parents:
+        if ancestor.is_relative_to(repo) and os.path.lexists(ancestor):
+            _preflight_ordinary_directory(ancestor)
+    if hooks.exists():
+        _preflight_ordinary_directory(hooks)
+    elif os.path.lexists(hooks):
+        raise ControlledPublicationApprovalError("redirected hooks path")
+    hook_present = os.path.lexists(hooks / "pre-push")
+
+    def line(raw_output: bytes) -> str:
+        try:
+            value = raw_output.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ControlledPublicationApprovalError("invalid Git observation encoding") from exc
+        value = value.removesuffix("\n").removesuffix("\r")
+        if not value or any(c in value for c in "\r\n\0"):
+            raise ControlledPublicationApprovalError("ambiguous Git observation")
+        return value
+
+    observed_repo = _preflight_ordinary_directory(Path(line(observe("rev-parse", "--show-toplevel"))))
+    if observed_repo != repo:
+        raise ControlledPublicationApprovalError("observed repository differs from authorized root")
+    head = line(observe("rev-parse", "HEAD"))
+    branch = line(observe("symbolic-ref", "--quiet", "--short", "HEAD"))
+    if branch != approval.branch:
+        raise ControlledPublicationApprovalError("observed branch differs from approval")
+    index = observe("ls-files", "--stage", "-z")
+    if index and not index.endswith(b"\0"):
+        raise ControlledPublicationApprovalError("incomplete Git index observation")
+    if any(record.startswith(b"160000 ") for record in index.split(b"\0")[:-1]):
+        raise ControlledPublicationApprovalError("submodule execution context unsupported")
+    paths = []
+    for record in index.split(b"\0")[:-1]:
+        metadata, separator, path = record.partition(b"\t")
+        if not separator or not path or not re.fullmatch(rb"[0-7]{6} [0-9a-f]+ [0-3]", metadata):
+            raise ControlledPublicationApprovalError("invalid Git index observation")
+        paths.append(path)
+    # Only observed tracked paths enter stdin; no path becomes an argv option.
+    attributes = observe("check-attr", "--stdin", "-z", "filter",
+                         config_raw=b"".join(path + b"\0" for path in paths))
+    expected_attributes = b"".join(path + b"\0filter\0unspecified\0" for path in paths)
+    if attributes != expected_attributes:
+        raise ControlledPublicationApprovalError("candidate filter attributes unsupported or ambiguous")
+    if observe("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none") != b"":
+        raise ControlledPublicationApprovalError("publication requires a clean worktree and index")
+    url = line(observe("remote", "get-url", "--push", "--all", approval.remote_name))
+    validate_controlled_publication_approval(
+        approval, publication_authority_snapshot, task_packet, task_packet_sha256,
+        expected_builder_id, head, approval.remote_name, url,
+    )
+    reject_info_attributes()
+    # PF-01: endpoint continuity only; this does not exclude intermediate ABA changes.
+    config_raw_after = _read_authority_bytes(git_dir / "config", git_dir)
+    if config_raw_after != raw:
+        raise ControlledPublicationApprovalError("Git config continuity mismatch")
+    return ControlledPublicationGitPreflight(
+        repo_root=repo, branch=branch, head_sha=head, worktree_clean=True,
+        remote_name=approval.remote_name, effective_push_url=url, target_ref=approval.target_ref,
+        git_config_sha256=config_sha, rewrite_present=bool(rewrites), rewrite_entries=tuple(rewrites),
+        mirror_enabled=mirror, follow_tags_enabled=follow_tags,
+        recurse_submodules=single("push.recursesubmodules"), push_options_present=False,
+        push_signing=single("push.gpgsign"), pre_push_hook_present=hook_present,
+        hooks_path=str(hooks), approval_id=approval.approval_id, task_packet_sha256=task_packet_sha256,
+        permissions_sha256=publication_authority_snapshot.permissions_sha256,
+        policies_sha256=publication_authority_snapshot.policies_sha256,
+        gates_sha256=publication_authority_snapshot.gates_sha256,
+        observed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _admit_publication_authority() -> PublicationAuthoritySnapshot:
+    """One logical admission, not an atomic filesystem transaction or approval."""
+    permissions_raw, permissions_sha = _admit_permissions_bytes_with_identity()
+    policies_raw = _read_authority_bytes(CONFIG_DIR / "POLICIES.yaml", CONFIG_DIR)
+    gates_raw = _read_authority_bytes(CONFIG_DIR / "GATES.yaml", CONFIG_DIR)
+    policies_sha = _sha256_hex(policies_raw)
+    gates_sha = _sha256_hex(gates_raw)
+    config = load_core_config_from_authority_bytes(
+        CONFIG_DIR, permissions_raw, policies_raw, gates_raw,
+    )
+    return PublicationAuthoritySnapshot(config, permissions_sha, policies_sha, gates_sha)
+
+
+def _admit_permissions_bytes_with_identity() -> tuple[bytes, str]:
+    """Shared approved PERMISSIONS read/hash admission, without parsing a second file."""
+    raw = _read_authority_bytes(CONFIG_DIR / "PERMISSIONS.yaml", CONFIG_DIR)
+    return raw, _sha256_hex(raw)
+
+
+def _admit_core_config_with_permissions_identity() -> tuple[OrchestratorConfig, str]:
+    """Pin permissions authority and RAW identity to the same byte snapshot."""
+    raw, digest = _admit_permissions_bytes_with_identity()
+    config = load_core_config_from_permissions_bytes(CONFIG_DIR, raw)
+    return config, digest
 
 
 def _validate_relative_packet_path(value: Any) -> str:
