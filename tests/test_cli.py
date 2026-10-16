@@ -6870,6 +6870,33 @@ class ControlledPublicationApprovalTests(CliFixtureTestCase):
             with self.subTest(changes=changes), self.assertRaises(app.ControlledPublicationApprovalError):
                 self.validate(replace(self.approval, **changes), **changes)
 
+    def test_alternate_branch_prefix_is_structurally_valid(self):
+        from dataclasses import replace
+        replace(self.approval, branch="review/cambio", target_ref="refs/heads/review/cambio").validate_structure()
+
+    def prefix_policy_fixture(self, branch):
+        from dataclasses import replace
+        path = app.CONFIG_DIR / "PERMISSIONS.yaml"
+        permissions = yaml.safe_load(path.read_bytes())
+        permissions["git_publish"]["branch_prefix"] = "review/"
+        _write_yaml(path, permissions)
+        authority = app._admit_publication_authority()
+        data = yaml.safe_load(self.sample_task_path.read_bytes())
+        data["preconditions"]["git"]["expected_branch"] = branch
+        _write_yaml(self.sample_task_path, data)
+        packet, digest = app._load_packet_with_identity(self.sample_task_path, policies=authority.config.policies)
+        approval = replace(self.approval, branch=branch, target_ref="refs/heads/" + branch,
+                           task_packet_sha256=digest, permissions_sha256=authority.permissions_sha256)
+        return dict(approval=approval, publication_authority_snapshot=authority,
+                    task_packet=packet, task_packet_sha256=digest)
+
+    def test_binding_accepts_admitted_alternate_prefix(self):
+        self.validate(**self.prefix_policy_fixture("review/cambio"))
+
+    def test_binding_rejects_wrong_prefix_under_alternate_policy(self):
+        with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "outside admitted publication bounds"):
+            self.validate(**self.prefix_policy_fixture("task/cambio"))
+
     def test_generic_approval_does_not_become_specific_record(self):
         for generic in ("TECH_APPROVED", "HUMAN_APPROVED", {"actor": "director"},
                         {"task_id": self.packet.task_id, "actor": "director", "to_status": "HUMAN_APPROVED"}):
@@ -6954,11 +6981,101 @@ class ControlledPublicationGitPreflightTests(CliFixtureTestCase):
             self.assertEqual(call.args[0][5:9],
                              ["-c", "core.attributesFile=" + str(self.empty_config),
                               "-c", "core.worktree=" + str(self.repo.resolve())])
-            argv = tuple(call.args[0][9:])
+            argv = tuple(call.args[0][10:])
             self.assertTrue(argv in app._PUBLICATION_PREFLIGHT_GIT_COMMANDS
                             or argv == ("remote", "get-url", "--push", "--all", "origin"))
         with self.assertRaises(FrozenInstanceError):
             result.head_sha = "changed"
+
+    def test_no_lazy_fetch_environment_overrides_parent(self):
+        with mock.patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "0"}), \
+                mock.patch.object(subprocess, "run", wraps=subprocess.run) as calls:
+            self.assertTrue(self.preflight().worktree_clean)
+        self.assertTrue(calls.call_args_list)
+        for call in calls.call_args_list:
+            self.assertEqual(call.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_no_lazy_fetch_global_flag_preserves_safe_arguments(self):
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as calls:
+            self.preflight()
+        for call in calls.call_args_list:
+            self.assertEqual(call.args[0][:10], [self.git_executable,
+                "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+                "-c", "core.attributesFile=" + str(self.empty_config),
+                "-c", "core.worktree=" + str(self.repo.resolve()), "--no-lazy-fetch"])
+            self.assertFalse(call.kwargs["shell"])
+            self.assertEqual(call.kwargs["timeout"], 15)
+
+    def object_inventory(self):
+        return {p.relative_to(self.repo): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in (self.repo / ".git" / "objects").rglob("*") if p.is_file()}
+
+    def assert_config_blocks_before_object_lookup(self, key, value, reason):
+        self.git("config", key, value)
+        before = self.object_inventory()
+        with mock.patch.object(app, "_run_publication_preflight_git",
+                               wraps=app._run_publication_preflight_git) as calls:
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, reason):
+                self.preflight()
+        self.assertEqual([call.args[1] for call in calls.call_args_list],
+                         [("config", "--no-includes", "--file", "-", "--null", "--list")])
+        self.assertEqual(self.object_inventory(), before)
+
+    def test_partial_clone_blocks_before_object_lookup(self):
+        self.assert_config_blocks_before_object_lookup("extensions.partialClone", "origin", "partial clone unsupported")
+
+    def test_promisor_true_blocks_before_object_lookup(self):
+        for value in ("true", "YES", "on", "1", "-1", "2"):
+            with self.subTest(value=value):
+                self.assert_config_blocks_before_object_lookup("remote.origin.promisor", value, "promisor configuration")
+
+    def test_partial_clone_filter_blocks_before_object_lookup(self):
+        self.assert_config_blocks_before_object_lookup("remote.origin.partialCloneFilter", "blob:none", "partial clone filter")
+
+    def test_promisor_false_values_are_not_promisor(self):
+        for value in ("false", "NO", "off", "0", "", "+0", "-0", "00", "0x0", "0k"):
+            with self.subTest(value=value):
+                self.git("config", "remote.origin.promisor", value)
+                self.assertEqual(self.git("config", "--bool", "remote.origin.promisor").strip(), b"false")
+                self.assertTrue(self.preflight().worktree_clean)
+
+    def test_other_remote_and_bare_or_invalid_promisor_block(self):
+        self.assert_config_blocks_before_object_lookup("remote.other.name.promisor", "true", "promisor configuration")
+        self.git("config", "--remove-section", "remote.other.name")
+        config = self.repo / ".git" / "config"
+        raw = config.read_bytes()
+        for setting in (b"promisor", b"promisor = invalid"):
+            with self.subTest(setting=setting):
+                config.write_bytes(raw + b'\n[remote "another"]\n' + setting + b"\n")
+                with mock.patch.object(app, "_run_publication_preflight_git",
+                                       wraps=app._run_publication_preflight_git) as calls:
+                    with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "promisor configuration"):
+                        self.preflight()
+                self.assertEqual(len(calls.call_args_list), 1)
+
+    def test_missing_object_blocks_without_retry_transport_or_progress(self):
+        original = subprocess.run
+        observed = []
+        before = self.object_inventory()
+
+        def missing_object(argv, **kwargs):
+            command = tuple(argv[10:])
+            observed.append(command)
+            self.assertEqual(argv[9], "--no-lazy-fetch")
+            self.assertEqual(kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+            if command[0] == "check-attr":
+                return subprocess.CompletedProcess(argv, 128, b"", b"fatal: missing local candidate object")
+            return original(argv, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=missing_object):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "Git preflight observation failed"):
+                self.preflight()
+        self.assertEqual(observed, [
+            ("config", "--no-includes", "--file", "-", "--null", "--list"),
+            ("rev-parse", "--show-toplevel"), ("rev-parse", "HEAD"),
+            ("symbolic-ref", "--quiet", "--short", "HEAD"),
+            ("ls-files", "--stage", "-z"), ("check-attr", "--stdin", "-z", "filter")])
+        self.assertEqual(self.object_inventory(), before)
 
     def commit_candidate_attributes(self, content):
         from dataclasses import replace
@@ -7010,7 +7127,7 @@ class ControlledPublicationGitPreflightTests(CliFixtureTestCase):
         self.assertTrue(result.worktree_clean)
         for call in calls.call_args_list:
             self.assertEqual(call.kwargs["env"]["GIT_ATTR_SOURCE"], self.head)
-        check = [call for call in calls.call_args_list if call.args[0][9] == "check-attr"]
+        check = [call for call in calls.call_args_list if call.args[0][10] == "check-attr"]
         self.assertEqual(len(check), 1)
         self.assertEqual(check[0].kwargs["input"], b".gitattributes\0tracked.txt\0")
 

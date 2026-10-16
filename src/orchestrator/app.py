@@ -1248,7 +1248,7 @@ class ControlledPublicationApproval:
             _require_approval_digest(getattr(self, label), 64, label)
         # This repository uses SHA-1 Git object IDs; configuration identities use SHA-256.
         _require_approval_digest(self.candidate_head_sha, 40, "candidate_head_sha")
-        if (not isinstance(self.branch, str) or not self.branch.startswith("task/")
+        if (not isinstance(self.branch, str)
                 or not all(_safe_ref_component(part) for part in self.branch.split("/"))):
             raise ControlledPublicationApprovalError("invalid task branch")
         if self.target_ref != "refs/heads/" + self.branch:
@@ -1384,7 +1384,7 @@ def _publication_preflight_environment(empty_global_config: Path) -> dict[str, s
     allowed = {"PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP", "TMPDIR"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(empty_global_config),
-               GIT_ATTR_NOSYSTEM="1",
+               GIT_ATTR_NOSYSTEM="1", GIT_NO_LAZY_FETCH="1",
                GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
     return env
 
@@ -1402,7 +1402,7 @@ def _run_publication_preflight_git(
         result = subprocess.run(
             [executable, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
              "-c", "core.attributesFile=" + env["GIT_CONFIG_GLOBAL"],
-             "-c", "core.worktree=" + str(repo), *args],
+             "-c", "core.worktree=" + str(repo), "--no-lazy-fetch", *args],
             cwd=str(repo), env=env, input=config_raw, capture_output=True,
             timeout=15, shell=False,
         )
@@ -1487,6 +1487,17 @@ def run_controlled_publication_git_preflight(
             raise ControlledPublicationApprovalError("local Git filters unsupported in read-only preflight")
         if key.lower() in {"extensions.worktreeconfig", "core.worktree"}:
             raise ControlledPublicationApprovalError("Git worktree configuration unsupported")
+        if key.lower() == "extensions.partialclone" and value:
+            raise ControlledPublicationApprovalError("Git partial clone unsupported")
+        if section.lower() == "remote":
+            setting = key.rsplit(".", 1)[-1].lower()
+            if setting == "partialclonefilter" and value:
+                raise ControlledPublicationApprovalError("Git partial clone filter unsupported")
+            # Git false values include empty strings and integer zero (with
+            # optional sign/base/unit). True or invalid values fail closed.
+            if (setting == "promisor" and value.lower() not in {"", "false", "no", "off"}
+                    and not re.fullmatch(r"[ \t]*[+-]?(?:0+|0[xX]0+)[kKmMgG]?", value)):
+                raise ControlledPublicationApprovalError("Git promisor configuration unsupported")
         if section.lower() == "url" and key.rsplit(".", 1)[-1].lower() in {"insteadof", "pushinsteadof"}:
             rewrites.append((key, value))
         config.setdefault(key, []).append(value)
