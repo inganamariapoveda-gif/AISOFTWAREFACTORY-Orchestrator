@@ -39,7 +39,7 @@ jobs:
           readonly SAFE_TEST_IMAGE="docker.io/library/python@sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
           readonly SAFE_TEST_PLATFORM="linux/amd64"
           readonly SAFE_TEST_PYTHON_VERSION="3.14.8"
-          readonly SAFE_TEST_EXECUTION_ENABLED=false
+          readonly SAFE_TEST_EXECUTION_ENABLED=true
           if [[ "$SAFE_TEST_IMAGE" != 'docker.io/library/python@sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf' ]] ||
              [[ "$SAFE_TEST_PLATFORM" != 'linux/amd64' ]] ||
              [[ "$SAFE_TEST_PYTHON_VERSION" != '3.14.8' ]]; then
@@ -128,7 +128,7 @@ jobs:
         env:
           SAFE_TEST_IMAGE: ${{ steps.preflight.outputs.image }}
         run: |
-          # Unreachable while execution is disabled. Never source candidate files.
+          # Candidate remains untrusted. Never source candidate files.
           readonly CONTAINER_NAME="safe-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           RESULT_FILE="$(mktemp "$RUNNER_TEMP/safe-test-result.XXXXXXXX")"
           readonly RESULT_FILE

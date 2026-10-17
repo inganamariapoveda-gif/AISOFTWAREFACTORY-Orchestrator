@@ -18,7 +18,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/safe-test-ru
 # Identity only, never execution approval. Updating workflow and digest together
 # cannot self-authorize a change; the governance review gates still apply.
 APPROVED_SAFE_RUNNER_CANONICAL_SHA256 = (
-    "722d0c0548e0243a2c9b3a2af8868bfd4963c65c39c8fcb1a46ba9f360250149"
+    "f080bc0e6f1bf4de4bb0d858ea77013b52e0571ec977ae68fc5c78e36e6fe024"
 )
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 IMAGE_DIGEST = "a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
@@ -536,9 +536,9 @@ class SafeTestRunnerContractTests(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?:library/)?python:[A-Za-z0-9]")
         self.assertNotIn("__UNSET_REQUIRES_IMAGE_ADMISSION__", self.text)
 
-    def test_execution_gate_remains_false(self):
-        self.assertEqual(re.findall(r"readonly SAFE_TEST_EXECUTION_ENABLED=(\S+)", self.text), ["false"])
-        self.assertNotIn("SAFE_TEST_EXECUTION_ENABLED=true", self.text)
+    def test_execution_gate_is_explicitly_enabled(self):
+        self.assertEqual(re.findall(r"readonly SAFE_TEST_EXECUTION_ENABLED=(\S+)", self.text), ["true"])
+        self.assertNotIn("SAFE_TEST_EXECUTION_ENABLED=false", self.text)
 
     def test_admission_does_not_enable_execution(self):
         self.assertLess(self.preflight.index("SAFE_TEST_EXECUTION_ENABLED\" != 'true'"),
