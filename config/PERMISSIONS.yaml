@@ -7,18 +7,39 @@ version: 1
 
 deny:
   production: true
-  git_push: true
+  uncontrolled_git_push: true
   git_merge: true
   irreversible_actions: true
   env_files: true
   secret_files: true
 
+# Capability alone never authorizes publication. Exact URL comparison required.
+git_publish:
+  enabled: true
+  remote_name: "origin"
+  allowed_remote_urls:
+    - "https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator.git"
+  branch_prefix: "task/"
+  forbidden_branches:
+    - "main"
+    - "master"
+  allow_force: false
+  allow_tags: false
+  allow_delete: false
+  require_explicit_task_packet: true
+  require_director_approval: true
+  require_clean_worktree: true
+  refspec_mode: "current_branch_only"
+
+execution_controls:
+  local_project_commands: false
+
 # TASK-EXECUTION-002 (D-EXEC-001): lista CERRADA de IDs lógicos autorizados
 # GLOBALMENTE (nunca argv, nunca un string de shell). Para que un
-# mandatory_test pueda ejecutarse hace falta la INTERSECCIÓN obligatoria de
+# mandatory_test pueda resolverse como datos hace falta la INTERSECCIÓN de
 # TaskPacket.mandatory_tests ∩ PERMISSIONS.allowed_commands ∩
 # PROJECT_RULES.commands.keys(); PROJECT_RULES.commands[id] produce
-# entonces el argv preautorizado. Cualquier ID ausente de esta lista queda
+# entonces argv como datos, nunca autorización de ejecución local. Cualquier ID ausente queda
 # prohibido por defecto (fail closed), sin importar lo que declare
 # PROJECT_RULES de un proyecto.
 allowed_commands:
@@ -30,5 +51,6 @@ allowed_commands:
 role_capabilities:
   builder:
     - implement_authorized_changes
+    - publish_authorized_task_branch
   director: []
   verifier: []

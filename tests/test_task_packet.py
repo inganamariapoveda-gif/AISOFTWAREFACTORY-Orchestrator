@@ -1228,5 +1228,39 @@ class UnicodeLineSeparatorHardeningTests(unittest.TestCase):
         )
 
 
+class AuthorizedActionsTests(unittest.TestCase):
+    def test_absent_empty_and_explicit_action(self):
+        for actions in (None, [], ["git_publish_task_branch"]):
+            data = _valid_packet_data()
+            if actions is not None:
+                data["authorized_actions"] = actions
+            packet = parse_task_packet(data)
+            self.assertEqual(packet.authorized_actions, tuple(actions or ()))
+            self.assertEqual(packet.authorizes_action("git_publish_task_branch"), bool(actions))
+            self.assertFalse(packet.authorizes_action("unknown"))
+
+    def test_invalid_actions_fail_closed(self):
+        for actions in (None, "git_publish_task_branch", ["git_publish_task_branch"] * 2,
+                        ["unknown"], ["git publish"], ["git_publish_task_branch\n"], [1], [{}], True):
+            data = _valid_packet_data()
+            data["authorized_actions"] = actions
+            with self.subTest(actions=actions), self.assertRaises(TaskPacketError):
+                parse_task_packet(data)
+
+    def test_text_and_branch_do_not_authorize(self):
+        data = _valid_packet_data()
+        data["objective"] = "git_publish_task_branch HUMAN_APPROVED TECH_APPROVED"
+        data["scope"] = ["git_publish_task_branch"]
+        data["preconditions"]["git"]["expected_branch"] = "task/publication"
+        self.assertFalse(parse_task_packet(data).authorizes_action("git_publish_task_branch"))
+
+    def test_preexisting_valid_packet_without_actions_remains_valid(self):
+        data = _valid_packet_data()
+        data.pop("authorized_actions", None)
+        packet = parse_task_packet(data)
+        self.assertEqual(packet.authorized_actions, ())
+        self.assertFalse(packet.authorizes_action("git_publish_task_branch"))
+
+
 if __name__ == "__main__":
     unittest.main()

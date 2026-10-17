@@ -16,8 +16,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
+
+from .store import ID_PATTERN
 
 SECRET_KEY_PATTERN = re.compile(
     r"(api[_-]?key|secret|token|password|passwd|credential)", re.IGNORECASE
@@ -56,7 +59,7 @@ CAPACITY_WAIT_MAX_WAIT_MAX_SECONDS = 604800
 
 REQUIRED_PERMISSION_DENY_KEYS = (
     "deny.production",
-    "deny.git_push",
+    "deny.uncontrolled_git_push",
     "deny.git_merge",
     "deny.irreversible_actions",
     "deny.env_files",
@@ -139,7 +142,19 @@ def _require_true(data: dict[str, Any], dotted_path: str, path: Path) -> None:
 def _validate_policies(data: dict[str, Any], path: Path) -> None:
     validate_resource_budget(data)
     _require_true(data, "prohibitions.production", path)
-    _require_true(data, "prohibitions.git_push", path)
+    _require_true(data, "prohibitions.uncontrolled_git_push", path)
+    if "git_push" in data["prohibitions"]:
+        raise ConfigError("obsolete push prohibition schema")
+    actions = _closed_mapping(data.get("controlled_actions"), {"git_publish_task_branch"}, "controlled_actions")
+    action = _closed_mapping(actions["git_publish_task_branch"],
+                             {"enabled", "classification", "approval", "on_violation"},
+                             "controlled_actions.git_publish_task_branch")
+    if type(action["enabled"]) is not bool:
+        raise ConfigError("controlled action enabled must be boolean")
+    if (action["classification"], action["approval"], action["on_violation"]) != (
+        "AMARILLO", "DIRECTOR_INTERNAL_GATE", "BLOCKED"
+    ):
+        raise ConfigError("invalid controlled publication policy")
     _require_true(data, "prohibitions.git_merge", path)
     _require_true(data, "prohibitions.irreversible_actions", path)
     _require_true(data, "fail_closed", path)
@@ -284,6 +299,27 @@ def require_builder_capability(permissions: dict[str, Any]) -> None:
     _validate_permissions(permissions, Path("PERMISSIONS.yaml"))
     if "implement_authorized_changes" not in permissions.get("role_capabilities", {}).get("builder", []):
         raise ConfigError("Builder capability is not authorized")
+
+
+def require_builder_publish_capability(permissions: dict[str, Any]) -> None:
+    """Capability prerequisite only; never an authorization or Git operation."""
+    _validate_permissions(permissions, Path("PERMISSIONS.yaml"))
+    if "publish_authorized_task_branch" not in permissions.get("role_capabilities", {}).get("builder", []):
+        raise ConfigError("Builder publication capability is not authorized")
+
+
+def require_controlled_publication_authority(config: OrchestratorConfig) -> None:
+    """Pure declarative prerequisite; never approval or execution authority."""
+    if not isinstance(config, OrchestratorConfig):
+        raise ConfigError("publication authority requires core config")
+    if any(not isinstance(block, dict) for block in (config.permissions, config.policies, config.gates)):
+        raise ConfigError("publication authority blocks must be mappings")
+    _validate_policies(config.policies, Path("POLICIES.yaml"))
+    _validate_gates(config.gates, Path("GATES.yaml"))
+    require_builder_publish_capability(config.permissions)
+    _require_true(config.permissions, "git_publish.enabled", Path("PERMISSIONS.yaml"))
+    _require_true(config.policies, "controlled_actions.git_publish_task_branch.enabled",
+                  Path("POLICIES.yaml"))
 
 
 def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
@@ -440,6 +476,7 @@ def _validate_capacity_wait_config(developer: dict[str, Any], path: Path) -> Non
 def _validate_gates(data: dict[str, Any], path: Path) -> None:
     _require_true(data, "automatic_approval.verde", path)
     _require_true(data, "director_internal_gate.amarillo_contemplado", path)
+    _require_true(data, "director_internal_gate.git_publish_task_branch", path)
 
     human_gates = _require(data, "human_gates", path)
     if not isinstance(human_gates, list) or not human_gates:
@@ -461,10 +498,17 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
     for role, grants in capabilities.items():
         if role not in {"director", "builder", "verifier"} or not isinstance(grants, list):
             raise ConfigError("invalid role capability policy")
-        if any(grant != "implement_authorized_changes" or role != "builder" for grant in grants):
+        if any(grant not in ("implement_authorized_changes", "publish_authorized_task_branch") or role != "builder" for grant in grants):
             raise ConfigError("unsupported role capability")
     for key in REQUIRED_PERMISSION_DENY_KEYS:
         _require_true(data, key, path)
+    if "git_push" in data["deny"]:
+        raise ConfigError("obsolete push denial schema")
+    controls = _closed_mapping(data.get("execution_controls"),
+                               {"local_project_commands"}, "execution_controls")
+    if controls["local_project_commands"] is not False:
+        raise ConfigError("execution_controls.local_project_commands must be false")
+    _validate_git_publish(data.get("git_publish"))
     allowed_commands = _require(data, "allowed_commands", path)
     if not isinstance(allowed_commands, list):
         raise ConfigError(f"'allowed_commands' must be a list in {path}")
@@ -480,6 +524,77 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
                 f"'allowed_commands[{idx}]' must be a simple logical identifier, "
                 f"not a shell command: {item!r} ({path})"
             )
+
+
+def _closed_mapping(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ConfigError(f"invalid {label} keys")
+    return value
+
+
+def _nonempty_unique_strings(value: Any, label: str) -> list[str]:
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(item, str) or not item.strip() for item in value)):
+        raise ConfigError(f"invalid {label} list")
+    if len(set(value)) != len(value):
+        raise ConfigError(f"duplicate {label} entries")
+    return value
+
+
+def _safe_ref_component(value: str) -> bool:
+    return (bool(value) and not value.startswith(("-", "."))
+            and not value.endswith((".", ".lock"))
+            and ".." not in value and "@{" not in value
+            and not any(c.isspace() or ord(c) < 32 or ord(c) == 127
+                        or c in "~^:?*[\\" for c in value))
+
+
+def _validate_git_publish(value: Any) -> None:
+    """Validate declarative bounds only. Concrete remote/ref values stay in YAML."""
+    block = _closed_mapping(value, {
+        "enabled", "remote_name", "allowed_remote_urls", "branch_prefix",
+        "forbidden_branches", "allow_force", "allow_tags", "allow_delete",
+        "require_explicit_task_packet", "require_director_approval",
+        "require_clean_worktree", "refspec_mode",
+    }, "git_publish")
+    if type(block["enabled"]) is not bool:
+        raise ConfigError("git_publish.enabled must be boolean")
+    remote = block["remote_name"]
+    if not isinstance(remote, str) or not _LOGICAL_ID_RE.fullmatch(remote):
+        raise ConfigError("invalid git_publish.remote_name")
+    urls = _nonempty_unique_strings(block["allowed_remote_urls"], "allowed_remote_urls")
+    for url in urls:
+        # Validate before urlsplit, which can discard some control characters.
+        if any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "\\*?#[]" for c in url):
+            raise ConfigError("unsafe publication URL")
+        try:
+            parsed = urlsplit(url)
+            valid = (parsed.scheme == "https" and bool(parsed.hostname)
+                     and parsed.username is None and parsed.password is None
+                     and parsed.port is None and not parsed.query and not parsed.fragment
+                     and bool(re.fullmatch(r"[A-Za-z0-9.-]+", parsed.netloc))
+                     and bool(re.fullmatch(r"/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+[.]git", parsed.path))
+                     and ".." not in parsed.path)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigError("invalid publication URL")
+    prefix = block["branch_prefix"]
+    if (not isinstance(prefix, str) or not prefix.endswith("/")
+            or not all(_safe_ref_component(part) for part in prefix[:-1].split("/"))):
+        raise ConfigError("unsafe git_publish.branch_prefix")
+    forbidden = _nonempty_unique_strings(block["forbidden_branches"], "forbidden_branches")
+    if (not {"main", "master"}.issubset(forbidden)
+            or any(not all(_safe_ref_component(part) for part in ref.split("/")) for ref in forbidden)):
+        raise ConfigError("invalid forbidden_branches")
+    for key in ("allow_force", "allow_tags", "allow_delete"):
+        if block[key] is not False:
+            raise ConfigError(f"git_publish.{key} must be false")
+    for key in ("require_explicit_task_packet", "require_director_approval", "require_clean_worktree"):
+        if block[key] is not True:
+            raise ConfigError(f"git_publish.{key} must be true")
+    if block["refspec_mode"] != "current_branch_only":
+        raise ConfigError("invalid git_publish.refspec_mode")
 
 
 def _validate_commands(commands: dict[str, Any], path: Path) -> None:
@@ -513,19 +628,46 @@ def _validate_commands(commands: dict[str, Any], path: Path) -> None:
 
 
 def _validate_project_rules(data: dict[str, Any], path: Path) -> None:
-    for key in ("project_id", "repo_path", "commands", "protected_paths"):
-        _require(data, key, path)
-    if not isinstance(data["project_id"], str) or not data["project_id"]:
-        raise ConfigError(f"'project_id' must be a non-empty string in {path}")
+    required = {"version", "project_id", "name", "repo_path", "commands",
+                "protected_paths", "autonomy_overrides"}
+    if set(data) != required:
+        raise ConfigError(f"PROJECT_RULES must contain exactly {sorted(required)} in {path}")
+    if type(data["version"]) is not int or data["version"] != 1:
+        raise ConfigError(f"PROJECT_RULES version must be integer 1 in {path}")
+    for key in ("project_id", "name", "repo_path"):
+        if not isinstance(data[key], str) or not data[key] or "\x00" in data[key]:
+            raise ConfigError(f"'{key}' must be a non-empty string without NUL in {path}")
+    if not ID_PATTERN.fullmatch(data["project_id"]):
+        raise ConfigError(f"invalid PROJECT_RULES project_id in {path}")
     if not isinstance(data["commands"], dict):
         raise ConfigError(f"'commands' must be a mapping in {path}")
     _validate_commands(data["commands"], path)
     if not isinstance(data["protected_paths"], list):
         raise ConfigError(f"'protected_paths' must be a list in {path}")
+    paths = data["protected_paths"]
+    if any(not isinstance(item, str) or not item or "\x00" in item for item in paths):
+        raise ConfigError(f"invalid protected_paths entry in {path}")
+    if len(set(paths)) != len(paths):
+        raise ConfigError(f"duplicate protected_paths entry in {path}")
+    if not isinstance(data["autonomy_overrides"], dict) or data["autonomy_overrides"]:
+        raise ConfigError(f"autonomy_overrides must be an empty mapping in {path}")
 
 
 def load_core_config(config_dir: Path | str) -> OrchestratorConfig:
-    """Carga y valida POLICIES/AGENTS/GATES/PERMISSIONS. Falla cerrado."""
+    """Read PERMISSIONS once; preserve the other core loaders."""
+    config_dir = Path(config_dir)
+    path = config_dir / "PERMISSIONS.yaml"
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError("cannot read PERMISSIONS.yaml") from exc
+    return load_core_config_from_permissions_bytes(config_dir, raw)
+
+
+def load_core_config_from_permissions_bytes(
+    config_dir: Path | str, permissions_raw_bytes: bytes,
+) -> OrchestratorConfig:
+    """Build core config without reopening the admitted PERMISSIONS snapshot."""
     config_dir = Path(config_dir)
 
     policies_path = config_dir / "POLICIES.yaml"
@@ -536,12 +678,11 @@ def load_core_config(config_dir: Path | str) -> OrchestratorConfig:
     policies = _load_yaml_mapping(policies_path)
     agents = _load_yaml_mapping(agents_path)
     gates = _load_yaml_mapping(gates_path)
-    permissions = _load_yaml_mapping(permissions_path)
+    permissions = load_permissions_from_yaml_bytes(permissions_raw_bytes, permissions_path)
 
     _validate_policies(policies, policies_path)
     _validate_agents(agents, agents_path)
     _validate_gates(gates, gates_path)
-    _validate_permissions(permissions, permissions_path)
 
     return OrchestratorConfig(
         policies=policies, agents=agents, gates=gates, permissions=permissions
@@ -608,12 +749,109 @@ def load_notifications_config(config_dir: Path | str) -> NotificationsConfig:
     )
 
 
-def load_project_rules(rules_path: Path | str) -> dict[str, Any]:
-    """Carga y valida PROJECT_RULES.yaml de un proyecto. Falla cerrado."""
-    rules_path = Path(rules_path)
-    data = _load_yaml_mapping(rules_path)
-    _validate_project_rules(data, rules_path)
+class _UniqueAuthorityLoader(yaml.SafeLoader):
+    """Local safe YAML loader; ambiguous mapping authority fails closed."""
+
+    authority_name = "authority"
+
+    def construct_mapping(self, node, deep=False):
+        self.flatten_mapping(node)
+        keys = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                if key in keys:
+                    raise ConfigError(f"duplicate {self.authority_name} YAML key")
+                keys.add(key)
+            except TypeError as exc:
+                raise ConfigError(f"invalid {self.authority_name} YAML mapping key") from exc
+        return super().construct_mapping(node, deep=deep)
+
+
+class _ProjectRulesLoader(_UniqueAuthorityLoader):
+    authority_name = "PROJECT_RULES"
+
+
+class _PoliciesLoader(_UniqueAuthorityLoader):
+    authority_name = "POLICIES"
+
+
+class _GatesLoader(_UniqueAuthorityLoader):
+    authority_name = "GATES"
+
+
+def _load_authority_mapping_bytes(raw_bytes, source_path, loader, validator):
+    """Shared exact-byte parser; source_path is diagnostic only."""
+    path = Path(source_path)
+    if not isinstance(raw_bytes, bytes):
+        raise ConfigError(f"{loader.authority_name} snapshot must be bytes")
+    try:
+        data = yaml.load(raw_bytes.decode("utf-8", errors="strict"), Loader=loader)
+        if not isinstance(data, dict):
+            raise ConfigError(f"{loader.authority_name} must contain a YAML mapping")
+        _reject_secrets(data, path)
+        validator(data, path)
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+        raise ConfigError(f"invalid {loader.authority_name} encoding or YAML") from exc
     return data
+
+
+def load_policies_from_yaml_bytes(raw_bytes: bytes, source_path: Path | str) -> dict[str, Any]:
+    return _load_authority_mapping_bytes(raw_bytes, source_path, _PoliciesLoader, _validate_policies)
+
+
+def load_gates_from_yaml_bytes(raw_bytes: bytes, source_path: Path | str) -> dict[str, Any]:
+    return _load_authority_mapping_bytes(raw_bytes, source_path, _GatesLoader, _validate_gates)
+
+
+def load_core_config_from_authority_bytes(
+    config_dir: Path | str, permissions_raw_bytes: bytes,
+    policies_raw_bytes: bytes, gates_raw_bytes: bytes,
+) -> OrchestratorConfig:
+    """Publication foundation: no authority file is reopened; AGENTS is roster only."""
+    root = Path(config_dir)
+    permissions = load_permissions_from_yaml_bytes(permissions_raw_bytes, root / "PERMISSIONS.yaml")
+    policies = load_policies_from_yaml_bytes(policies_raw_bytes, root / "POLICIES.yaml")
+    gates = load_gates_from_yaml_bytes(gates_raw_bytes, root / "GATES.yaml")
+    agents = _load_yaml_mapping(root / "AGENTS.yaml")
+    _validate_agents(agents, root / "AGENTS.yaml")
+    return OrchestratorConfig(policies=policies, agents=agents, gates=gates, permissions=permissions)
+
+
+class _PermissionsLoader(_UniqueAuthorityLoader):
+    authority_name = "PERMISSIONS"
+
+
+def load_permissions_from_yaml_bytes(raw_bytes: bytes, source_path: Path | str) -> dict[str, Any]:
+    """Validate existing policy from exact bytes; never grant execution."""
+    return _load_authority_mapping_bytes(raw_bytes, source_path, _PermissionsLoader, _validate_permissions)
+
+
+def load_project_rules_from_yaml_bytes(raw_bytes: bytes, source_path: Path | str) -> dict[str, Any]:
+    """Parse only the supplied snapshot. Admission never authorizes execution."""
+    path = Path(source_path)
+    if not isinstance(raw_bytes, bytes):
+        raise ConfigError("PROJECT_RULES snapshot must be bytes")
+    try:
+        text = raw_bytes.decode("utf-8", errors="strict")
+        data = yaml.load(text, Loader=_ProjectRulesLoader)
+        if not isinstance(data, dict):
+            raise ConfigError(f"PROJECT_RULES must contain a YAML mapping in {path}")
+        _reject_secrets(data, path)
+        _validate_project_rules(data, path)
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+        raise ConfigError(f"invalid PROJECT_RULES encoding or YAML in {path}") from exc
+    return data
+
+
+def load_project_rules(rules_path: Path | str) -> dict[str, Any]:
+    """Read once and delegate to the exact-byte parser."""
+    path = Path(rules_path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read PROJECT_RULES in {path}") from exc
+    return load_project_rules_from_yaml_bytes(raw, path)
 
 
 def resolve_project_root(

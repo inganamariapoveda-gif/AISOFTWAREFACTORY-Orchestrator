@@ -340,6 +340,11 @@ class TaskPacket:
     required_evidence: tuple[str, ...]
     preconditions: Preconditions
     resource_profile: str
+    authorized_actions: tuple[str, ...] = ()
+
+    def authorizes_action(self, action: str) -> bool:
+        """Explicit logical intent only; never approval or permission to execute."""
+        return action == "git_publish_task_branch" and action in self.authorized_actions
 
 
 def _validate_identifier(value: Any, field_name: str) -> str:
@@ -553,7 +558,7 @@ def parse_task_packet(data: Any, *, policies: dict[str, Any] | None = None) -> T
     if not data:
         raise TaskPacketError("task packet must not be empty")
 
-    unknown = sorted(set(data.keys()) - set(_REQUIRED_FIELDS) - {"resource_profile"})
+    unknown = sorted(set(data.keys()) - set(_REQUIRED_FIELDS) - {"resource_profile", "authorized_actions"})
     if unknown:
         raise TaskPacketError(f"task packet contains unknown field(s): {unknown}")
 
@@ -588,6 +593,13 @@ def parse_task_packet(data: Any, *, policies: dict[str, Any] | None = None) -> T
 
     mandatory_tests = _validate_test_id_list(data["mandatory_tests"], "mandatory_tests")
     preconditions = _validate_preconditions(data["preconditions"])
+    actions = data.get("authorized_actions", [])
+    if not isinstance(actions, list):
+        raise TaskPacketError("authorized_actions must be a list")
+    if any(not isinstance(action, str) or action != "git_publish_task_branch" for action in actions):
+        raise TaskPacketError("unsupported authorized action")
+    if len(actions) != len(set(actions)):
+        raise TaskPacketError("duplicate authorized action")
     from .config_loader import load_core_config, validate_resource_budget
 
     # Standalone callers use repository governance; operational callers pass
@@ -615,6 +627,7 @@ def parse_task_packet(data: Any, *, policies: dict[str, Any] | None = None) -> T
         required_evidence=required_evidence,
         preconditions=preconditions,
         resource_profile=resource_profile,
+        authorized_actions=tuple(actions),
     )
 
 

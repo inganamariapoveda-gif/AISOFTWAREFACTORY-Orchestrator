@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from orchestrator import app  # noqa: E402
+from orchestrator import config_loader as config_loader_mod  # noqa: E402
 from orchestrator import evidence as evidence_mod  # noqa: E402
 from orchestrator.adapters.claude_code import (  # noqa: E402
     DEVELOPER_ROLE_BOUNDARY_HEADING,
@@ -61,10 +63,14 @@ def _valid_core_config() -> dict[str, dict]:
             "version": 1,
             "prohibitions": {
                 "production": True,
-                "git_push": True,
+                "uncontrolled_git_push": True,
                 "git_merge": True,
                 "irreversible_actions": True,
             },
+            "controlled_actions": {"git_publish_task_branch": {
+                "enabled": True, "classification": "AMARILLO",
+                "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED",
+            }},
             "attempts": {"max_correction_attempts": 3},
             "classification": {
                 "levels": ["VERDE", "AMARILLO", "ROJO"],
@@ -83,7 +89,7 @@ def _valid_core_config() -> dict[str, dict]:
         "GATES.yaml": {
             "version": 1,
             "automatic_approval": {"verde": True},
-            "director_internal_gate": {"amarillo_contemplado": True},
+            "director_internal_gate": {"amarillo_contemplado": True, "git_publish_task_branch": True},
             "human_gates": [
                 {"name": "HUMAN_UI_REVIEW"},
                 {"name": "HUMAN_FUNCTIONAL_TEST"},
@@ -96,14 +102,23 @@ def _valid_core_config() -> dict[str, dict]:
             "version": 1,
             "deny": {
                 "production": True,
-                "git_push": True,
+                "uncontrolled_git_push": True,
                 "git_merge": True,
                 "irreversible_actions": True,
                 "env_files": True,
                 "secret_files": True,
             },
+            "git_publish": {
+                "enabled": True, "remote_name": "origin",
+                "allowed_remote_urls": ["https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator.git"],
+                "branch_prefix": "task/", "forbidden_branches": ["main", "master"],
+                "allow_force": False, "allow_tags": False, "allow_delete": False,
+                "require_explicit_task_packet": True, "require_director_approval": True,
+                "require_clean_worktree": True, "refspec_mode": "current_branch_only",
+            },
+            "execution_controls": {"local_project_commands": False},
             "allowed_commands": [],
-            "role_capabilities": {"builder": ["implement_authorized_changes"]},
+            "role_capabilities": {"builder": ["implement_authorized_changes", "publish_authorized_task_branch"]},
         },
     }
 
@@ -164,6 +179,7 @@ class CliFixtureTestCase(unittest.TestCase):
                 "repo_path": "./projects/SAMPLE",
                 "commands": {},
                 "protected_paths": ["**/.env*"],
+                "autonomy_overrides": {},
             },
         )
 
@@ -801,16 +817,89 @@ class TaskPacketProbeTests(CliFixtureTestCase):
 # "orchestrator.adapters.claude_code.subprocess.run" parchea el MISMO
 # objeto módulo que usa orchestrator.evidence internamente (git real). Por
 # eso aquí se parchea "subprocess.run"/"shutil.which" UNA sola vez con un
-# despachador que distingue por el ejecutable invocado: las llamadas a
-# Claude ("/resolved/claude") y al mandatory test ("python") se simulan;
-# CUALQUIER otra invocación (git, usado por Git Evidence) se delega a la
-# implementación REAL guardada antes de parchear. Así el repositorio Git
-# temporal sigue siendo la fuente de verdad ejecutable, y Claude nunca se
-# invoca de verdad.
+# despachador que intercepta al Builder simulado. La ejecución de comandos
+# del proyecto sigue bloqueada; sus resultados históricos son sintéticos.
+# Solo Git del motor/fixtures (basename exacto git/git.exe) se delega a la
+# implementación REAL guardada antes de parchear. Cualquier otro ejecutable
+# host inesperado falla cerrado. El repositorio Git temporal sigue siendo
+# la fuente de evidencia; el Builder nunca se invoca de verdad.
 # ============================================================
 
 _REAL_SUBPROCESS_RUN = subprocess.run
 _REAL_SHUTIL_WHICH = shutil.which
+
+
+def _is_engine_git(executable: str) -> bool:
+    """Recognize only the exact Git basename in this test harness."""
+    if not isinstance(executable, str):
+        return False
+    return executable.replace("\\", "/").rsplit("/", 1)[-1].casefold() in ("git", "git.exe")
+
+
+def _is_engine_schtasks_query(args, kwargs) -> bool:
+    """Executable identity alone does not authorize an operation: exact read-only query."""
+    if not isinstance(args, (list, tuple)) or len(args) != 5:
+        return False
+    if not all(isinstance(arg, str) for arg in args):
+        return False
+    if kwargs.get("shell", False) is not False:
+        return False
+    executable = args[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    return (
+        executable in ("schtasks", "schtasks.exe")
+        and args[1].casefold() == "/query"
+        and args[2].casefold() == "/tn"
+        and bool(args[3])
+        and args[4].casefold() == "/hresult"
+    )
+
+
+class EngineSchtasksQueryTests(unittest.TestCase):
+    def test_exact_read_only_queries_accepted(self):
+        for executable in ("schtasks", "schtasks.exe", r"C:\Windows\System32\schtasks.exe"):
+            for sequence in (list, tuple):
+                with self.subTest(executable=executable, sequence=sequence):
+                    args = sequence([executable, "/QUERY", "/TN", "SomeTask", "/HRESULT"])
+                    self.assertTrue(_is_engine_schtasks_query(args, {"shell": False}))
+                    self.assertTrue(_is_engine_schtasks_query(args, {}))
+
+    def test_mutating_operations_and_other_executables_rejected(self):
+        for verb in ("/Create", "/Delete", "/Change", "/Run", "/End"):
+            with self.subTest(verb=verb):
+                self.assertFalse(_is_engine_schtasks_query(
+                    ["schtasks", verb, "/TN", "SomeTask", "/HRESULT"], {}))
+        for executable in ("powershell", "cmd", "python", "git", "evil-schtasks.exe"):
+            with self.subTest(executable=executable):
+                self.assertFalse(_is_engine_schtasks_query(
+                    [executable, "/Query", "/TN", "SomeTask", "/HRESULT"], {}))
+
+    def test_malformed_queries_and_shell_rejected(self):
+        valid = ["schtasks", "/Query", "/TN", "SomeTask", "/HRESULT"]
+        for args in (None, "schtasks /Query", [], valid[:-1], valid + ["EXTRA"],
+                     ["schtasks", "/Query", "/TN", "", "/HRESULT"],
+                     ["schtasks", "/Query", "/TN", None, "/HRESULT"],
+                     ["schtasks", "/Query", "/OTHER", "SomeTask", "/HRESULT"],
+                     ["schtasks", "/Query", "/TN", "SomeTask", "/OTHER"]):
+            with self.subTest(args=args):
+                self.assertFalse(_is_engine_schtasks_query(args, {"shell": False}))
+        for shell in (True, 1, "true", None):
+            with self.subTest(shell=shell):
+                self.assertFalse(_is_engine_schtasks_query(valid, {"shell": shell}))
+
+
+class EngineGitDiscriminationTests(unittest.TestCase):
+    def test_exact_git_basenames_accepted(self):
+        for executable in ("git", "git.exe", "/usr/bin/git", r"C:\Program Files\Git\cmd\git.EXE"):
+            with self.subTest(executable=executable):
+                self.assertTrue(_is_engine_git(executable))
+
+    def test_other_executables_rejected(self):
+        for executable in (
+            "python", "python.exe", "pnpm.cmd", "powershell", "cmd",
+            "git-wrapper", "evilgit.exe", "notgit", "",
+        ):
+            with self.subTest(executable=executable):
+                self.assertFalse(_is_engine_git(executable))
 
 
 def _init_taskexec_repo(repo_root: Path) -> None:
@@ -840,6 +929,7 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
                 "repo_path": "./taskexec_repo",
                 "commands": {"unit": ["python", "-c", "pass"]},
                 "protected_paths": [],
+                "autonomy_overrides": {},
             },
         )
 
@@ -916,6 +1006,7 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
                 "repo_path": "./taskexec_repo",
                 "commands": {tid: ["python", "-c", "pass", tid] for tid in test_ids},
                 "protected_paths": [],
+                "autonomy_overrides": {},
             },
         )
         self._set_allowed_commands(list(test_ids))
@@ -975,11 +1066,34 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
 
     @contextlib.contextmanager
     def patched_subprocess(self, *, developer=None, test=None):
-        """Despachador único: delega a git REAL cualquier invocación que no
-        sea Claude ("/resolved/claude") ni el mandatory test ("python").
-        `developer`/`test`, si se dan, deben ser mock.MagicMock(side_effect=...)
-        para poder aserir después cuántas veces se invocaron; si son None,
-        una invocación inesperada de ese tipo hace fallar la prueba."""
+        """Historical reporting/review fixture with synthetic isolated results.
+
+        Builder, engine Git and exact read-only schtasks queries use the dispatcher.
+        The schtasks delegate preserves any outer spy. The backend
+        admission check and result boundary are mocked in tests alone; production
+        has neither a permissive flag nor a local command executor.
+        """
+        delegate_run = subprocess.run
+
+        def synthetic_result(test_id, *, project_commands, globally_allowed_ids, cwd, timeout):
+            resolved = app.test_runner_mod.resolve_mandatory_test(
+                test_id, project_commands=project_commands,
+                globally_allowed_ids=globally_allowed_ids,
+            )
+            if test is None:
+                raise AssertionError("unexpected synthetic test result request")
+            try:
+                completed = test(
+                    list(resolved.argv), shell=False, cwd=str(Path(cwd).resolve()),
+                    capture_output=True, text=True, timeout=timeout,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                raise app.test_runner_mod.TestRunnerError("synthetic backend error") from exc
+            return app.test_runner_mod.TestResult(
+                test_id=resolved.test_id, argv=resolved.argv,
+                success=completed.returncode == 0, exit_code=completed.returncode,
+                stdout=completed.stdout, stderr=completed.stderr,
+            )
 
         def fake_which(name, *a, **kw):
             if name == "claude":
@@ -992,14 +1106,18 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
                 if developer is None:
                     raise AssertionError("unexpected Claude invocation in this test")
                 return developer(args, **kwargs)
-            if exe == "python":
-                if test is None:
-                    raise AssertionError("unexpected mandatory test invocation in this test")
-                return test(args, **kwargs)
+            if _is_engine_schtasks_query(args, kwargs):
+                return delegate_run(args, **kwargs)
+            if not _is_engine_git(exe):
+                raise AssertionError("unexpected host command in this test")
             return _REAL_SUBPROCESS_RUN(args, **kwargs)
 
         with mock.patch("shutil.which", side_effect=fake_which), mock.patch(
             "subprocess.run", side_effect=fake_run
+        ), mock.patch.object(
+            app.test_runner_mod, "require_isolated_mandatory_test_backend", return_value=None
+        ), mock.patch.object(
+            app.test_runner_mod, "run_mandatory_test", side_effect=synthetic_result
         ):
             yield
 
@@ -1339,9 +1457,10 @@ class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
         self._write_taskexec_packet(mandatory_tests=["nonexistent"])
         head_before = _git("rev-parse", "HEAD", cwd=self.taskexec_repo).stdout.strip()
 
+        developer = mock.MagicMock(side_effect=self._developer_writes_allowed_only)
         test_mock = mock.MagicMock(side_effect=self._test_passes)
         with self.patched_subprocess(
-            developer=mock.MagicMock(side_effect=self._developer_writes_allowed_only),
+            developer=developer,
             test=test_mock,
         ):
             rc, stdout = self.run_task_execution_probe()
@@ -1351,12 +1470,11 @@ class TaskExecutionProbeFailureTests(TaskExecutionProbeTestCase):
         self.assertNotEqual(output["state"], "HUMAN_GATE")
         self.assertFalse(output["commit_performed"])
         test_mock.assert_not_called()
-        # REPORTING-001: el error estructural del runner (ID no autorizado)
-        # queda registrado como ERROR/exit_code null, sin convertirse en FAIL.
-        self.assertEqual(
-            output["mandatory_test_results"],
-            [{"test_id": "nonexistent", "result": "ERROR", "exit_code": None}],
-        )
+        developer.assert_not_called()
+        self.assertEqual(output["state"], "BLOCKED")
+        self.assertEqual(output["reason"], "local model execution preflight failed")
+        self.assertEqual(output["mandatory_test_results"], [])
+        self.assertEqual((self.taskexec_repo / "allowed.txt").read_text(encoding="utf-8"), "BEFORE")
         self._assert_head_unchanged_on_disk(head_before)
 
     def test_test_runner_error_after_passing_test_is_accumulated_as_error(self) -> None:
@@ -2833,41 +2951,57 @@ class PersistedStartTests(PersistedExecutionTestCase):
         self.assertNotIn("..", path.split("/"))
         self.assertNotIn("\\", path)
 
-    def test_project_rules_changing_while_loading_is_rejected(self) -> None:
-        real = app._require_project_rules
+    def test_project_rules_disk_mutation_cannot_replace_admitted_authority(self) -> None:
+        raw = self.rules_path.read_bytes()
+        real_parser = app.load_project_rules_from_yaml_bytes
+        alternate = yaml.safe_load(raw)
+        alternate["commands"] = {"unapproved": ["forbidden"]}
+        alternate["protected_paths"] = []
 
-        def racing(project_id):
-            rules = real(project_id)
-            self.rules_path.write_text(
-                self.rules_path.read_text(encoding="utf-8") + "\n# changed during load\n",
-                encoding="utf-8",
-            )
-            return rules
+        def racing(snapshot, source_path):
+            self.assertEqual(snapshot, raw)
+            _write_yaml(self.rules_path, alternate)
+            return real_parser(snapshot, source_path)
 
+        with mock.patch.object(app, "load_project_rules_from_yaml_bytes", side_effect=racing):
+            first = self.suspend_with_partial()
+        suspension = self.suspension()
+        self.assertIsNotNone(suspension)
+        self.assertEqual(suspension["project_rules_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertNotEqual(suspension["project_rules_sha256"], self.sha256_of(self.rules_path))
+        self.assertEqual(first["state"], WAITING)
+        self.clock.advance(1800)
         developer = self.never_called()
-        with mock.patch.object(app, "_require_project_rules", racing):
-            rc, _result, _test = self.run_task(developer=developer)
-        self.assertEqual(rc, 1)
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
         developer.assert_not_called()
-        self.assertFalse(self.db_path.exists())
+        self.assertIsNone(self.suspension())
 
-    def test_permissions_changing_while_loading_is_rejected(self) -> None:
-        real = app._require_core_config
+    def test_permissions_disk_mutation_cannot_replace_admitted_authority(self) -> None:
+        raw = self.permissions_path.read_bytes()
+        original = config_loader_mod.load_permissions_from_yaml_bytes
+        alternate = yaml.safe_load(raw)
+        alternate["allowed_commands"] = ["extra"]
+        alternate["role_capabilities"]["builder"] = []
 
-        def racing():
-            config = real()
-            self.permissions_path.write_text(
-                self.permissions_path.read_text(encoding="utf-8") + "\n# changed during load\n",
-                encoding="utf-8",
-            )
-            return config
+        def racing(snapshot, path):
+            self.assertEqual(snapshot, raw)
+            _write_yaml(self.permissions_path, alternate)
+            return original(snapshot, path)
 
+        with mock.patch.object(config_loader_mod, "load_permissions_from_yaml_bytes", side_effect=racing):
+            first = self.suspend_with_partial()
+        suspension = self.suspension()
+        self.assertIsNotNone(suspension)
+        self.assertEqual(first["state"], WAITING)
+        self.assertEqual(suspension["permissions_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertNotEqual(suspension["permissions_sha256"], self.sha256_of(self.permissions_path))
+        self.clock.advance(1800)
         developer = self.never_called()
-        with mock.patch.object(app, "_require_core_config", racing):
-            rc, _result, _test = self.run_task(developer=developer)
-        self.assertEqual(rc, 1)
+        rc, result, _test = self.resume(developer=developer)
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
         developer.assert_not_called()
-        self.assertFalse(self.db_path.exists())
+        self.assertIsNone(self.suspension())
 
 
 class PersistedAtomicStartTests(PersistedExecutionTestCase):
@@ -4413,6 +4547,7 @@ class ResumeDueTestCase(PersistedExecutionTestCase):
                 "repo_path": f"./taskexec_repo{n}",
                 "commands": {"unit": ["python", "-c", "pass"]},
                 "protected_paths": [],
+                "autonomy_overrides": {},
             },
         )
         packet = yaml.safe_load(self.taskexec_packet_path.read_text(encoding="utf-8"))
@@ -5596,8 +5731,88 @@ class PersistedStaticSafetyTests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+class LocalProjectCommandGateTests(PersistedExecutionTestCase):
+    """Exercise the real admission check; never use patched_subprocess here."""
+
+    def assert_backend_blocked(self, *cli_args):
+        before_files = self.repo_files()
+        before_head = self.head()
+
+        def only_engine_git(args, **kwargs):
+            if not args or not _is_engine_git(args[0]):
+                raise AssertionError("project command reached host subprocess")
+            return _REAL_SUBPROCESS_RUN(args, **kwargs)
+
+        with mock.patch.object(app, "run_developer_task") as claude, \
+                mock.patch.object(app, "run_codex_task") as codex, \
+                mock.patch.object(Store, "reserve_agent_run") as reserve, \
+                mock.patch.object(app.test_runner_mod, "run_mandatory_test") as runner, \
+                mock.patch("subprocess.run", side_effect=only_engine_git):
+            rc, result = self.capture(*cli_args)
+        self.assertEqual((rc, result["state"]), (1, "BLOCKED"))
+        self.assertEqual(result["reason"], "isolated mandatory-test execution backend unavailable")
+        self.assertFalse(result["developer_completed"])
+        self.assertFalse(result["tests_passed"])
+        self.assertFalse(result["commit_performed"])
+        self.assertEqual(result["mandatory_test_results"], [])
+        claude.assert_not_called()
+        codex.assert_not_called()
+        runner.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(self.repo_files(), before_files)
+        self.assertEqual(self.head(), before_head)
+
+    def test_probe_blocks_every_project_argv_before_builder(self):
+        for argv in (
+            ["git", "push", "origin", "task/x"],
+            ["git", "reset", "--hard"],
+            ["powershell", "-Command", "..."],
+            ["python", "-c", "..."],
+            ["python", "verify_task.py"],
+            ["pnpm.cmd", "test"],
+        ):
+            with self.subTest(argv=argv):
+                rules = yaml.safe_load(self.rules_path.read_text(encoding="utf-8"))
+                rules["commands"]["unit"] = argv
+                _write_yaml(self.rules_path, rules)
+                self.assert_backend_blocked("task-execution-probe", str(self.taskexec_packet_path))
+                self.assertFalse(self.db_path.exists())
+
+    def test_codex_builder_also_blocked_before_invocation(self):
+        from tests.test_codex_adapter import codex_agent
+        path = self.config_dir / "AGENTS.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data["agents"]["developer"]["enabled"] = False
+        data["agents"]["codex_builder"] = codex_agent()
+        _write_yaml(path, data)
+        self.assert_backend_blocked("run-task", str(self.taskexec_packet_path))
+
+    def test_run_task_blocks_without_builder_or_reservation(self):
+        self.assert_backend_blocked("run-task", str(self.taskexec_packet_path))
+        self.assertEqual(self.task()["status"], "BLOCKED")
+        with Store(self.db_path) as store:
+            self.assertEqual(store.list_agent_runs(TASK_ID), [])
+
+    def test_resume_blocks_before_another_builder_or_reservation(self):
+        # Existing suspension is seeded using the historical synthetic fixture.
+        # The resumed call uses the real unavailable-backend check.
+        self.suspend_with_partial()
+        self.clock.advance(1800)
+        with Store(self.db_path) as store:
+            runs_before = store.list_agent_runs(TASK_ID)
+        self.assert_backend_blocked("resume-capacity", TASK_ID)
+        with Store(self.db_path) as store:
+            self.assertEqual(store.list_agent_runs(TASK_ID), runs_before)
+
+    def test_empty_mandatory_tests_do_not_require_backend(self):
+        self._write_taskexec_packet(mandatory_tests=[])
+        with mock.patch.object(app, "run_developer_task") as developer, \
+                mock.patch.object(app.test_runner_mod, "require_isolated_mandatory_test_backend") as backend:
+            rc, result = self.capture("task-execution-probe", str(self.taskexec_packet_path))
+        self.assertEqual((rc, result["state"]), (0, "HUMAN_GATE"))
+        backend.assert_not_called()
+        developer.assert_called_once()
 
 
 class RoleCapabilityFlowTests(PersistedExecutionTestCase):
@@ -6101,12 +6316,12 @@ class CodexDispatchTests(PersistedExecutionTestCase):
                 if developer is None:
                     raise AssertionError("no Claude fallback")
                 return developer(args, **kwargs)
-            if args[0] == "python":
-                if test is None:
-                    raise AssertionError("unexpected test command")
-                return test(args, **kwargs)
+            if not _is_engine_git(args[0]):
+                raise AssertionError("unexpected host command")
             return _REAL_SUBPROCESS_RUN(args, **kwargs)
-        with mock.patch("shutil.which", side_effect=which), mock.patch("subprocess.run", side_effect=run):
+        with TaskExecutionProbeTestCase.patched_subprocess(self, developer=developer, test=test), \
+                mock.patch("shutil.which", side_effect=which), \
+                mock.patch("subprocess.run", side_effect=run):
             yield
 
     def test_codex_reservation_before_process_then_existing_human_gate(self):
@@ -6225,3 +6440,1001 @@ class CodexProtectedPathFlowTests(ProtectedPathFlowTests):
         data["agents"]["codex_builder"] = codex_agent()
         _write_yaml(path, data)
         self.codex_process = mock.MagicMock(side_effect=self.codex_success)
+
+
+class ProjectRulesAdmissionSnapshotTests(CliFixtureTestCase):
+    def test_hash_and_parser_share_one_read_object_even_if_disk_changes(self):
+        path = self.projects_dir / "SAMPLE" / "PROJECT_RULES.yaml"
+        raw = path.read_bytes()
+        real_open = Path.open
+        real_parser = app.load_project_rules_from_yaml_bytes
+        seen = []
+
+        def parse(snapshot, source_path):
+            seen.append(snapshot)
+            # A second disk read would grant different command authority.
+            changed = yaml.safe_load(raw)
+            changed["commands"] = {"unapproved": ["forbidden"]}
+            with real_open(path, "wb") as stream:
+                stream.write(yaml.safe_dump(changed).encode())
+            return real_parser(snapshot, source_path)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=real_open) as opened:
+            with mock.patch.object(app, "_sha256_hex", wraps=app._sha256_hex) as hashed:
+                with mock.patch.object(app, "load_project_rules_from_yaml_bytes", side_effect=parse):
+                    rules, digest = app._load_project_rules_with_identity("SAMPLE")
+        opened.assert_called_once_with(path, "rb")
+        self.assertEqual(len(seen), 1)
+        self.assertIs(hashed.call_args.args[0], seen[0])
+        self.assertEqual(seen[0], raw)
+        self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(rules["commands"], {})
+        self.assertNotEqual(path.read_bytes(), raw)
+
+    def test_both_public_helpers_use_the_same_admission(self):
+        rules = {"sentinel": True}
+        with mock.patch.object(app, "_admit_project_rules", return_value=(rules, "digest")) as admit:
+            self.assertIs(app._require_project_rules("SAMPLE"), rules)
+            self.assertEqual(app._load_project_rules_with_identity("SAMPLE"), (rules, "digest"))
+        self.assertEqual(admit.call_args_list, [mock.call("SAMPLE"), mock.call("SAMPLE")])
+
+    def test_project_id_mismatch_and_traversal_fail_closed(self):
+        self.set_project_rules_project_id("OTHER")
+        with self.assertRaises(app.ConfigError):
+            app._admit_project_rules("SAMPLE")
+        with mock.patch.object(Path, "open") as opened:
+            with self.assertRaises(app.InvalidIdError):
+                app._admit_project_rules("../SAMPLE")
+        opened.assert_not_called()
+
+    def test_file_and_directory_redirection_rejected_before_open(self):
+        path = self.projects_dir / "SAMPLE" / "PROJECT_RULES.yaml"
+        real_lstat = Path.lstat
+        for redirected, mode, attributes in (
+            (path, stat.S_IFLNK, 0),
+            (path, stat.S_IFREG, 0x400),
+            (path.parent, stat.S_IFLNK, 0),
+            (path.parent, stat.S_IFDIR, 0x400),
+        ):
+            def metadata(candidate):
+                if candidate == redirected:
+                    return mock.Mock(st_mode=mode, st_file_attributes=attributes)
+                return real_lstat(candidate)
+            with self.subTest(path=redirected, mode=mode, attributes=attributes):
+                with mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata):
+                    with mock.patch.object(Path, "open") as opened:
+                        with self.assertRaises(app.ConfigError):
+                            app._admit_project_rules("SAMPLE")
+                opened.assert_not_called()
+
+    def test_resolved_escape_is_rejected_before_open(self):
+        path = self.projects_dir / "SAMPLE" / "PROJECT_RULES.yaml"
+        real_resolve = Path.resolve
+        def resolve(candidate, **kwargs):
+            if candidate == path:
+                return self.root / "outside.yaml"
+            return real_resolve(candidate, **kwargs)
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve):
+            with mock.patch.object(Path, "open") as opened:
+                with self.assertRaises(app.ConfigError):
+                    app._admit_project_rules("SAMPLE")
+        opened.assert_not_called()
+
+    def test_opened_file_must_match_validated_identity(self):
+        with mock.patch.object(app.os, "fstat", return_value=mock.Mock(
+            st_mode=stat.S_IFREG, st_dev=-1, st_ino=-1, st_file_attributes=0
+        )):
+            with mock.patch.object(app, "load_project_rules_from_yaml_bytes") as parser:
+                with self.assertRaises(app.ConfigError):
+                    app._admit_project_rules("SAMPLE")
+        parser.assert_not_called()
+
+
+class ProjectRulesAdmissionBeforeBuilderTests(PersistedExecutionTestCase):
+    def test_missing_unreadable_and_nonregular_rules_block_before_builder(self):
+        raw = self.rules_path.read_bytes()
+        real_open = Path.open
+        for mode in ("missing", "directory", "unreadable"):
+            with self.subTest(mode=mode):
+                if mode != "unreadable":
+                    self.rules_path.unlink()
+                    if mode == "directory":
+                        self.rules_path.mkdir()
+                def opened(path, *args, **kwargs):
+                    if path == self.rules_path and mode == "unreadable":
+                        raise PermissionError("fixture")
+                    return real_open(path, *args, **kwargs)
+                developer = self.never_called()
+                try:
+                    with mock.patch.object(Path, "open", autospec=True, side_effect=opened):
+                        rc, _result, _test = self.run_task(developer=developer)
+                    self.assertEqual(rc, 1)
+                    developer.assert_not_called()
+                    self.assertFalse(self.db_path.exists())
+                finally:
+                    if mode == "directory":
+                        self.rules_path.rmdir()
+                    self.rules_path.write_bytes(raw)
+
+
+class PermissionsAdmissionSnapshotTests(CliFixtureTestCase):
+    def test_authority_read_once_and_hash_parser_share_bytes_despite_disk_mutation(self):
+        path = self.config_dir / "PERMISSIONS.yaml"
+        raw = path.read_bytes()
+        real_open = Path.open
+        original = config_loader_mod.load_permissions_from_yaml_bytes
+        seen = []
+
+        def parser(snapshot, source):
+            seen.append(snapshot)
+            changed = yaml.safe_load(raw)
+            changed["allowed_commands"] = ["extra"]
+            with real_open(path, "wb") as stream:
+                stream.write(yaml.safe_dump(changed).encode())
+            return original(snapshot, source)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=real_open) as opened:
+            with mock.patch.object(app, "_sha256_hex", wraps=app._sha256_hex) as hashed:
+                with mock.patch.object(config_loader_mod, "load_permissions_from_yaml_bytes",
+                                       side_effect=parser):
+                    with mock.patch.object(subprocess, "run") as process:
+                        config, digest = app._load_core_config_with_identity()
+        permission_reads = [call for call in opened.call_args_list if call.args[0] == path]
+        self.assertEqual(permission_reads, [mock.call(path, "rb")])
+        self.assertEqual(len(seen), 1)
+        self.assertIs(hashed.call_args.args[0], seen[0])
+        self.assertEqual(seen[0], raw)
+        self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(config.permissions, yaml.safe_load(raw))
+        self.assertNotEqual(path.read_bytes(), raw)
+        process.assert_not_called()  # Publication policy is data, never a Git action.
+
+    def test_core_helpers_share_one_admission(self):
+        config = object()
+        with mock.patch.object(app, "_admit_core_config_with_permissions_identity",
+                               return_value=(config, "digest")) as admit:
+            self.assertIs(app._require_core_config(), config)
+            self.assertEqual(app._load_core_config_with_identity(), (config, "digest"))
+        self.assertEqual(admit.call_count, 2)
+
+    def test_permissions_resolved_escape_rejected_before_open(self):
+        path = self.config_dir / "PERMISSIONS.yaml"
+        original = Path.resolve
+        def resolve(candidate, **kwargs):
+            return self.root / "outside.yaml" if candidate == path else original(candidate, **kwargs)
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve):
+            with mock.patch.object(Path, "open") as opened:
+                with self.assertRaises(app.ConfigError):
+                    app._load_core_config_with_identity()
+        opened.assert_not_called()
+
+    def test_permissions_descriptor_mismatch_rejected_before_parsing(self):
+        with mock.patch.object(app.os, "fstat", return_value=mock.Mock(
+            st_mode=stat.S_IFREG, st_dev=-1, st_ino=-1, st_file_attributes=0
+        )):
+            with mock.patch.object(config_loader_mod, "load_permissions_from_yaml_bytes") as parser:
+                with self.assertRaises(app.ConfigError):
+                    app._load_core_config_with_identity()
+        parser.assert_not_called()
+
+
+class PermissionsAdmissionBeforeBuilderTests(PersistedExecutionTestCase):
+    def test_missing_nonregular_unreadable_and_redirected_permissions_block_builder(self):
+        raw = self.permissions_path.read_bytes()
+        real_open = Path.open
+        real_lstat = Path.lstat
+        for mode in ("missing", "directory", "unreadable", "symlink", "reparse"):
+            with self.subTest(mode=mode):
+                if mode in ("missing", "directory"):
+                    self.permissions_path.unlink()
+                    if mode == "directory":
+                        self.permissions_path.mkdir()
+                def opened(path, *args, **kwargs):
+                    if path == self.permissions_path and mode == "unreadable":
+                        raise PermissionError("fixture")
+                    return real_open(path, *args, **kwargs)
+                def metadata(path):
+                    if path == self.permissions_path and mode in ("symlink", "reparse"):
+                        return mock.Mock(st_mode=stat.S_IFLNK if mode == "symlink" else stat.S_IFREG,
+                                         st_file_attributes=0x400 if mode == "reparse" else 0)
+                    return real_lstat(path)
+                developer = self.never_called()
+                try:
+                    with mock.patch.object(Path, "open", autospec=True, side_effect=opened):
+                        with mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata):
+                            rc, _result, _test = self.run_task(developer=developer)
+                    self.assertEqual(rc, 1)
+                    developer.assert_not_called()
+                    self.assertFalse(self.db_path.exists())
+                finally:
+                    if mode == "directory":
+                        self.permissions_path.rmdir()
+                    self.permissions_path.write_bytes(raw)
+
+
+class PublicationAuthoritySnapshotTests(CliFixtureTestCase):
+    def test_read_once_hash_and_parse_same_bytes_despite_later_mutation(self):
+        from contextlib import ExitStack
+        names = ("PERMISSIONS", "POLICIES", "GATES")
+        paths = {name: self.config_dir / (name + ".yaml") for name in names}
+        raw = {name: path.read_bytes() for name, path in paths.items()}
+        seen = {}
+        real_open = Path.open
+        streams = {}
+
+        def traced_open(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            if path in paths.values() and args == ("rb",):
+                monitored = mock.MagicMock(wraps=stream)
+                monitored.__enter__.return_value = monitored
+                monitored.__exit__.side_effect = stream.__exit__
+                streams[path] = monitored
+                return monitored
+            return stream
+
+        def wrap(name, original):
+            def parser(snapshot, source):
+                seen[name] = snapshot
+                with real_open(paths[name], "wb") as stream:
+                    stream.write(b"invalid: replacement\n")
+                return original(snapshot, source)
+            return parser
+
+        with ExitStack() as stack:
+            opened = stack.enter_context(mock.patch.object(Path, "open", autospec=True, side_effect=traced_open))
+            hashed = stack.enter_context(mock.patch.object(app, "_sha256_hex", wraps=app._sha256_hex))
+            process = stack.enter_context(mock.patch.object(subprocess, "run", side_effect=AssertionError("execution")))
+            for name in names:
+                attr = "load_" + name.lower() + "_from_yaml_bytes"
+                stack.enter_context(mock.patch.object(config_loader_mod, attr,
+                                                     side_effect=wrap(name, getattr(config_loader_mod, attr))))
+            snapshot = app._admit_publication_authority()
+        self.assertEqual(len(hashed.call_args_list), 3)
+        for index, name in enumerate(names):
+            reads = [call for call in opened.call_args_list
+                     if call.args[0] == paths[name] and call.args[1] == "rb"]
+            self.assertEqual(reads, [mock.call(paths[name], "rb")])
+            streams[paths[name]].read.assert_called_once_with()
+            self.assertIs(hashed.call_args_list[index].args[0], seen[name])
+            self.assertEqual(seen[name], raw[name])
+            self.assertEqual(getattr(snapshot, name.lower() + "_sha256"), hashlib.sha256(raw[name]).hexdigest())
+            self.assertEqual(getattr(snapshot.config, name.lower()), yaml.safe_load(raw[name]))
+            self.assertNotEqual(paths[name].read_bytes(), raw[name])
+        process.assert_not_called()
+        self.assertFalse(self.db_path.exists())
+
+    def test_missing_nonregular_redirected_and_descriptor_mismatch_fail_closed(self):
+        from contextlib import ExitStack
+        for name in ("PERMISSIONS", "POLICIES", "GATES"):
+            path = self.config_dir / (name + ".yaml")
+            raw = path.read_bytes()
+            real_lstat = Path.lstat
+            real_resolve = Path.resolve
+            real_fstat = app.os.fstat
+            for mode in ("missing", "directory", "reparse", "escape", "descriptor"):
+                with self.subTest(name=name, mode=mode):
+                    try:
+                        if mode in ("missing", "directory"):
+                            path.unlink()
+                        if mode == "directory":
+                            path.mkdir()
+                        with ExitStack() as stack:
+                            if mode == "reparse":
+                                def metadata(candidate):
+                                    if candidate == path:
+                                        return mock.Mock(st_mode=stat.S_IFREG, st_file_attributes=0x400)
+                                    return real_lstat(candidate)
+                                stack.enter_context(mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata))
+                            if mode == "escape":
+                                def resolve(candidate, **kwargs):
+                                    return self.root / "outside.yaml" if candidate == path else real_resolve(candidate, **kwargs)
+                                stack.enter_context(mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve))
+                            if mode == "descriptor":
+                                target_identity = path.stat()
+                                def fstat(descriptor):
+                                    info = real_fstat(descriptor)
+                                    if (info.st_dev, info.st_ino) == (target_identity.st_dev, target_identity.st_ino):
+                                        return mock.Mock(st_mode=stat.S_IFREG, st_dev=-1, st_ino=-1, st_file_attributes=0)
+                                    return info
+                                stack.enter_context(mock.patch.object(app.os, "fstat", side_effect=fstat))
+                            parser = stack.enter_context(mock.patch.object(app, "load_core_config_from_authority_bytes"))
+                            with self.assertRaises(app.ConfigError):
+                                app._admit_publication_authority()
+                            parser.assert_not_called()
+                    finally:
+                        if mode == "directory":
+                            path.rmdir()
+                        path.write_bytes(raw)
+
+
+class ControlledPublicationApprovalTests(CliFixtureTestCase):
+    def setUp(self):
+        super().setUp()
+        self.authority = app._admit_publication_authority()
+        data = yaml.safe_load(self.sample_task_path.read_bytes())
+        data["authorized_actions"] = ["git_publish_task_branch"]
+        data["preconditions"]["git"]["expected_branch"] = "task/approval-test"
+        _write_yaml(self.sample_task_path, data)
+        self.packet, self.packet_sha = app._load_packet_with_identity(
+            self.sample_task_path, policies=self.authority.config.policies)
+        self.final_sha = hashlib.sha1(b"final candidate fixture").hexdigest()
+        limits = self.authority.config.permissions["git_publish"]
+        self.approval = app.ControlledPublicationApproval(
+            approval_id="approval-001", task_id=self.packet.task_id,
+            task_packet_sha256=self.packet_sha, action="git_publish_task_branch",
+            builder_id="developer", branch=self.packet.preconditions.git.expected_branch,
+            candidate_head_sha=self.final_sha, remote_name=limits["remote_name"],
+            effective_push_url=limits["allowed_remote_urls"][0],
+            target_ref="refs/heads/" + self.packet.preconditions.git.expected_branch,
+            permissions_sha256=self.authority.permissions_sha256,
+            policies_sha256=self.authority.policies_sha256,
+            gates_sha256=self.authority.gates_sha256,
+            approved_at="2026-10-09T12:00:00+00:00",
+            approval_source="EXTERNAL_TRUSTED_DIRECTOR",
+        )
+
+    def validate(self, approval=None, **overrides):
+        values = dict(
+            approval=self.approval if approval is None else approval,
+            publication_authority_snapshot=self.authority, task_packet=self.packet,
+            task_packet_sha256=self.packet_sha, expected_builder_id="developer",
+            candidate_head_sha=self.final_sha, remote_name=self.approval.remote_name,
+            effective_push_url=self.approval.effective_push_url,
+        )
+        values.update(overrides)
+        return app.validate_controlled_publication_approval(**values)
+
+    def test_valid_frozen_record_and_pure_binding_not_initial_head(self):
+        from dataclasses import FrozenInstanceError
+        self.assertNotEqual(self.final_sha, self.packet.preconditions.git.expected_head)
+        with mock.patch.object(Path, "open", side_effect=AssertionError("file IO")), \
+                mock.patch.object(subprocess, "run", side_effect=AssertionError("execution")), \
+                mock.patch.object(app, "Store", side_effect=AssertionError("persistence")):
+            self.assertIsNone(self.validate())
+        with self.assertRaises(FrozenInstanceError):
+            self.approval.builder_id = "another"
+        self.assertEqual(self.approval.approved_at, "2026-10-09T12:00:00+00:00")
+        self.assertFalse(self.db_path.exists())
+
+    def test_model_rejects_invalid_fields(self):
+        from dataclasses import replace
+        cases = [("action", "other"), ("approval_source", "director"),
+                 ("approval_source", "HUMAN_APPROVED"), ("approval_id", ""),
+                 ("builder_id", "developer\n"), ("task_id", None),
+                 ("approved_at", "2026-10-09"), ("approved_at", "not-time"),
+                 ("approved_at", None), ("remote_name", ""), ("remote_name", "--all")]
+        for label in ("task_packet_sha256", "permissions_sha256", "policies_sha256", "gates_sha256"):
+            cases.extend((label, value) for value in (None, "", "placeholder", "a" * 63, "A" * 64, "0" * 64))
+        cases.extend(("candidate_head_sha", value) for value in (None, "", "HEAD", "a" * 64, "A" * 40, "0" * 40))
+        cases.extend(("branch", value) for value in ("main", "master", "HEAD", "refs/tags/v1", "task/", "task/a..b", "task/x.lock", "task/a:b"))
+        cases.extend(("target_ref", value) for value in ("", "HEAD", ":refs/heads/task/x", "refs/tags/v1", "refs/heads/task/other"))
+        cases.extend(("effective_push_url", value) for value in ("", "http://host/repo.git", "git@host:owner/repo.git", "https://user:pass@host/owner/repo.git", "https://host/owner/repo.git?x=1"))
+        for label, value in cases:
+            with self.subTest(label=label, value=value), self.assertRaises(app.ControlledPublicationApprovalError):
+                replace(self.approval, **{label: value})
+
+    def test_every_record_binding_mismatch_fails_closed(self):
+        from dataclasses import replace
+        other_digest = hashlib.sha256(b"other admitted bytes").hexdigest()
+        mutations = {
+            "task_id": "different-task", "task_packet_sha256": other_digest,
+            "action": "other", "builder_id": "other-builder", "branch": "task/other",
+            "candidate_head_sha": hashlib.sha1(b"another candidate").hexdigest(),
+            "remote_name": "other", "effective_push_url": "https://example.com/owner/other.git",
+            "target_ref": "refs/heads/task/other", "permissions_sha256": other_digest,
+            "policies_sha256": other_digest, "gates_sha256": other_digest,
+        }
+        for label, value in mutations.items():
+            with self.subTest(label=label), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.validate(replace(self.approval, **{label: value}))
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.validate(replace(self.approval, branch="task/other", target_ref="refs/heads/task/other"))
+
+    def test_current_observation_and_admission_mismatches_fail(self):
+        from dataclasses import replace
+        other = hashlib.sha256(b"changed authority").hexdigest()
+        cases = dict(task_packet_sha256=other, expected_builder_id="another",
+                     candidate_head_sha=self.packet.preconditions.git.expected_head,
+                     remote_name="another", effective_push_url=self.approval.effective_push_url.upper())
+        for label, value in cases.items():
+            with self.subTest(label=label), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.validate(**{label: value})
+        for label in ("permissions_sha256", "policies_sha256", "gates_sha256"):
+            with self.subTest(label=label), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.validate(publication_authority_snapshot=replace(self.authority, **{label: other}))
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.validate(task_packet=replace(self.packet, authorized_actions=()))
+
+    def test_snapshot_only_and_intersection_required(self):
+        import copy
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.validate(publication_authority_snapshot=self.authority.config)
+        for block in ("permissions", "policies", "gates"):
+            altered = copy.deepcopy(self.authority)
+            if block == "permissions":
+                altered.config.permissions["git_publish"]["enabled"] = False
+            elif block == "policies":
+                altered.config.policies["controlled_actions"]["git_publish_task_branch"]["enabled"] = False
+            else:
+                altered.config.gates["director_internal_gate"]["git_publish_task_branch"] = False
+            with self.subTest(block=block), self.assertRaises(app.ConfigError):
+                self.validate(publication_authority_snapshot=altered)
+
+    def test_literal_destination_and_policy_bounds(self):
+        from dataclasses import replace
+        for changes in (
+            {"remote_name": "other"},
+            {"effective_push_url": self.approval.effective_push_url.replace("github.com", "GITHUB.com")},
+            {"effective_push_url": "https://example.com/owner/repo.git"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.validate(replace(self.approval, **changes), **changes)
+
+    def test_alternate_branch_prefix_is_structurally_valid(self):
+        from dataclasses import replace
+        replace(self.approval, branch="review/cambio", target_ref="refs/heads/review/cambio").validate_structure()
+
+    def prefix_policy_fixture(self, branch):
+        from dataclasses import replace
+        path = app.CONFIG_DIR / "PERMISSIONS.yaml"
+        permissions = yaml.safe_load(path.read_bytes())
+        permissions["git_publish"]["branch_prefix"] = "review/"
+        _write_yaml(path, permissions)
+        authority = app._admit_publication_authority()
+        data = yaml.safe_load(self.sample_task_path.read_bytes())
+        data["preconditions"]["git"]["expected_branch"] = branch
+        _write_yaml(self.sample_task_path, data)
+        packet, digest = app._load_packet_with_identity(self.sample_task_path, policies=authority.config.policies)
+        approval = replace(self.approval, branch=branch, target_ref="refs/heads/" + branch,
+                           task_packet_sha256=digest, permissions_sha256=authority.permissions_sha256)
+        return dict(approval=approval, publication_authority_snapshot=authority,
+                    task_packet=packet, task_packet_sha256=digest)
+
+    def test_binding_accepts_admitted_alternate_prefix(self):
+        self.validate(**self.prefix_policy_fixture("review/cambio"))
+
+    def test_binding_rejects_wrong_prefix_under_alternate_policy(self):
+        with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "outside admitted publication bounds"):
+            self.validate(**self.prefix_policy_fixture("task/cambio"))
+
+    def test_generic_approval_does_not_become_specific_record(self):
+        for generic in ("TECH_APPROVED", "HUMAN_APPROVED", {"actor": "director"},
+                        {"task_id": self.packet.task_id, "actor": "director", "to_status": "HUMAN_APPROVED"}):
+            with self.subTest(generic=generic), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.validate(generic)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            app.build_parser().parse_args(["approve-publication"])
+
+
+class ControlledPublicationGitPreflightTests(CliFixtureTestCase):
+    """Local disposable Git fixtures only; no remote contact, hooks or publisher."""
+
+    def setUp(self):
+        super().setUp()
+        self.empty_config = self.root / "empty-global-config"
+        self.empty_config.write_bytes(b"")
+        self.git_env = app._publication_preflight_environment(self.empty_config)
+        self.git_executable = evidence_mod._resolve_git_executable()
+        self.repo = self.root / "git-fixture"
+        self.repo.mkdir()
+        # Mutating setup is confined to this disposable fixture, never preflight.
+        self.git("init", "-b", "task/preflight")
+        self.git("config", "user.name", "Preflight Fixture")
+        self.git("config", "user.email", "preflight@localhost")
+        (self.repo / "tracked.txt").write_bytes(b"baseline\n")
+        self.git("add", "tracked.txt")
+        self.git("-c", "commit.gpgSign=false", "-c", "core.hooksPath=" + str(self.root / "no-hooks"),
+                 "commit", "-m", "fixture baseline")
+        self.authority = app._admit_publication_authority()
+        limits = self.authority.config.permissions["git_publish"]
+        self.url = limits["allowed_remote_urls"][0]
+        self.git("config", "remote.origin.url", self.url)
+        data = yaml.safe_load(self.sample_task_path.read_bytes())
+        data["authorized_actions"] = ["git_publish_task_branch"]
+        data["preconditions"]["git"]["expected_branch"] = "task/preflight"
+        _write_yaml(self.sample_task_path, data)
+        self.packet, self.packet_sha = app._load_packet_with_identity(
+            self.sample_task_path, policies=self.authority.config.policies)
+        self.head = self.git("rev-parse", "HEAD").decode().strip()
+        self.approval = app.ControlledPublicationApproval(
+            "approval-preflight", self.packet.task_id, self.packet_sha, "git_publish_task_branch",
+            "developer", "task/preflight", self.head, "origin", self.url, "refs/heads/task/preflight",
+            self.authority.permissions_sha256, self.authority.policies_sha256, self.authority.gates_sha256,
+            "2026-10-09T12:00:00+00:00", "EXTERNAL_TRUSTED_DIRECTOR")
+
+    def git(self, *args):
+        return subprocess.run([self.git_executable, *args], cwd=self.repo, env=self.git_env,
+                              capture_output=True, check=True, shell=False, timeout=15).stdout
+
+    def preflight(self, **overrides):
+        args = dict(publication_authority_snapshot=self.authority, approval=self.approval,
+                    task_packet=self.packet, task_packet_sha256=self.packet_sha,
+                    expected_builder_id="developer", repo_path=self.repo,
+                    empty_global_config=self.empty_config)
+        args.update(overrides)
+        return app.run_controlled_publication_git_preflight(**args)
+
+    def test_clean_exact_context_and_raw_config_identity(self):
+        from dataclasses import FrozenInstanceError
+        path = self.repo / ".git" / "config"
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        real_run = subprocess.run
+        timeline = mock.Mock()
+        with mock.patch.object(app, "_read_authority_bytes", wraps=app._read_authority_bytes) as reads, \
+                mock.patch.object(subprocess, "run", wraps=real_run) as calls:
+            timeline.attach_mock(reads, "read")
+            timeline.attach_mock(calls, "git")
+            result = self.preflight()
+        self.assertEqual([c for c in reads.call_args_list if c.args[0] == path],
+                         [mock.call(path, path.parent)] * 2)
+        self.assertEqual(timeline.mock_calls[-1], mock.call.read(path, path.parent))
+        self.assertEqual(result.git_config_sha256, expected)
+        self.assertEqual((result.repo_root, result.branch, result.head_sha), (self.repo.resolve(), "task/preflight", self.head))
+        self.assertEqual(result.effective_push_url, self.url)
+        self.assertTrue(result.worktree_clean)
+        self.assertFalse(result.rewrite_present)
+        for call in calls.call_args_list:
+            self.assertIs(call.kwargs["shell"], False)
+            self.assertEqual(call.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertEqual(call.kwargs["env"]["GIT_ATTR_SOURCE"], self.approval.candidate_head_sha)
+            self.assertEqual(call.kwargs["env"]["GIT_ATTR_NOSYSTEM"], "1")
+            self.assertEqual(call.args[0][5:9],
+                             ["-c", "core.attributesFile=" + str(self.empty_config),
+                              "-c", "core.worktree=" + str(self.repo.resolve())])
+            argv = tuple(call.args[0][10:])
+            self.assertTrue(argv in app._PUBLICATION_PREFLIGHT_GIT_COMMANDS
+                            or argv == ("remote", "get-url", "--push", "--all", "origin"))
+        with self.assertRaises(FrozenInstanceError):
+            result.head_sha = "changed"
+
+    def test_no_lazy_fetch_environment_overrides_parent(self):
+        with mock.patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "0"}), \
+                mock.patch.object(subprocess, "run", wraps=subprocess.run) as calls:
+            self.assertTrue(self.preflight().worktree_clean)
+        self.assertTrue(calls.call_args_list)
+        for call in calls.call_args_list:
+            self.assertEqual(call.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_no_lazy_fetch_global_flag_preserves_safe_arguments(self):
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as calls:
+            self.preflight()
+        for call in calls.call_args_list:
+            self.assertEqual(call.args[0][:10], [self.git_executable,
+                "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+                "-c", "core.attributesFile=" + str(self.empty_config),
+                "-c", "core.worktree=" + str(self.repo.resolve()), "--no-lazy-fetch"])
+            self.assertFalse(call.kwargs["shell"])
+            self.assertEqual(call.kwargs["timeout"], 15)
+
+    def object_inventory(self):
+        return {p.relative_to(self.repo): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in (self.repo / ".git" / "objects").rglob("*") if p.is_file()}
+
+    def assert_config_blocks_before_object_lookup(self, key, value, reason):
+        self.git("config", key, value)
+        before = self.object_inventory()
+        with mock.patch.object(app, "_run_publication_preflight_git",
+                               wraps=app._run_publication_preflight_git) as calls:
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, reason):
+                self.preflight()
+        self.assertEqual([call.args[1] for call in calls.call_args_list],
+                         [("config", "--no-includes", "--file", "-", "--null", "--list")])
+        self.assertEqual(self.object_inventory(), before)
+
+    def test_partial_clone_blocks_before_object_lookup(self):
+        self.assert_config_blocks_before_object_lookup("extensions.partialClone", "origin", "partial clone unsupported")
+
+    def test_promisor_true_blocks_before_object_lookup(self):
+        for value in ("true", "YES", "on", "1", "-1", "2"):
+            with self.subTest(value=value):
+                self.assert_config_blocks_before_object_lookup("remote.origin.promisor", value, "promisor configuration")
+
+    def test_partial_clone_filter_blocks_before_object_lookup(self):
+        self.assert_config_blocks_before_object_lookup("remote.origin.partialCloneFilter", "blob:none", "partial clone filter")
+
+    def test_promisor_false_values_are_not_promisor(self):
+        for value in ("false", "NO", "off", "0", "", "+0", "-0", "00", "0x0", "0k"):
+            with self.subTest(value=value):
+                self.git("config", "remote.origin.promisor", value)
+                self.assertEqual(self.git("config", "--bool", "remote.origin.promisor").strip(), b"false")
+                self.assertTrue(self.preflight().worktree_clean)
+
+    def test_other_remote_and_bare_or_invalid_promisor_block(self):
+        self.assert_config_blocks_before_object_lookup("remote.other.name.promisor", "true", "promisor configuration")
+        self.git("config", "--remove-section", "remote.other.name")
+        config = self.repo / ".git" / "config"
+        raw = config.read_bytes()
+        for setting in (b"promisor", b"promisor = invalid"):
+            with self.subTest(setting=setting):
+                config.write_bytes(raw + b'\n[remote "another"]\n' + setting + b"\n")
+                with mock.patch.object(app, "_run_publication_preflight_git",
+                                       wraps=app._run_publication_preflight_git) as calls:
+                    with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "promisor configuration"):
+                        self.preflight()
+                self.assertEqual(len(calls.call_args_list), 1)
+
+    def test_missing_object_blocks_without_retry_transport_or_progress(self):
+        original = subprocess.run
+        observed = []
+        before = self.object_inventory()
+
+        def missing_object(argv, **kwargs):
+            command = tuple(argv[10:])
+            observed.append(command)
+            self.assertEqual(argv[9], "--no-lazy-fetch")
+            self.assertEqual(kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+            if command[0] == "check-attr":
+                return subprocess.CompletedProcess(argv, 128, b"", b"fatal: missing local candidate object")
+            return original(argv, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=missing_object):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "Git preflight observation failed"):
+                self.preflight()
+        self.assertEqual(observed, [
+            ("config", "--no-includes", "--file", "-", "--null", "--list"),
+            ("rev-parse", "--show-toplevel"), ("rev-parse", "HEAD"),
+            ("symbolic-ref", "--quiet", "--short", "HEAD"),
+            ("ls-files", "--stage", "-z"), ("check-attr", "--stdin", "-z", "filter")])
+        self.assertEqual(self.object_inventory(), before)
+
+    def commit_candidate_attributes(self, content):
+        from dataclasses import replace
+        (self.repo / ".gitattributes").write_bytes(content.encode("utf-8"))
+        self.git("add", ".gitattributes")
+        self.git("-c", "commit.gpgSign=false", "-c", "core.hooksPath=" + str(self.root / "no-hooks"),
+                 "commit", "-m", "fixture attributes")
+        self.head = self.git("rev-parse", "HEAD").decode().strip()
+        self.approval = replace(self.approval, candidate_head_sha=self.head)
+
+    def filter_marker_config(self):
+        marker = self.repo / ".git" / "filter-executed"
+        # Harmless marker command; only a vulnerable future test run would execute it.
+        script = self.repo / ".git" / "evil-filter.sh"
+        script.write_text('echo executed > "' + marker.as_posix() + '"\nexit 1\n', encoding="utf-8")
+        command = 'sh "' + script.as_posix() + '"'
+        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        return marker, ('\n[filter "evil"]\n\tprocess = "' + escaped + '"\n').encode()
+
+    def test_candidate_filter_blocks_before_status_without_executing_driver(self):
+        self.commit_candidate_attributes("*.txt filter=evil\n")
+        marker, addition = self.filter_marker_config()
+        config = self.repo / ".git" / "config"
+        safe = config.read_bytes()
+        original = app._run_publication_preflight_git
+        observed = []
+
+        def transient(executable, args, **kwargs):
+            observed.append(args)
+            if args[0] == "check-attr":
+                config.write_bytes(safe + addition)
+            return original(executable, args, **kwargs)
+
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=transient):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "candidate filter attributes"):
+                self.preflight()
+        self.assertTrue(any(args[0] == "check-attr" for args in observed))
+        self.assertFalse(any(args[0] == "status" for args in observed))
+        self.assertFalse(marker.exists())
+
+    def test_normal_candidate_attributes_and_final_approved_source(self):
+        self.commit_candidate_attributes("*.txt text eol=lf\n")
+        self.assertNotEqual(self.packet.preconditions.git.expected_head, self.head)
+        self.assertEqual(self.git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                         b"", "fixture must be clean before invoking preflight")
+        real_run = subprocess.run
+        with mock.patch.object(subprocess, "run", wraps=real_run) as calls:
+            result = self.preflight()
+        self.assertTrue(result.worktree_clean)
+        for call in calls.call_args_list:
+            self.assertEqual(call.kwargs["env"]["GIT_ATTR_SOURCE"], self.head)
+        check = [call for call in calls.call_args_list if call.args[0][10] == "check-attr"]
+        self.assertEqual(len(check), 1)
+        self.assertEqual(check[0].kwargs["input"], b".gitattributes\0tracked.txt\0")
+
+    def test_filter_values_and_malformed_attribute_output_fail_closed(self):
+        original = app._run_publication_preflight_git
+        for output in (b"tracked.txt\0filter\0set\0", b"tracked.txt\0filter\0unset\0",
+                       b"tracked.txt\0filter\0evil\0", b"", b"other.txt\0filter\0unspecified\0"):
+            def observe(executable, args, **kwargs):
+                if args[0] == "check-attr":
+                    return output
+                if args[0] == "status":
+                    self.fail("ambiguous or unsupported attributes must block before status")
+                return original(executable, args, **kwargs)
+            with self.subTest(output=output), mock.patch.object(
+                    app, "_run_publication_preflight_git", side_effect=observe):
+                with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "candidate filter attributes"):
+                    self.preflight()
+
+    def test_info_attributes_even_empty_blocks_before_git(self):
+        path = self.repo / ".git" / "info" / "attributes"
+        for content in (b"", b"*.txt filter=evil\n"):
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                with mock.patch.object(subprocess, "run") as run:
+                    with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "info attributes"):
+                        self.preflight()
+                    run.assert_not_called()
+        path.unlink()
+        self.assertTrue(self.preflight().worktree_clean)
+
+    def test_info_attributes_created_after_observation_blocks_return(self):
+        original = app._run_publication_preflight_git
+        def create_after(executable, args, **kwargs):
+            result = original(executable, args, **kwargs)
+            if args[0] == "remote":
+                (self.repo / ".git" / "info" / "attributes").write_bytes(b"")
+            return result
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=create_after):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "info attributes"):
+                self.preflight()
+
+    def test_transient_filter_config_and_mutable_worktree_attrs_do_not_execute_driver(self):
+        marker, addition = self.filter_marker_config()
+        config = self.repo / ".git" / "config"
+        safe = config.read_bytes()
+        original = app._run_publication_preflight_git
+        statuses = []
+
+        def transient(executable, args, **kwargs):
+            if args[0] == "status":
+                config.write_bytes(safe + addition)
+                (self.repo / ".gitattributes").write_text("*.txt filter=evil\n", encoding="utf-8")
+                (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+                statuses.append(args)
+            return original(executable, args, **kwargs)
+
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=transient):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "clean worktree"):
+                self.preflight()
+        self.assertEqual(len(statuses), 1)
+        self.assertFalse(marker.exists())
+
+    def test_config_change_during_observation_blocks_even_with_same_effective_url(self):
+        path = self.repo / ".git" / "config"
+        config_raw_a = path.read_bytes()
+        config_raw_b = config_raw_a + b"\n# PF-01: same semantics, different exact bytes\n"
+        original = app._run_publication_preflight_git
+        observed_urls = []
+
+        def mutate(executable, args, **kwargs):
+            if args == ("remote", "get-url", "--push", "--all", "origin"):
+                path.write_bytes(config_raw_b)
+                output = original(executable, args, **kwargs)
+                observed_urls.append(output.decode().strip())
+                return output
+            return original(executable, args, **kwargs)
+
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=mutate):
+            with self.assertRaisesRegex(app.ControlledPublicationApprovalError, "Git config continuity mismatch"):
+                self.preflight()
+        self.assertEqual(observed_urls, [self.url])
+        self.assertEqual(path.read_bytes(), config_raw_b)
+
+    def test_config_disappears_after_last_git_observation_fails_closed(self):
+        path = self.repo / ".git" / "config"
+        original = app._run_publication_preflight_git
+        observed_urls = []
+
+        def remove_after_observation(executable, args, **kwargs):
+            output = original(executable, args, **kwargs)
+            if args == ("remote", "get-url", "--push", "--all", "origin"):
+                observed_urls.append(output.decode().strip())
+                path.unlink()
+            return output
+
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=remove_after_observation):
+            with self.assertRaises(app.ConfigError):
+                self.preflight()
+        self.assertEqual(observed_urls, [self.url])
+        self.assertFalse(path.exists())
+
+    def test_approval_first_and_generic_config_rejected_without_git(self):
+        from dataclasses import replace
+        for changes in ({"publication_authority_snapshot": self.authority.config},
+                        {"approval": replace(self.approval, task_packet_sha256=hashlib.sha256(b"wrong").hexdigest())},
+                        {"task_packet": replace(self.packet, authorized_actions=())}):
+            with self.subTest(changes=changes), mock.patch.object(subprocess, "run") as run:
+                with self.assertRaises(app.ControlledPublicationApprovalError):
+                    self.preflight(**changes)
+                run.assert_not_called()
+
+    def test_wrong_repo_and_redirected_root_block(self):
+        subdir = self.repo / "subdir"
+        subdir.mkdir()
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight(repo_path=subdir)
+        with mock.patch.object(evidence_mod, "_is_reparse_point", return_value=True), \
+                mock.patch.object(subprocess, "run") as run:
+            with self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+            run.assert_not_called()
+
+    def test_wrong_observed_root(self):
+        original = app._run_publication_preflight_git
+        def observed(executable, args, **kwargs):
+            if args == ("rev-parse", "--show-toplevel"):
+                return (str(self.root) + "\n").encode()
+            return original(executable, args, **kwargs)
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=observed):
+            with self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+
+    def test_detached_wrong_branch_and_wrong_final_head(self):
+        from dataclasses import replace
+        self.git("checkout", "--detach", self.head)
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("checkout", "-b", "task/other")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("checkout", "task/preflight")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight(approval=replace(self.approval, candidate_head_sha=hashlib.sha1(b"wrong").hexdigest()))
+
+    def test_dirty_modified_staged_deleted_and_untracked_block(self):
+        path = self.repo / "tracked.txt"
+        path.write_text("modified", encoding="utf-8")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("add", "tracked.txt")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("reset", "--hard", self.head)
+        path.unlink()
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("reset", "--hard", self.head)
+        (self.repo / "untracked.txt").write_text("untracked", encoding="utf-8")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+
+    def test_remote_absent_zero_multiple_and_wrong_url(self):
+        self.git("config", "--remove-section", "remote.origin")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("config", "remote.origin.url", "https://example.com/owner/wrong.git")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        self.git("config", "remote.origin.pushurl", self.url)
+        self.git("config", "--add", "remote.origin.pushurl", self.url)
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+        original = app._run_publication_preflight_git
+        def empty(executable, args, **kwargs):
+            return b"" if args[:2] == ("remote", "get-url") else original(executable, args, **kwargs)
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=empty):
+            with self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+
+    def test_pushurl_is_observed_instead_of_fetch_url(self):
+        self.git("config", "remote.origin.url", "https://example.com/owner/fetch.git")
+        self.git("config", "remote.origin.pushurl", self.url)
+        self.assertEqual(self.preflight().effective_push_url, self.url)
+
+    def test_insteadof_and_pushinsteadof_are_observed_by_git(self):
+        for setting in ("insteadOf", "pushInsteadOf"):
+            key = "url." + self.url + "." + setting
+            self.git("config", "remote.origin.url", "fixture-alias:repo")
+            self.git("config", key, "fixture-alias:repo")
+            result = self.preflight()
+            self.assertTrue(result.rewrite_present)
+            self.assertEqual(result.effective_push_url, self.url)
+            self.assertTrue(result.rewrite_entries)
+            self.git("config", "--unset", key)
+
+    def test_dangerous_push_settings_block(self):
+        for key, value in (("remote.origin.mirror", "true"), ("push.followTags", "true"),
+                           ("remote.origin.push", "refs/heads/*:refs/heads/*"),
+                           ("push.recurseSubmodules", "on-demand"), ("push.pushOption", "option"),
+                           ("push.gpgSign", "true")):
+            self.git("config", key, value)
+            with self.subTest(key=key), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+            self.git("config", "--unset", key)
+
+    def test_includes_and_worktree_config_block(self):
+        path = self.repo / ".git" / "config"
+        original = path.read_bytes()
+        for section in (b'\n[include]\n path = missing.conf\n',
+                        b'\n[includeIf "gitdir:never/"]\n path = missing.conf\n',
+                        b'\n[extensions]\n worktreeConfig = true\n'):
+            path.write_bytes(original + section)
+            with self.subTest(section=section), self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+        path.write_bytes(original)
+        (self.repo / ".git" / "config.worktree").write_bytes(b"")
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            self.preflight()
+
+    def test_hook_is_observed_never_executed(self):
+        hooks = self.repo / ".git" / "custom-hooks"
+        hooks.mkdir()
+        marker = self.repo / "hook-executed"
+        hook = hooks / "pre-push"
+        hook.write_text("#!/bin/sh\ntouch hook-executed\nexit 99\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", ".git/custom-hooks")
+        result = self.preflight()
+        self.assertTrue(result.pre_push_hook_present)
+        self.assertEqual(result.hooks_path, str(hooks))
+        self.assertFalse(marker.exists())
+
+    def test_environment_excludes_injected_git_configuration(self):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "elsewhere", "GIT_WORK_TREE": "elsewhere",
+                             "GIT_CONFIG_GLOBAL": "untrusted-global", "GIT_CONFIG_SYSTEM": "untrusted-system",
+                             "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "push.followTags",
+                             "GIT_CONFIG_VALUE_0": "true", "GIT_CONFIG_PARAMETERS": "bad"}):
+            env = app._publication_preflight_environment(self.empty_config)
+            self.assertNotIn("GIT_DIR", env)
+            self.assertNotIn("GIT_CONFIG_COUNT", env)
+            self.assertNotIn("GIT_CONFIG_PARAMETERS", env)
+            self.assertNotIn("GIT_CONFIG_SYSTEM", env)
+            self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(env["GIT_CONFIG_GLOBAL"], str(self.empty_config))
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertTrue(self.preflight().worktree_clean)
+
+    def test_filter_and_submodule_context_block_before_status(self):
+        self.git("config", "filter.untrusted.clean", "unapproved-command")
+        original = app._run_publication_preflight_git
+        with mock.patch.object(app, "_run_publication_preflight_git", wraps=original) as calls:
+            with self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+        self.assertFalse(any(call.args[1][0] == "status" for call in calls.call_args_list))
+        self.git("config", "--remove-section", "filter.untrusted")
+        def gitlink(executable, args, **kwargs):
+            if args == ("ls-files", "--stage", "-z"):
+                return ("160000 " + self.head + " 0\tmodule\0").encode()
+            if args[0] == "status":
+                self.fail("status must not enter a submodule")
+            return original(executable, args, **kwargs)
+        with mock.patch.object(app, "_run_publication_preflight_git", side_effect=gitlink):
+            with self.assertRaises(app.ControlledPublicationApprovalError):
+                self.preflight()
+
+    def test_allowlist_rejects_other_argv_before_subprocess(self):
+        with mock.patch.object(subprocess, "run") as run:
+            for args in (("push", "origin"), ("config", "push.followTags", "true"),
+                         ("remote", "set-url", "origin", self.url), ("status", "--short"),
+                         ("check-attr", "--all", "tracked.txt"),
+                         ("check-attr", "--stdin", "-z", "diff")):
+                with self.subTest(args=args), self.assertRaises(app.ControlledPublicationApprovalError):
+                    app._run_publication_preflight_git(self.git_executable, args, repo=self.repo,
+                                                      remote_name="origin", env=self.git_env)
+            run.assert_not_called()
+
+    def test_any_nonempty_status_blocks_including_rename_and_conflict(self):
+        original = app._run_publication_preflight_git
+        for status in (b"R  new\0old\0", b"UU tracked.txt\0", b"D  tracked.txt\0", b"?? new\0"):
+            def dirty(executable, args, **kwargs):
+                return status if args[0] == "status" else original(executable, args, **kwargs)
+            with self.subTest(status=status), mock.patch.object(app, "_run_publication_preflight_git", side_effect=dirty):
+                with self.assertRaises(app.ControlledPublicationApprovalError):
+                    self.preflight()
+
+    def test_nonregular_and_redirected_local_config_rejected_before_git(self):
+        path = self.repo / ".git" / "config"
+        raw = path.read_bytes()
+        path.unlink()
+        with mock.patch.object(subprocess, "run") as run:
+            with self.assertRaises(app.ConfigError):
+                self.preflight()
+            path.mkdir()
+            with self.assertRaises(app.ConfigError):
+                self.preflight()
+            path.rmdir()
+            path.write_bytes(raw)
+            real_lstat = Path.lstat
+            def redirected(candidate):
+                if candidate == path:
+                    return mock.Mock(st_mode=stat.S_IFREG, st_file_attributes=0x400)
+                return real_lstat(candidate)
+            with mock.patch.object(Path, "lstat", autospec=True, side_effect=redirected):
+                with self.assertRaises(app.ConfigError):
+                    self.preflight()
+            run.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

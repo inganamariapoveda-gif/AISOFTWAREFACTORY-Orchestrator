@@ -1,0 +1,216 @@
+name: Safe Test Runner Foundation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact candidate commit (40 lowercase hexadecimal characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  safe-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Validate trusted source and admission
+        id: preflight
+        env:
+          WORKFLOW_SOURCE_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          if [[ "$WORKFLOW_SOURCE_REF" != 'refs/heads/main' ]]; then
+            printf '%s\n' 'FAIL: workflow must be dispatched from main.'
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'FAIL: invalid candidate SHA.'
+            exit 1
+          fi
+          printf 'workflow source ref: %s\ncandidate SHA: %s\nrunner OS: %s\n' \
+            "$WORKFLOW_SOURCE_REF" "$CANDIDATE_SHA" "$RUNNER_OS"
+          # Director-approved literals; admission does not enable execution.
+          readonly SAFE_TEST_IMAGE="docker.io/library/python@sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
+          readonly SAFE_TEST_PLATFORM="linux/amd64"
+          readonly SAFE_TEST_PYTHON_VERSION="3.14.8"
+          readonly SAFE_TEST_EXECUTION_ENABLED=false
+          if [[ "$SAFE_TEST_IMAGE" != 'docker.io/library/python@sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf' ]] ||
+             [[ "$SAFE_TEST_PLATFORM" != 'linux/amd64' ]] ||
+             [[ "$SAFE_TEST_PYTHON_VERSION" != '3.14.8' ]]; then
+            printf '%s\n' 'FAIL: image admission contract mismatch.'
+            exit 1
+          fi
+          if [[ "$SAFE_TEST_EXECUTION_ENABLED" != 'true' ]]; then
+            printf '%s\n' 'STATICALLY ADMITTED; EXECUTION INTENTIONALLY DISABLED'
+            exit 1
+          fi
+          printf 'candidate_sha=%s\nimage=%s\n' "$CANDIDATE_SHA" "$SAFE_TEST_IMAGE" >> "$GITHUB_OUTPUT"
+          printf 'platform=%s\npython_version=%s\n' "$SAFE_TEST_PLATFORM" "$SAFE_TEST_PYTHON_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare admitted image
+        env:
+          SAFE_TEST_IMAGE: ${{ steps.preflight.outputs.image }}
+          SAFE_TEST_PLATFORM: ${{ steps.preflight.outputs.platform }}
+          SAFE_TEST_PYTHON_VERSION: ${{ steps.preflight.outputs.python_version }}
+        run: |
+          # Trusted preparation may use network; candidate is never run here.
+          if ! docker pull --quiet --platform "$SAFE_TEST_PLATFORM" "$SAFE_TEST_IMAGE" > /dev/null 2>&1; then
+            printf '%s\n' 'FAIL: admitted image unavailable.'
+            exit 1
+          fi
+          inspect_field() {
+            docker image inspect --format "$1" "$SAFE_TEST_IMAGE" 2>/dev/null
+          }
+          if ! image_os=$(inspect_field '{{json .Os}}') ||
+             ! image_arch=$(inspect_field '{{json .Architecture}}') ||
+             ! image_entrypoint=$(inspect_field '{{json .Config.Entrypoint}}') ||
+             ! image_cmd=$(inspect_field '{{json .Config.Cmd}}') ||
+             ! image_user=$(inspect_field '{{json .Config.User}}') ||
+             ! image_workdir=$(inspect_field '{{json .Config.WorkingDir}}') ||
+             ! image_volumes=$(inspect_field '{{json .Config.Volumes}}') ||
+             ! image_healthcheck=$(inspect_field '{{json (index .Config "Healthcheck")}}') ||
+             ! image_env=$(inspect_field '{{range .Config.Env}}{{println .}}{{end}}'); then
+            printf '%s\n' 'FAIL: image metadata inspection unavailable.'
+            exit 1
+          fi
+          if [[ "$image_os" != '"linux"' || "$image_arch" != '"amd64"' ||
+                ( "$image_entrypoint" != 'null' && "$image_entrypoint" != '[]' ) ||
+                "$image_cmd" != '["python3"]' || "$image_user" != '""' ||
+                "$image_workdir" != '""' || "$image_healthcheck" != 'null' ||
+                ( "$image_volumes" != 'null' && "$image_volumes" != '{}' ) ]]; then
+            printf '%s\n' 'FAIL: unexpected image metadata.'
+            exit 1
+          fi
+          version_entries=0
+          while IFS= read -r entry; do
+            if [[ "$entry" != *=* ]]; then
+              printf '%s\n' 'FAIL: malformed image environment.'
+              exit 1
+            fi
+            env_name=${entry%%=*}
+            case "${env_name^^}" in
+              GITHUB_*|ACTIONS_*|AWS_*|AZURE_*|GOOGLE_*|SSH_*|DOCKER_AUTH_CONFIG|*TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*|*API_KEY*|*PRIVATE_KEY*)
+                printf '%s\n' 'FAIL: credential-like image environment.'
+                exit 1
+                ;;
+            esac
+            if [[ "$env_name" == 'PYTHON_VERSION' ]]; then
+              if [[ "$entry" != "PYTHON_VERSION=$SAFE_TEST_PYTHON_VERSION" ]]; then
+                printf '%s\n' 'FAIL: unexpected image Python version.'
+                exit 1
+              fi
+              version_entries=$((version_entries + 1))
+            fi
+          done <<< "$image_env"
+          if [[ "$version_entries" -ne 1 ]]; then
+            printf '%s\n' 'FAIL: missing or duplicate image Python version.'
+            exit 1
+          fi
+
+      - name: Checkout exact candidate as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.preflight.outputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+          show-progress: false
+
+      - name: Future contained critical suite
+        env:
+          SAFE_TEST_IMAGE: ${{ steps.preflight.outputs.image }}
+        run: |
+          # Unreachable while execution is disabled. Never source candidate files.
+          readonly CONTAINER_NAME="safe-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RESULT_FILE="$(mktemp "$RUNNER_TEMP/safe-test-result.XXXXXXXX")"
+          readonly RESULT_FILE
+          cleanup() {
+            local original_exit=$?
+            trap - EXIT
+            trap '' INT TERM
+            local cleanup_failed=0 remaining
+            timeout --kill-after=5s 10s docker rm --force "$CONTAINER_NAME" > /dev/null 2>&1 || true
+            if remaining=$(timeout --kill-after=5s 10s docker container ls --all \
+              --filter "name=^/${CONTAINER_NAME}$" --format '{{.ID}}' 2>/dev/null); then
+              if [[ -n "$remaining" ]]; then
+                cleanup_failed=1
+              fi
+            else
+              cleanup_failed=1
+            fi
+            if ! rm -f -- "$RESULT_FILE"; then
+              cleanup_failed=1
+            fi
+            if [[ "$cleanup_failed" -ne 0 ]]; then
+              printf '%s\n' 'FAIL: cleanup absence could not be established.'
+            fi
+            if [[ "$original_exit" -ne 0 ]]; then
+              exit "$original_exit"
+            fi
+            exit "$cleanup_failed"
+          }
+          trap cleanup EXIT
+          trap 'exit 1' INT TERM
+          printf '%s\n' 'isolation: network=none rootfs=ro candidate=ro uid=65534 gid=65534 caps=none no-new-privileges' \
+            'limits: cpus=2 memory=1GiB pids=128 tmpfs=128MiB shm=16MiB output=1MiB job=15min'
+          readonly OUTPUT_LIMIT_BYTES=1048576
+          exit_code=0
+          prlimit --fsize="${OUTPUT_LIMIT_BYTES}:${OUTPUT_LIMIT_BYTES}" \
+            timeout --signal=TERM --kill-after=10s 10m docker run \
+            --name "$CONTAINER_NAME" \
+            --init \
+            --log-driver none \
+            --rm \
+            --pull never \
+            --platform linux/amd64 \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --user 65534:65534 \
+            --pids-limit 128 \
+            --memory 1g \
+            --memory-swap 1g \
+            --cpus 2 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777 \
+            --tmpfs /dev/shm:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/candidate,target=/candidate,readonly" \
+            --workdir /candidate \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --entrypoint "" \
+            "$SAFE_TEST_IMAGE" python -B -m unittest tests.test_integrity_gate -v \
+            > "$RESULT_FILE" 2>&1 || exit_code=$?
+          printf 'exit code: %s\n' "$exit_code"
+          if [[ "$exit_code" -ne 0 ]]; then
+            printf '%s\n' 'contract/result signal: FAIL (nonzero exit or timeout)'
+            exit "$exit_code"
+          fi
+          # Reject even an exact-boundary result if the client ignored EFBIG.
+          output_bytes=$(stat --format=%s -- "$RESULT_FILE")
+          if [[ ! "$output_bytes" =~ ^[0-9]+$ ]] || (( output_bytes >= OUTPUT_LIMIT_BYTES )); then
+            printf '%s\n' 'contract/result signal: FAIL (output quota reached or invalid size)'
+            exit 1
+          fi
+          # Treat output only as data; never emit raw candidate output to Actions.
+          # This detects accidental skips, not deliberately forged test evidence.
+          if ! LC_ALL=C awk '
+            / \.\.\. ok$/ { passed++ }
+            /^Ran 71 tests in [0-9]+([.][0-9]+)?s$/ { summaries++ }
+            /^OK$/ { successes++ }
+            / \.\.\. (FAIL|ERROR|skipped|expected failure|unexpected success)/ { rejected++ }
+            /^FAILED|^OK \(/ { rejected++ }
+            END { exit !(passed == 71 && summaries == 1 && successes == 1 && rejected == 0) }
+          ' "$RESULT_FILE"; then
+            printf '%s\n' 'contract/result signal: FAIL (missing or inconsistent candidate-reported output)'
+            exit 1
+          fi
+          printf '%s\n' 'candidate-reported test summary (UNVERIFIED): tests=71 failures=0 errors=0 skips=0' \
+            'contract/result signal only: NO technical approval; NO security approval'
