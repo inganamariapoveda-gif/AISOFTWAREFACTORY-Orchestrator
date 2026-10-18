@@ -8,6 +8,7 @@ IMPLEMENTATION-001: authored for independent review, NOT RUN by Builder.
 
 from pathlib import Path
 from collections import Counter
+import ast
 import hashlib
 import re
 import stat
@@ -18,7 +19,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/safe-test-ru
 # Identity only, never execution approval. Updating workflow and digest together
 # cannot self-authorize a change; the governance review gates still apply.
 APPROVED_SAFE_RUNNER_CANONICAL_SHA256 = (
-    "f080bc0e6f1bf4de4bb0d858ea77013b52e0571ec977ae68fc5c78e36e6fe024"
+    "9344fcd07b886f5713b0d31d9674058f9484b8d0ed4fbf031e9d3908972f621f"
 )
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 IMAGE_DIGEST = "a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
@@ -174,7 +175,7 @@ class SafeTestRunnerContractTests(unittest.TestCase):
         cls.trigger = cls.text.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
         cls.preflight = cls.text.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
         cls.checkout = cls.text.split("        with:\n", 1)[1].split("\n      - name:", 1)[0]
-        cls.execution = cls.text.split("      - name: Future contained critical suite\n", 1)[1]
+        cls.execution = cls.text.split("      - name: Contained Safe Runner smoke payload\n", 1)[1]
         cls.preparation = cls.text.split("      - name: Prepare admitted image\n", 1)[1].split("      - name: Checkout exact candidate as data", 1)[0]
         cls.docker = cls.execution.split("10m docker run \\\n", 1)[1].split('> "$RESULT_FILE"', 1)[0]
 
@@ -355,17 +356,35 @@ class SafeTestRunnerContractTests(unittest.TestCase):
 
     def test_fixed_test_command_and_entrypoint(self):
         self.assertIn('--entrypoint "" \\\n', self.docker)
-        self.assertIn('"$SAFE_TEST_IMAGE" python -B -m unittest tests.test_integrity_gate -v \\\n', self.docker)
+        self.assertIn('"$SAFE_TEST_IMAGE" python -B -m unittest tests.test_safe_runner_smoke -v \\\n', self.docker)
         self.assertIn("--workdir /candidate \\\n", self.docker)
 
-    def test_exactly_71_tests_required(self):
-        self.assertIn("/^Ran 71 tests in [0-9]+([.][0-9]+)?s$/ { summaries++ }", self.execution)
-        self.assertIn("passed == 71 && summaries == 1 && successes == 1 && rejected == 0", self.execution)
+    def test_exactly_three_smoke_tests_required(self):
+        self.assertIn("/^Ran 3 tests in [0-9]+([.][0-9]+)?s$/ { summaries++ }", self.execution)
+        self.assertIn("passed == 3 && summaries == 1 && successes == 1 && rejected == 0", self.execution)
+
+    def test_nonexistent_integrity_gate_command_is_forbidden(self):
+        self.assertNotIn("tests.test_integrity_gate", self.text)
+
+    def test_smoke_payload_is_regular_file_with_exact_test_count(self):
+        smoke = Path(__file__).resolve().parent / "test_safe_runner_smoke.py"
+        self.assertTrue(stat.S_ISREG(smoke.lstat().st_mode))
+        self.assertFalse(smoke.is_symlink())
+        module = ast.parse(smoke.read_text(encoding="utf-8"))
+        classes = [node for node in module.body if isinstance(node, ast.ClassDef)]
+        self.assertEqual(len(classes), 1)
+        self.assertEqual(classes[0].name, "SafeRunnerSmokeTests")
+        self.assertEqual(
+            [node.name for node in classes[0].body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name.startswith("test")],
+            ["test_integer_arithmetic", "test_utf8_round_trip", "test_json_round_trip"],
+        )
 
     def test_zero_skips_failures_and_errors(self):
         self.assertIn("(FAIL|ERROR|skipped|expected failure|unexpected success)", self.execution)
         self.assertIn("/^FAILED|^OK \\(/ { rejected++ }", self.execution)
-        self.assertIn("candidate-reported test summary (UNVERIFIED): tests=71 failures=0 errors=0 skips=0", self.execution)
+        self.assertIn("candidate-reported test summary (UNVERIFIED): tests=3 failures=0 errors=0 skips=0", self.execution)
 
     def test_nonzero_exit_fails(self):
         self.assertIn('> "$RESULT_FILE" 2>&1 || exit_code=$?', self.execution)
@@ -375,7 +394,7 @@ class SafeTestRunnerContractTests(unittest.TestCase):
 
     def test_summary_rejection_fails(self):
         self.assertIn("if ! LC_ALL=C awk '", self.execution)
-        self.assertIn("END { exit !(passed == 71", self.execution)
+        self.assertIn("END { exit !(passed == 3", self.execution)
         self.assertIn("' \"$RESULT_FILE\"; then\n"
                       "            printf '%s\\n' 'contract/result signal: FAIL (missing or inconsistent candidate-reported output)'\n"
                       "            exit 1\n          fi", self.execution)
@@ -399,7 +418,7 @@ class SafeTestRunnerContractTests(unittest.TestCase):
 
     def test_no_candidate_execution_on_host(self):
         # The only interpreter command is an argument to the fixed Docker call.
-        self.assertEqual(self.text.count("python -B -m unittest tests.test_integrity_gate -v"), 1)
+        self.assertEqual(self.text.count("python -B -m unittest tests.test_safe_runner_smoke -v"), 1)
         self.assertNotRegex(self.text, r"(?m)^\s*(?:python\d*|bash|sh|pwsh|node|make)\s")
         self.assertNotRegex(self.text, r"(?m)^\s*(?:source\s|\.\s|eval\s|exec\s|cd\s|\./)")
         self.assertNotRegex(self.text, r"docker\s+(?:build|compose)|uses:\s*\./|working-directory:")
@@ -615,7 +634,7 @@ class SafeTestRunnerContractTests(unittest.TestCase):
                       "            exit 1", self.preparation)
 
     def test_runtime_image_and_platform_are_fixed(self):
-        self.assertIn('"$SAFE_TEST_IMAGE" python -B -m unittest tests.test_integrity_gate -v', self.docker)
+        self.assertIn('"$SAFE_TEST_IMAGE" python -B -m unittest tests.test_safe_runner_smoke -v', self.docker)
         self.assertEqual(re.findall(r"--platform\s+(\S+)", self.docker), ["linux/amd64"])
         self.assertIn("--pull never", self.docker)
 

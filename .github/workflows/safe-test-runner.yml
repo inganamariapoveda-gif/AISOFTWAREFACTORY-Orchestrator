@@ -124,7 +124,7 @@ jobs:
           lfs: false
           show-progress: false
 
-      - name: Future contained critical suite
+      - name: Contained Safe Runner smoke payload
         env:
           SAFE_TEST_IMAGE: ${{ steps.preflight.outputs.image }}
         run: |
@@ -186,7 +186,7 @@ jobs:
             --workdir /candidate \
             --env PYTHONDONTWRITEBYTECODE=1 \
             --entrypoint "" \
-            "$SAFE_TEST_IMAGE" python -B -m unittest tests.test_integrity_gate -v \
+            "$SAFE_TEST_IMAGE" python -B -m unittest tests.test_safe_runner_smoke -v \
             > "$RESULT_FILE" 2>&1 || exit_code=$?
           printf 'exit code: %s\n' "$exit_code"
           if [[ "$exit_code" -ne 0 ]]; then
@@ -203,14 +203,14 @@ jobs:
           # This detects accidental skips, not deliberately forged test evidence.
           if ! LC_ALL=C awk '
             / \.\.\. ok$/ { passed++ }
-            /^Ran 71 tests in [0-9]+([.][0-9]+)?s$/ { summaries++ }
+            /^Ran 3 tests in [0-9]+([.][0-9]+)?s$/ { summaries++ }
             /^OK$/ { successes++ }
             / \.\.\. (FAIL|ERROR|skipped|expected failure|unexpected success)/ { rejected++ }
             /^FAILED|^OK \(/ { rejected++ }
-            END { exit !(passed == 71 && summaries == 1 && successes == 1 && rejected == 0) }
+            END { exit !(passed == 3 && summaries == 1 && successes == 1 && rejected == 0) }
           ' "$RESULT_FILE"; then
             printf '%s\n' 'contract/result signal: FAIL (missing or inconsistent candidate-reported output)'
             exit 1
           fi
-          printf '%s\n' 'candidate-reported test summary (UNVERIFIED): tests=71 failures=0 errors=0 skips=0' \
+          printf '%s\n' 'candidate-reported test summary (UNVERIFIED): tests=3 failures=0 errors=0 skips=0' \
             'contract/result signal only: NO technical approval; NO security approval'
