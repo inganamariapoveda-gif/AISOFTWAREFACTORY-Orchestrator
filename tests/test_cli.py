@@ -1065,7 +1065,7 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
     @contextlib.contextmanager
-    def patched_subprocess(self, *, developer=None, test=None):
+    def patched_subprocess(self, *, developer=None, test=None, real_backend_port=False):
         """Historical reporting/review fixture with synthetic isolated results.
 
         Builder, engine Git and exact read-only schtasks queries use the dispatcher.
@@ -1075,7 +1075,7 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
         """
         delegate_run = subprocess.run
 
-        def synthetic_result(test_id, *, project_commands, globally_allowed_ids, cwd, timeout):
+        def synthetic_result(test_id, *, project_commands, globally_allowed_ids, cwd, timeout, backend=None):
             resolved = app.test_runner_mod.resolve_mandatory_test(
                 test_id, project_commands=project_commands,
                 globally_allowed_ids=globally_allowed_ids,
@@ -1114,11 +1114,11 @@ class TaskExecutionProbeTestCase(CliFixtureTestCase):
 
         with mock.patch("shutil.which", side_effect=fake_which), mock.patch(
             "subprocess.run", side_effect=fake_run
-        ), mock.patch.object(
+        ), (contextlib.nullcontext() if real_backend_port else mock.patch.object(
             app.test_runner_mod, "require_isolated_mandatory_test_backend", return_value=None
-        ), mock.patch.object(
+        )), (contextlib.nullcontext() if real_backend_port else mock.patch.object(
             app.test_runner_mod, "run_mandatory_test", side_effect=synthetic_result
-        ):
+        )):
             yield
 
     def run_task_execution_probe(self) -> tuple[int, str]:
@@ -7434,6 +7434,82 @@ class ControlledPublicationGitPreflightTests(CliFixtureTestCase):
                 with self.assertRaises(app.ConfigError):
                     self.preflight()
             run.assert_not_called()
+
+
+class IsolatedBackendCoreTests(TaskExecutionProbeTestCase):
+    """Real core/port with an injected fake; no CLI backend installation."""
+
+    def execute_core(self, backend):
+        config = config_loader_mod.load_core_config(self.config_dir)
+        packet = task_packet_mod.load_task_packet_from_yaml_file(self.taskexec_packet_path)
+        rules = config_loader_mod.load_project_rules(
+            self.projects_dir / "TASKEXEC" / "PROJECT_RULES.yaml")
+        with self.patched_subprocess(
+            developer=self._developer_writes_allowed_only, real_backend_port=True,
+        ), mock.patch.object(evidence_mod, "capture_change_evidence",
+                             wraps=evidence_mod.capture_change_evidence) as evidence:
+            result = app.execute_task_packet(
+                packet, project_rules=rules,
+                developer_config=app.resolve_builder(config.agents)[1],
+                permissions=config.permissions, agent_roster=config.agents,
+                orchestrator_repo_root=self.root, mandatory_test_timeout=30,
+                mandatory_test_backend=backend,
+            )
+        self.assertEqual(evidence.call_count, 2)
+        self.assertIs(evidence.call_args_list[0].args[0], evidence.call_args_list[1].args[0])
+        self._assert_test_result_shape(result)
+        self._assert_no_test_output_leak(json.dumps(result))
+        return result
+
+    def backend(self, *, code=0, error=False):
+        backend = mock.Mock()
+
+        def execute(resolved, *, cwd, timeout):
+            self.assertEqual((Path(cwd) / "allowed.txt").read_text(), "AFTER")
+            self.assertEqual(timeout, 30)
+            if error:
+                raise RuntimeError(self._EXC_MARKER)
+            return app.test_runner_mod.ExternalTestOutcome(
+                resolved.test_id, resolved.argv, code == 0, code,
+                self._STDOUT_MARKER, self._STDERR_MARKER,
+            )
+
+        backend.execute.side_effect = execute
+        return backend
+
+    def test_pass_reaches_human_gate_with_original_evidence(self):
+        backend = self.backend()
+        result = self.execute_core(backend)
+        self.assertEqual(result["state"], "HUMAN_GATE")
+        self.assertEqual(result["human_gate"], "HUMAN_FUNCTIONAL_TEST")
+        self.assertTrue(result["pre_test_evidence_passed"])
+        self.assertTrue(result["post_test_evidence_passed"])
+        self.assertFalse(result["commit_performed"])
+        self.assertEqual(result["mandatory_test_results"],
+                         [{"test_id": "unit", "result": "PASS", "exit_code": 0}])
+        backend.execute.assert_called_once()
+
+    def test_failure_stops_at_first_test(self):
+        self._configure_test_commands(["unit", "lint"])
+        self._write_taskexec_packet(mandatory_tests=["unit", "lint"])
+        backend = self.backend(code=2)
+        result = self.execute_core(backend)
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["mandatory_test_results"],
+                         [{"test_id": "unit", "result": "FAIL", "exit_code": 2}])
+        backend.execute.assert_called_once()
+
+    def test_backend_error_is_blocked_without_leaking_exception(self):
+        backend = self.backend(error=True)
+        result = self.execute_core(backend)
+        self.assertEqual(result["state"], "BLOCKED")
+        self.assertEqual(result["mandatory_test_results"],
+                         [{"test_id": "unit", "result": "ERROR", "exit_code": None}])
+
+    def test_backend_parameter_is_optional_keyword_only(self):
+        parameter = inspect.signature(app.execute_task_packet).parameters["mandatory_test_backend"]
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
 
 
 if __name__ == "__main__":
