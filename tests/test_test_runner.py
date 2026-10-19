@@ -1,6 +1,7 @@
 """Resolution-only contract: project argv never becomes a host subprocess."""
 
 import inspect
+from dataclasses import replace
 import sys
 import unittest
 from pathlib import Path
@@ -108,6 +109,76 @@ class ResolveMandatoryTestTests(unittest.TestCase):
             self.assertNotIn("allow_local", inspect.signature(function).parameters)
         with self.assertRaisesRegex(TestRunnerError, ISOLATED_BACKEND_UNAVAILABLE):
             test_runner.require_isolated_mandatory_test_backend()
+
+
+class IsolatedBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.outcome = test_runner.ExternalTestOutcome(
+            "unit", ("python", "verify_task.py"), True, 0, "private out", "private err",
+        )
+        self.backend = mock.Mock()
+        self.backend.execute.return_value = self.outcome
+
+    def run_test(self, **overrides):
+        args = dict(test_id="unit", project_commands={"unit": ["python", "verify_task.py"]},
+                    globally_allowed_ids=["unit"], cwd=REPO_ROOT, timeout=30,
+                    backend=self.backend)
+        args.update(overrides)
+        return run_mandatory_test(**args)
+
+    def test_absent_backend(self):
+        with self.assertRaisesRegex(TestRunnerError, ISOLATED_BACKEND_UNAVAILABLE):
+            self.run_test(backend=None)
+
+    def test_admission_only_checks_presence_and_shape(self):
+        test_runner.require_isolated_mandatory_test_backend(self.backend)
+        self.backend.execute.assert_not_called()
+        for backend in (object(), {"execute": "command"}):
+            with self.subTest(backend=backend), self.assertRaises(TestRunnerError):
+                self.run_test(backend=backend)
+
+    def test_resolution_precedes_backend(self):
+        for overrides in ({"test_id": "unit;evil"}, {"globally_allowed_ids": []},
+                          {"project_commands": {}}, {"project_commands": {"unit": []}}):
+            with self.subTest(overrides=overrides), self.assertRaises(TestRunnerError):
+                self.run_test(**overrides)
+        self.backend.execute.assert_not_called()
+
+    def test_pass_exact_data_without_local_execution(self):
+        with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
+            result = self.run_test()
+        self.backend.execute.assert_called_once_with(
+            ResolvedMandatoryTest("unit", ("python", "verify_task.py")),
+            cwd=REPO_ROOT, timeout=30,
+        )
+        self.assertIsInstance(result, test_runner.TestResult)
+        self.assertTrue(result.success)
+        self.assertEqual(result.exit_code, 0)
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_valid_failure(self):
+        self.backend.execute.return_value = replace(self.outcome, success=False, exit_code=2)
+        result = self.run_test()
+        self.assertFalse(result.success)
+        self.assertEqual(result.exit_code, 2)
+
+    def test_malformed_outcomes_fail_closed(self):
+        changes = [dict(test_id="lint"), dict(test_id=1), dict(argv=("evil",)),
+                   dict(argv=list(self.outcome.argv)), dict(argv=(1,)),
+                   dict(success=1), dict(success="true"), dict(exit_code=True),
+                   dict(exit_code="0"), dict(exit_code=0.0), dict(exit_code=1),
+                   dict(success=False, exit_code=0), dict(stdout=None), dict(stderr=b"err")]
+        for outcome in [None, {}, "PASS", *[replace(self.outcome, **c) for c in changes]]:
+            with self.subTest(outcome=outcome), self.assertRaises(TestRunnerError):
+                self.backend.execute.return_value = outcome
+                self.run_test()
+
+    def test_backend_exception_is_sanitized(self):
+        self.backend.execute.side_effect = RuntimeError("SECRET")
+        with self.assertRaises(TestRunnerError) as error:
+            self.run_test()
+        self.assertNotIn("SECRET", str(error.exception))
 
 
 if __name__ == "__main__":

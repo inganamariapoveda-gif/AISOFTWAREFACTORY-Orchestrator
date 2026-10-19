@@ -661,6 +661,7 @@ def execute_task_packet(
     permissions: dict[str, Any],
     orchestrator_repo_root: Path,
     mandatory_test_timeout: int,
+    mandatory_test_backend: test_runner_mod.IsolatedTestBackend | None = None,
     before: evidence_mod.GitEvidenceSnapshot | None = None,
     resume: bool = False,
     capacity_hook: Callable[[CapacityFailure], dict[str, Any] | None] | None = None,
@@ -672,20 +673,19 @@ def execute_task_packet(
 
         TaskPacket -> project authorization -> command data resolution ->
         isolated backend required if mandatory_tests is nonempty ->
-        BLOCKED before Builder (no isolated backend integrated).
+        BLOCKED before Builder when no engine-injected backend is available.
 
     With no mandatory tests, Builder/evidence/review controls remain in force.
-    The downstream test-result reporting contract is retained for later isolated
-    integration and synthetic fixtures; it cannot execute project commands.
+    The injected port returns validated results; it provides no local executor.
 
     -- SIN commit automático. Función determinista dado el mismo estado
     externo (Git real, subprocess mockeado en pruebas); NUNCA invoca
     git add/commit/reset/checkout/clean, NUNCA revierte nada. Claude nunca
     es autoridad sobre éxito (D-EXEC-002): Git Evidence y scope validation
     siguen siendo obligatorios. El contrato histórico de resultados de tests
-    se conserva para reporting sintético y futura integración aislada;
-    test_runner_mod solo resuelve/valida datos y rechaza ejecución local.
-    Mandatory tests no vacíos bloquean antes del Builder, nunca se aceptan
+    recibe resultados validados del port aislado;
+    test_runner_mod resuelve/valida datos y rechaza ejecución local.
+    Sin backend, mandatory tests bloquean antes del Builder, nunca se aceptan
     como evidencia la narrativa de run_developer_task() ni IDs autorizados.
 
     Cualquier fallo (repo sucio, developer con timeout/resultado
@@ -798,7 +798,7 @@ def execute_task_packet(
         return _blocked("local model execution preflight failed")
     if packet.mandatory_tests:
         try:
-            test_runner_mod.require_isolated_mandatory_test_backend()
+            test_runner_mod.require_isolated_mandatory_test_backend(mandatory_test_backend)
         except test_runner_mod.TestRunnerError:
             return _blocked(test_runner_mod.ISOLATED_BACKEND_UNAVAILABLE)
     if budget_store is not None:
@@ -962,7 +962,7 @@ def execute_task_packet(
             **common_fields,
         )
 
-    # 12-14. Contrato histórico de reporting, cubierto con resultados sintéticos.
+    # 12-14. Execute only through the engine-injected isolated backend port.
     # Sin backend aislado, mandatory tests no vacíos ya bloquearon antes del Builder;
     # run_mandatory_test también rechaza ejecución local en su API compatible.
     # PRE-TEST pasó; POST-TEST sigue pendiente. REPORTING-001 acumula resultados
@@ -980,6 +980,7 @@ def execute_task_packet(
                 globally_allowed_ids=permissions["allowed_commands"],
                 cwd=project_root,
                 timeout=mandatory_test_timeout,
+                backend=mandatory_test_backend,
             )
         except test_runner_mod.TestRunnerError as exc:
             mandatory_test_results.append(
@@ -998,7 +999,7 @@ def execute_task_packet(
             mandatory_failure_reason = f"mandatory test {test_id!r} failed"
             break
 
-    # Historical/synthetic reporting: inspect even after failure or handled error.
+    # Inspect evidence even after backend failure or handled error.
     # This retained evidence contract does not authorize local test execution.
     try:
         protected_after_tests = _capture_protected_paths(project_root, project_rules["protected_paths"])
@@ -1064,8 +1065,7 @@ def execute_task_packet(
         )
 
     # 15-18. Retained review contract: PRE-TEST + results + POST-TEST must pass.
-    # Nonempty mandatory tests reach this only in synthetic reporting fixtures
-    # until isolated integration; empty mandatory tests keep the existing flow.
+    # Backend results do not bypass evidence checks or the existing Human Gate.
     # HUMAN_GATE/HUMAN_FUNCTIONAL_TEST -> STOP. Nunca commit.
     return {
         "task_id": packet.task_id,
