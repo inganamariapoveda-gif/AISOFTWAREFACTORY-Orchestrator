@@ -1701,5 +1701,43 @@ class PublicationAuthorityFoundationTests(unittest.TestCase):
                 require_controlled_publication_authority(invalid)
 
 
+class SafeTestBackendPolicyTests(unittest.TestCase):
+    def load_policy(self, data):
+        from orchestrator.config_loader import load_policies_from_yaml_bytes
+        return load_policies_from_yaml_bytes(yaml.safe_dump(data).encode("utf-8"), "POLICIES.yaml")
+
+    def test_canonical_policy_and_legacy_absence(self):
+        from orchestrator.config_loader import validate_safe_test_backend
+        policy = yaml.safe_load((CONFIG_DIR / "POLICIES.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(self.load_policy(policy)["safe_test_backend"]["activation"], "disabled")
+        del policy["safe_test_backend"]
+        self.assertIsNone(validate_safe_test_backend(self.load_policy(policy)))
+
+    def test_migration_must_cannot_be_weakened(self):
+        for key, value in (("mvp", "other"), ("production_required", "optional"),
+                           ("github_app_required_before", []), ("token", "SENTINEL")):
+            data = yaml.safe_load((CONFIG_DIR / "POLICIES.yaml").read_text(encoding="utf-8"))
+            data["safe_test_backend"]["credential_strategy"][key] = value
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                self.load_policy(data)
+
+    def test_closed_policy_rejects_partial_enabled_and_extra_fields(self):
+        for block in (None, {}, {"activation": "enabled"}):
+            data = _baseline_policies()
+            data["safe_test_backend"] = block
+            with self.subTest(block=block), self.assertRaises(ConfigError):
+                self.load_policy(data)
+        data = yaml.safe_load((CONFIG_DIR / "POLICIES.yaml").read_text(encoding="utf-8"))
+        data["safe_test_backend"]["activation"] = "enabled"
+        with self.assertRaises(ConfigError):
+            self.load_policy(data)
+
+    def test_credential_exception_is_exact_path_only(self):
+        data = _baseline_policies()
+        data["credential_strategy"] = {"mvp": "fine_grained_pat_dpapi"}
+        with self.assertRaises(ConfigError):
+            self.load_policy(data)
+
+
 if __name__ == "__main__":
     unittest.main()

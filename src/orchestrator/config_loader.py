@@ -113,6 +113,10 @@ def _reject_secrets(node: Any, path: Path, trail: str = "") -> None:
         for key, value in node.items():
             key_str = str(key)
             location = f"{trail}.{key_str}" if trail else key_str
+            if location == "safe_test_backend.credential_strategy":
+                # Only these exact declarative values are exempt; never secrets.
+                _validate_safe_test_credential_strategy(value)
+                continue
             if SECRET_KEY_PATTERN.search(key_str) and not isinstance(value, bool):
                 raise ConfigError(
                     f"potential secret key '{location}' found in {path}; "
@@ -140,6 +144,7 @@ def _require_true(data: dict[str, Any], dotted_path: str, path: Path) -> None:
 
 
 def _validate_policies(data: dict[str, Any], path: Path) -> None:
+    validate_safe_test_backend(data)
     validate_resource_budget(data)
     _require_true(data, "prohibitions.production", path)
     _require_true(data, "prohibitions.uncontrolled_git_push", path)
@@ -180,6 +185,44 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
             f"'classification.on_unclassified' must be {REQUIRED_ON_UNCLASSIFIED!r} "
             f"in {path}"
         )
+
+
+def _validate_safe_test_credential_strategy(value: Any) -> None:
+    expected = {
+        "mvp": "fine_grained_pat_dpapi",
+        "production_required": "github_app_installation_token",
+        "github_app_required_before": [
+            "production", "multi_client", "commercial_external_customer",
+        ],
+    }
+    if type(value) is not dict or value != expected:
+        raise ConfigError("invalid safe test credential migration policy")
+
+
+def validate_safe_test_backend(policies: dict[str, Any]) -> dict[str, Any] | None:
+    """Absent means unavailable; present configuration is closed and disabled.
+
+    Credential strategy is metadata, never a credential or execution authority.
+    """
+    if "safe_test_backend" not in policies:
+        return None
+    block = _closed_mapping(policies["safe_test_backend"],
+                            {"provider", "activation", "credential_strategy", "github"},
+                            "safe_test_backend")
+    if block["provider"] != "github_actions" or block["activation"] != "disabled":
+        raise ConfigError("safe test backend must be github_actions and disabled")
+    _validate_safe_test_credential_strategy(block["credential_strategy"])
+    github = _closed_mapping(block["github"],
+                             {"repository", "workflow_id", "workflow_ref", "api_version", "return_run_details"},
+                             "safe_test_backend.github")
+    expected = {
+        "repository": "inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator",
+        "workflow_id": "safe-test-runner.yml", "workflow_ref": "main",
+        "api_version": "2026-03-10", "return_run_details": True,
+    }
+    if github != expected or github["return_run_details"] is not True:
+        raise ConfigError("invalid safe test GitHub control-plane contract")
+    return block
 
 
 RESOURCE_LIMIT_KEYS = frozenset({
