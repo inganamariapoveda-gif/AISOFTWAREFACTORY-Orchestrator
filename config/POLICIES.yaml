@@ -33,6 +33,25 @@ classification:
 # ejecución en vez de continuar con un comportamiento permisivo (§10).
 fail_closed: true
 
+# fine_grained_pat_dpapi is MVP-only. github_app_installation_token MUST
+# replace it before production, multi-client operation or commercial customers.
+safe_test_backend:
+  provider: github_actions
+  activation: disabled
+  credential_strategy:
+    mvp: fine_grained_pat_dpapi
+    production_required: github_app_installation_token
+    github_app_required_before:
+      - production
+      - multi_client
+      - commercial_external_customer
+  github:
+    repository: inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator
+    workflow_id: safe-test-runner.yml
+    workflow_ref: main
+    api_version: "2026-03-10"
+    return_run_details: true
+
 # Operational runs only; manual stateless probes retain their own limits.
 resource_budget:
   default_profile: standard
