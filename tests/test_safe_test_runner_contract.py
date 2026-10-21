@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import Counter
 import ast
 import hashlib
+import json
 import re
 import stat
 import unittest
@@ -19,7 +20,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/safe-test-ru
 # Identity only, never execution approval. Updating workflow and digest together
 # cannot self-authorize a change; the governance review gates still apply.
 APPROVED_SAFE_RUNNER_CANONICAL_SHA256 = (
-    "9344fcd07b886f5713b0d31d9674058f9484b8d0ed4fbf031e9d3908972f621f"
+    "431cba9121d512c46000ccad3c26e335ad53530ad94e5ab356783d6cea8255b8"
 )
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 IMAGE_DIGEST = "a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
@@ -30,6 +31,8 @@ IMAGE = "docker.io/library/python@sha256:" + IMAGE_DIGEST
 ALLOWED_EXPRESSIONS = {
     "${{ github.ref }}": 1,
     "${{ inputs.candidate_sha }}": 1,
+    "${{ inputs.logical_test_id }}": 1,
+    "${{ inputs.argv_sha256 }}": 1,
     "${{ steps.preflight.outputs.image }}": 2,
     "${{ steps.preflight.outputs.platform }}": 1,
     "${{ steps.preflight.outputs.python_version }}": 1,
@@ -200,10 +203,56 @@ class SafeTestRunnerContractTests(unittest.TestCase):
     def test_no_repository_dispatch_trigger(self):
         self.assertNotRegex(self.text, r"(?m)^\s*repository_dispatch:")
 
-    def test_candidate_only_required_string_input(self):
-        self.assertEqual(re.findall(r"^      (\w+):", self.trigger, re.M), ["candidate_sha"])
-        self.assertIn("        required: true\n        type: string", self.trigger)
+    def test_exact_three_required_string_inputs(self):
+        self.assertEqual(re.findall(r"^      (\w+):", self.trigger, re.M),
+                         ["candidate_sha", "logical_test_id", "argv_sha256"])
+        for block in re.split(r"(?m)^      \w+:\n", self.trigger)[1:]:
+            self.assertEqual(re.findall(r"(?m)^        (\w+):", block),
+                             ["description", "required", "type"])
+            self.assertIn("        required: true\n        type: string", block)
         self.assertNotIn("default:", self.trigger)
+
+    def test_identity_metadata_fails_closed_before_candidate_checkout(self):
+        for condition, message in (
+            ('"$LOGICAL_TEST_ID" != \'safe_runner_smoke_v1\'',
+             "unsupported logical test identity"),
+            ('! "$ARGV_SHA256" =~ ^[0-9a-f]{64}$', "invalid argv digest format"),
+            ('"$ARGV_SHA256" != \'07e2764d9cb675f8894363f08ae9a52e7e6ebdbef8092a60a2ec403dc6fdd601\'',
+             "unsupported argv identity"),
+        ):
+            guard = (f"          if [[ {condition} ]]; then\n"
+                     f"            printf '%s\\n' 'FAIL: {message}.'\n"
+                     "            exit 1\n          fi\n")
+            with self.subTest(condition=condition):
+                self.assertEqual(self.preflight.count(guard), 1)
+                self.assertLess(self.preflight.index(guard),
+                                self.preflight.index('>> "$GITHUB_OUTPUT"'))
+                self.assertLess(self.text.index(guard), self.text.index(f"uses: {CHECKOUT}"))
+
+    def test_identity_inputs_are_environment_only_and_never_execution_data(self):
+        for field, variable, count in (("logical_test_id", "LOGICAL_TEST_ID", 1),
+                                       ("argv_sha256", "ARGV_SHA256", 2)):
+            self.assertIn(f"          {variable}: ${{{{ inputs.{field} }}}}\n", self.text)
+            # All shell references must be quoted comparisons; no normalization,
+            # forwarding, command construction, or dynamic test selection.
+            references = [line for line in self.text.splitlines() if "$" + variable in line]
+            self.assertEqual(len(references), count)
+            for line in references:
+                self.assertRegex(line, rf'^          if \[\[ !? ?"\${variable}" (?:!=|=~) ')
+            self.assertNotIn(variable, self.execution)
+            self.assertNotIn(variable, self.checkout)
+            self.assertNotIn(variable, self.preparation)
+        require_expression_free_runs(self.text)
+
+    def test_canonical_argv_digest_matches_exact_executed_command(self):
+        argv = ["python", "-B", "-m", "unittest", "tests.test_safe_runner_smoke", "-v"]
+        digest = hashlib.sha256(json.dumps(
+            argv, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(digest, "07e2764d9cb675f8894363f08ae9a52e7e6ebdbef8092a60a2ec403dc6fdd601")
+        self.assertIn(f'"$ARGV_SHA256" != \'{digest}\'', self.preflight)
+        self.assertEqual(self.docker.split('"$SAFE_TEST_IMAGE" ', 1)[1].strip(),
+                         " ".join(argv) + " " + chr(92))
 
     def test_no_command_input(self):
         self.assertNotRegex(self.trigger, r"(?m)^\s*command:")
@@ -422,7 +471,8 @@ class SafeTestRunnerContractTests(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^\s*(?:python\d*|bash|sh|pwsh|node|make)\s")
         self.assertNotRegex(self.text, r"(?m)^\s*(?:source\s|\.\s|eval\s|exec\s|cd\s|\./)")
         self.assertNotRegex(self.text, r"docker\s+(?:build|compose)|uses:\s*\./|working-directory:")
-        self.assertEqual(re.findall(r"\$\{\{\s*inputs\.(\w+)\s*\}\}", self.text), ["candidate_sha"])
+        self.assertEqual(re.findall(r"\$\{\{\s*inputs\.(\w+)\s*\}\}", self.text),
+                         ["candidate_sha", "logical_test_id", "argv_sha256"])
 
     def test_no_raw_output_or_environment_logging(self):
         self.assertNotRegex(self.text, r"set\s+-[^\n]*x|\bprintenv\b|(?m:^\s*env\s*$)")

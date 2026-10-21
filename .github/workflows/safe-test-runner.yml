@@ -7,6 +7,14 @@ on:
         description: Exact candidate commit (40 lowercase hexadecimal characters)
         required: true
         type: string
+      logical_test_id:
+        description: Fixed smoke identity (admission metadata only)
+        required: true
+        type: string
+      argv_sha256:
+        description: Canonical fixed smoke argv digest (admission metadata only)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +32,8 @@ jobs:
         env:
           WORKFLOW_SOURCE_REF: ${{ github.ref }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          LOGICAL_TEST_ID: ${{ inputs.logical_test_id }}
+          ARGV_SHA256: ${{ inputs.argv_sha256 }}
         run: |
           if [[ "$WORKFLOW_SOURCE_REF" != 'refs/heads/main' ]]; then
             printf '%s\n' 'FAIL: workflow must be dispatched from main.'
@@ -31,6 +41,19 @@ jobs:
           fi
           if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             printf '%s\n' 'FAIL: invalid candidate SHA.'
+            exit 1
+          fi
+          # Untrusted identity metadata only; never derive commands from inputs.
+          if [[ "$LOGICAL_TEST_ID" != 'safe_runner_smoke_v1' ]]; then
+            printf '%s\n' 'FAIL: unsupported logical test identity.'
+            exit 1
+          fi
+          if [[ ! "$ARGV_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'FAIL: invalid argv digest format.'
+            exit 1
+          fi
+          if [[ "$ARGV_SHA256" != '07e2764d9cb675f8894363f08ae9a52e7e6ebdbef8092a60a2ec403dc6fdd601' ]]; then
+            printf '%s\n' 'FAIL: unsupported argv identity.'
             exit 1
           fi
           printf 'workflow source ref: %s\ncandidate SHA: %s\nrunner OS: %s\n' \
