@@ -15,6 +15,10 @@ on:
         description: Canonical fixed smoke argv digest (admission metadata only)
         required: true
         type: string
+      workflow_source_sha:
+        description: Expected workflow source commit (identity metadata only)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -31,14 +35,41 @@ jobs:
         id: preflight
         env:
           WORKFLOW_SOURCE_REF: ${{ github.ref }}
+          WORKFLOW_SOURCE_REF_TYPE: ${{ github.ref_type }}
+          WORKFLOW_SOURCE_REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_SOURCE_SHA_ACTUAL: ${{ github.sha }}
+          WORKFLOW_SOURCE_SHA_EXPECTED: ${{ inputs.workflow_source_sha }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           LOGICAL_TEST_ID: ${{ inputs.logical_test_id }}
           ARGV_SHA256: ${{ inputs.argv_sha256 }}
         run: |
-          if [[ "$WORKFLOW_SOURCE_REF" != 'refs/heads/main' ]]; then
-            printf '%s\n' 'FAIL: workflow must be dispatched from main.'
+          if [[ "$WORKFLOW_SOURCE_REF" != 'refs/tags/safe-test-runner-v1' ]]; then
+            printf '%s\n' 'FAIL: workflow must be dispatched from the versioned source tag.'
             exit 1
           fi
+          if [[ "$WORKFLOW_SOURCE_REF_TYPE" != 'tag' ]]; then
+            printf '%s\n' 'FAIL: workflow source must be a tag.'
+            exit 1
+          fi
+          if [[ "$WORKFLOW_SOURCE_REF_PROTECTED" != 'true' ]]; then
+            printf '%s\n' 'FAIL: workflow source tag must be protected.'
+            exit 1
+          fi
+          if [[ ! "$WORKFLOW_SOURCE_SHA_EXPECTED" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'FAIL: invalid expected workflow source SHA.'
+            exit 1
+          fi
+          if [[ ! "$WORKFLOW_SOURCE_SHA_ACTUAL" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'FAIL: invalid actual workflow source SHA.'
+            exit 1
+          fi
+          if [[ "$WORKFLOW_SOURCE_SHA_ACTUAL" != "$WORKFLOW_SOURCE_SHA_EXPECTED" ]]; then
+            printf '%s\n' 'FAIL: workflow source SHA mismatch.'
+            exit 1
+          fi
+          # workflow_source_sha is declared identity, NOT authority or authorization.
+          # Future trust: protected immutable version tag + policy-pinned source SHA
+          # + runtime identity continuity. Supplying an arbitrary SHA grants no authority.
           if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             printf '%s\n' 'FAIL: invalid candidate SHA.'
             exit 1
