@@ -20,7 +20,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/safe-test-ru
 # Identity only, never execution approval. Updating workflow and digest together
 # cannot self-authorize a change; the governance review gates still apply.
 APPROVED_SAFE_RUNNER_CANONICAL_SHA256 = (
-    "431cba9121d512c46000ccad3c26e335ad53530ad94e5ab356783d6cea8255b8"
+    "5b8062008c22f7b886f31067107ed00620a0a36b468acab325eabd8e0a165c1f"
 )
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 IMAGE_DIGEST = "a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf"
@@ -30,6 +30,10 @@ IMAGE = "docker.io/library/python@sha256:" + IMAGE_DIGEST
 # Exact source expressions and multiplicities: no YAML run-key recognition needed.
 ALLOWED_EXPRESSIONS = {
     "${{ github.ref }}": 1,
+    "${{ github.ref_type }}": 1,
+    "${{ github.ref_protected }}": 1,
+    "${{ github.sha }}": 1,
+    "${{ inputs.workflow_source_sha }}": 1,
     "${{ inputs.candidate_sha }}": 1,
     "${{ inputs.logical_test_id }}": 1,
     "${{ inputs.argv_sha256 }}": 1,
@@ -149,6 +153,29 @@ def require_container_name(docker):
         raise AssertionError("Expected exactly one fixed container name")
 
 
+# Fixed independent expectations; no candidate activity may interrupt these guards.
+SOURCE_GUARDS = (
+    ('"$WORKFLOW_SOURCE_REF" != \'refs/tags/safe-test-runner-v1\'',
+     "workflow must be dispatched from the versioned source tag"),
+    ('"$WORKFLOW_SOURCE_REF_TYPE" != \'tag\'', "workflow source must be a tag"),
+    ('"$WORKFLOW_SOURCE_REF_PROTECTED" != \'true\'', "workflow source tag must be protected"),
+    ('! "$WORKFLOW_SOURCE_SHA_EXPECTED" =~ ^[0-9a-f]{40}$', "invalid expected workflow source SHA"),
+    ('! "$WORKFLOW_SOURCE_SHA_ACTUAL" =~ ^[0-9a-f]{40}$', "invalid actual workflow source SHA"),
+    ('"$WORKFLOW_SOURCE_SHA_ACTUAL" != "$WORKFLOW_SOURCE_SHA_EXPECTED"', "workflow source SHA mismatch"),
+)
+EXPECTED_SOURCE_GUARDS = "".join(
+    f"          if [[ {condition} ]]; then\n"
+    f"            printf '%s\\n' 'FAIL: {message}.'\n"
+    "            exit 1\n          fi\n"
+    for condition, message in SOURCE_GUARDS
+)
+
+
+def require_source_guards(preflight):
+    if not preflight.startswith(EXPECTED_SOURCE_GUARDS):
+        raise AssertionError("Source identity must fail closed before other activity")
+
+
 class SafeRunnerGoldenIdentityTests(unittest.TestCase):
     def test_safe_runner_workflow_matches_approved_golden_identity(self):
         # N-03/N-04: whole-file identity covers insertions between blocks and
@@ -203,9 +230,9 @@ class SafeTestRunnerContractTests(unittest.TestCase):
     def test_no_repository_dispatch_trigger(self):
         self.assertNotRegex(self.text, r"(?m)^\s*repository_dispatch:")
 
-    def test_exact_three_required_string_inputs(self):
+    def test_exact_four_required_string_inputs(self):
         self.assertEqual(re.findall(r"^      (\w+):", self.trigger, re.M),
-                         ["candidate_sha", "logical_test_id", "argv_sha256"])
+                         ["candidate_sha", "logical_test_id", "argv_sha256", "workflow_source_sha"])
         for block in re.split(r"(?m)^      \w+:\n", self.trigger)[1:]:
             self.assertEqual(re.findall(r"(?m)^        (\w+):", block),
                              ["description", "required", "type"])
@@ -313,11 +340,103 @@ class SafeTestRunnerContractTests(unittest.TestCase):
         self.assertIn("          ref: ${{ steps.preflight.outputs.candidate_sha }}\n", self.checkout)
         self.assertIn("printf 'candidate_sha=%s\\nimage=%s\\n'", self.preflight)
 
-    def test_main_ref_guard_fails_first(self):
-        self.assertTrue(self.preflight.startswith('          if [[ "$WORKFLOW_SOURCE_REF" != \'refs/heads/main\' ]]; then\n'))
-        guard = self.preflight.split("          fi", 1)[0]
-        self.assertIn("            exit 1", guard)
-        self.assertIn("WORKFLOW_SOURCE_REF: ${{ github.ref }}", self.text)
+    def test_versioned_source_guards_fail_first(self):
+        require_source_guards(self.preflight)
+        self.assertNotIn("refs/heads/main", self.preflight)
+
+    def test_source_contexts_enter_only_through_preflight_env(self):
+        env = self.text.split("        id: preflight\n        env:\n", 1)[1].split("        run: |\n", 1)[0]
+        for variable, expression in (
+            ("WORKFLOW_SOURCE_REF", "github.ref"),
+            ("WORKFLOW_SOURCE_REF_TYPE", "github.ref_type"),
+            ("WORKFLOW_SOURCE_REF_PROTECTED", "github.ref_protected"),
+            ("WORKFLOW_SOURCE_SHA_ACTUAL", "github.sha"),
+            ("WORKFLOW_SOURCE_SHA_EXPECTED", "inputs.workflow_source_sha"),
+        ):
+            token = "${{ " + expression + " }}"
+            with self.subTest(variable=variable):
+                self.assertEqual(self.text.count(token), 1)
+                self.assertIn(f"          {variable}: {token}\n", env)
+        require_expression_free_runs(self.text)
+
+    def test_source_guards_precede_all_candidate_and_image_activity(self):
+        require_source_guards(self.preflight)
+        end = self.text.index(EXPECTED_SOURCE_GUARDS) + len(EXPECTED_SOURCE_GUARDS)
+        for marker in (
+            'if [[ ! "$CANDIDATE_SHA"', 'if [[ "$LOGICAL_TEST_ID"',
+            'if [[ ! "$ARGV_SHA256"', 'readonly SAFE_TEST_IMAGE=',
+            '>> "$GITHUB_OUTPUT"', "docker pull", f"uses: {CHECKOUT}", "10m docker run",
+        ):
+            with self.subTest(marker=marker):
+                self.assertLess(end, self.text.index(marker))
+
+    def test_each_source_guard_removal_is_rejected(self):
+        for condition, _ in SOURCE_GUARDS:
+            start = self.preflight.index(f"          if [[ {condition} ]]; then\n")
+            end = self.preflight.index("          fi\n", start) + len("          fi\n")
+            with self.subTest(condition=condition), self.assertRaises(AssertionError):
+                require_source_guards(self.preflight[:start] + self.preflight[end:])
+
+    def test_each_source_guard_cannot_succeed_on_rejection(self):
+        matches = list(re.finditer(r"            exit 1\n", EXPECTED_SOURCE_GUARDS))
+        self.assertEqual(len(matches), 6)
+        for index, match in enumerate(matches):
+            mutated = self.preflight[:match.start()] + "            exit 0\n" + self.preflight[match.end():]
+            with self.subTest(guard=index), self.assertRaises(AssertionError):
+                require_source_guards(mutated)
+
+    def test_source_values_and_operators_cannot_be_weakened(self):
+        for before, after in (
+            ("refs/tags/safe-test-runner-v1", "refs/heads/main"),
+            ("!= 'tag'", "!= 'branch'"),
+            ("!= 'true'", "!= 'false'"),
+            ('! "$WORKFLOW_SOURCE_SHA_EXPECTED"', '"$WORKFLOW_SOURCE_SHA_EXPECTED"'),
+            ('! "$WORKFLOW_SOURCE_SHA_ACTUAL"', '"$WORKFLOW_SOURCE_SHA_ACTUAL"'),
+            ('"$WORKFLOW_SOURCE_SHA_ACTUAL" !=', '"$WORKFLOW_SOURCE_SHA_ACTUAL" =='),
+        ):
+            with self.subTest(before=before), self.assertRaises(AssertionError):
+                require_source_guards(self.preflight.replace(before, after, 1))
+
+    def test_both_source_sha_patterns_are_exact_lowercase_full_length(self):
+        for variable in ("WORKFLOW_SOURCE_SHA_EXPECTED", "WORKFLOW_SOURCE_SHA_ACTUAL"):
+            condition = '! "$' + variable + '" =~ ^[0-9a-f]{40}$'
+            self.assertIn(condition, self.preflight)
+            for pattern in ("[0-9a-f]{40}", "^[0-9a-fA-F]{40}$", "^[0-9a-f]{39}$",
+                            "^[0-9a-f]{40,}$", "^[0-9a-f]{40}"):
+                changed = self.preflight.replace(condition, '! "$' + variable + '" =~ ' + pattern, 1)
+                with self.subTest(variable=variable, pattern=pattern), self.assertRaises(AssertionError):
+                    require_source_guards(changed)
+
+    def test_candidate_validation_cannot_be_moved_before_source_guards(self):
+        prefix = '          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then\n            exit 1\n          fi\n'
+        with self.assertRaises(AssertionError):
+            require_source_guards(prefix + self.preflight)
+
+    def test_candidate_export_cannot_interrupt_source_guards(self):
+        first_end = self.preflight.index("          fi\n") + len("          fi\n")
+        mutated = (self.preflight[:first_end] +
+                   '          printf "candidate_sha=%s\\n" "$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"\n' +
+                   self.preflight[first_end:])
+        with self.assertRaises(AssertionError):
+            require_source_guards(mutated)
+
+    def test_source_sha_is_only_comparison_metadata(self):
+        for variable in ("WORKFLOW_SOURCE_SHA_ACTUAL", "WORKFLOW_SOURCE_SHA_EXPECTED"):
+            references = [line for line in self.preflight.splitlines() if "$" + variable in line]
+            self.assertEqual(len(references), 2)
+            for line in references:
+                self.assertTrue(line.startswith("          if [[ "))
+        for block in (self.checkout, self.preparation, self.execution):
+            self.assertNotIn("workflow_source_sha", block)
+            self.assertNotIn("WORKFLOW_SOURCE_", block)
+        self.assertIn("ref: ${{ steps.preflight.outputs.candidate_sha }}", self.checkout)
+
+    def test_source_identity_is_not_authority(self):
+        self.assertIn("workflow_source_sha is declared identity, NOT authority or authorization.", self.preflight)
+        self.assertIn("protected immutable version tag + policy-pinned source SHA", self.preflight)
+        self.assertIn("+ runtime identity continuity.", self.preflight)
+        self.assertIn("Supplying an arbitrary SHA grants no authority.", self.preflight)
+        self.assertIn("Candidate remains untrusted. Never source candidate files.", self.execution)
 
     def test_image_is_trusted_admitted_literal(self):
         self.assertIn(f'readonly SAFE_TEST_IMAGE="{IMAGE}"', self.preflight)
@@ -472,7 +591,7 @@ class SafeTestRunnerContractTests(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^\s*(?:source\s|\.\s|eval\s|exec\s|cd\s|\./)")
         self.assertNotRegex(self.text, r"docker\s+(?:build|compose)|uses:\s*\./|working-directory:")
         self.assertEqual(re.findall(r"\$\{\{\s*inputs\.(\w+)\s*\}\}", self.text),
-                         ["candidate_sha", "logical_test_id", "argv_sha256"])
+                         ["workflow_source_sha", "candidate_sha", "logical_test_id", "argv_sha256"])
 
     def test_no_raw_output_or_environment_logging(self):
         self.assertNotRegex(self.text, r"set\s+-[^\n]*x|\bprintenv\b|(?m:^\s*env\s*$)")
