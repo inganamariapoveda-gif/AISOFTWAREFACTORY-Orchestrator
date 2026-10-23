@@ -43,15 +43,20 @@ Do not silently resolve conflicts or infer missing authorization.
 
 ## Git and deployment
 
-Git push is denied by default. The only exception is controlled task-branch
-publication defined in the canonical YAML/spec, requiring an explicit Task
+Git push is denied by default. Controlled task-branch publication and the exact
+dedicated Safe Test source-tag action are defined in canonical YAML/spec,
+requiring an explicit Task
 Packet, Director approval, and every canonical restriction. The Builder must
 never infer authorization from its role or capability alone.
-Publishing main/master, force pushes, tags, remote deletion, and remotes or
+Publishing main/master, generic force pushes, generic tags, remote deletion, and remotes or
 repositories outside the exact allowlist remain prohibited. Git merge and
 production remain absolutely prohibited. Do not rebase, reset, or clean
 without express authorization consistent with canonical governance.
 This section grants no independent exception; the canonical sources control.
+Only git_publish_safe_test_source_tag may create the exact canonical trust tag,
+when every permission, policy, gate, Builder capability, approved target and
+verified protective Ruleset condition intersects. It never widens git_publish
+or permits inferred tag authorization, tag updates or deletion.
 
 ## Verification and evidence
 

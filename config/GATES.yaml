@@ -15,6 +15,7 @@ automatic_approval:
 director_internal_gate:
   amarillo_contemplado: true
   git_publish_task_branch: true
+  git_publish_safe_test_source_tag: true
 
 # Human Gates definidos en la Master Spec (§9).
 human_gates:

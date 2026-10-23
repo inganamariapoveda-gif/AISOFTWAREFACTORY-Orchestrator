@@ -19,6 +19,12 @@ controlled_actions:
     approval: "DIRECTOR_INTERNAL_GATE"
     on_violation: "BLOCKED"
 
+  git_publish_safe_test_source_tag:
+    enabled: true
+    classification: "AMARILLO"
+    approval: "DIRECTOR_INTERNAL_GATE"
+    on_violation: "BLOCKED"
+
 attempts:
   # Límite configurable de intentos de corrección antes de BLOCKED (§14).
   max_correction_attempts: 3
