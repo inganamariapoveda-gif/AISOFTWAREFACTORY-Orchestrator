@@ -1107,13 +1107,14 @@ functional signal = UNVERIFIED y WORKTREE != SECURITY ISOLATION.
 
 IMPLEMENTATION-001 / SCOPE-CORRECTION-001 registra la decisión material aprobada
 por la Product Owner mediante HUMAN_BUSINESS_DECISION: git push se deniega por
-defecto, con una única operación contemplada `git_publish_task_branch`.
+defecto. La publicación ordinaria contempla `git_publish_task_branch`;
+030A1 añade separadamente la autoridad exacta de source-tag descrita abajo.
 Es AMARILLO CONTEMPLADO y requiere autorización explícita del Director mediante
 DIRECTOR_INTERNAL_GATE. No requiere nuevo Human Gate para cada publicación que
 cumpla exactamente el contrato; una desviación material sigue BLOCKED →
 HUMAN_BUSINESS_DECISION. Merge y producción continúan absolutamente prohibidos.
 
-MOTOR != REGLAS. POLICIES declara uncontrolled_git_push prohibido y la única
+MOTOR != REGLAS. POLICIES declara uncontrolled_git_push prohibido y la
 controlled_action con enabled=true, classification=AMARILLO,
 approval=DIRECTOR_INTERNAL_GATE y on_violation=BLOCKED. PERMISSIONS mantiene
 denegaciones de producción, merge, irreversibles, env_files y secret_files,
@@ -1128,11 +1129,12 @@ allowed_remote_urls con una única URL exacta:
 Comparación futura exacta, sin normalización a URL equivalente, wildcard,
 URL SSH alternativa ni otro repository. branch_prefix=task/, forbidden_branches
 incluye main y master, refspec_mode=current_branch_only. Se prohíben force,
-tags y eliminación remota. Se exige Task Packet explícito, aprobación del
+tags y eliminación remota dentro de git_publish. Se exige Task Packet explícito, aprobación del
 Director y working tree limpio. La política no contiene comandos shell.
 
-Builder admite únicamente implement_authorized_changes y
-publish_authorized_task_branch. Director y Verifier carecen de capabilities
+Builder admite implement_authorized_changes, publish_authorized_task_branch y
+la capacidad separada publish_authorized_safe_test_source_tag de 030A1.
+Director y Verifier carecen de capabilities
 operacionales. Una capability sola nunca autoriza publicación. Deben coincidir
 simultáneamente capability, controlled_action habilitada, git_publish habilitado,
 Task Packet, aprobación del Director, gate y restricciones Git verificadas.
@@ -1516,3 +1518,44 @@ local_project_commands=false y SAFE_TEST_EXECUTION_ENABLED=false permanecen.
 Tests focalizados con repos temporales añadidos NOT RUN. Pendientes: trusted
 Director issuance, runtime tests, publisher GP-01/GP-02, revalidación de ejecución,
 Safe Runner runtime, evidencia independiente y hardlink gap.
+
+### SAFE_TEST_TAG_GOVERNANCE_030A1 — exact source-tag authority
+
+La acción `git_publish_safe_test_source_tag` es AMARILLO expresamente contemplado,
+con DIRECTOR_INTERNAL_GATE y on_violation=BLOCKED. No añade un Human Gate
+para su ejecución técnica rutinaria. Toda desviación permanece BLOCKED.
+Es una capacidad controlada SEPARADA, no una excepción que amplíe `git_publish`.
+La publicación ordinaria sigue limitada a task/*, current_branch_only y
+allow_tags=false, allow_force=false, allow_delete=false.
+
+El bloque canónico `git_tag_publish` autoriza únicamente origin y
+https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator.git,
+ref refs/tags/safe-test-runner-v1, commit
+db38ef6e6cbc73d8e54b591d4f0eb747073d500b y tree
+a0e83537b75fa4341d6e32b477ff07adec4cda1c. Solo lightweight remoto,
+CREATE ONLY con ausencia remota exigida atómicamente: lease de creación
+con expected-value vacío; nunca force genérico, actualización, borrado,
+tag local ni objeto annotated. Los tags genéricos siguen prohibidos.
+
+Antes de publicar deben coincidir PERMISSIONS, POLICIES, GATES y la capacidad
+Builder publish_authorized_safe_test_source_tag, además del Task Packet explícito,
+aprobación del Director, worktree limpio e identidad exacta del objeto.
+La condición protectora requiere evidencia independiente verificada del Ruleset
+25739744, protect-safe-test-runner-v1: target=tag, enforcement=active,
+include exacto refs/tags/safe-test-runner-v1, reglas deletion/update,
+bypass_actors vacío, current_user_can_bypass=never y creación no restringida.
+Declarar esa condición no demuestra por sí solo el estado remoto.
+
+El loader valida el esquema cerrado de esta decisión versionada, valores exactos
+y booleanos reales sin coerción; rechaza campos desconocidos, faltantes y
+debilitamientos. Una configuración histórica sin el bloque nuevo sigue cargando
+para operaciones anteriores, pero NO obtiene autoridad de source-tag: el validador
+de intersección la deniega ante cualquier elemento ausente o deshabilitado.
+Los literales exactos del validador comprueban esta decisión canónica;
+no seleccionan nuevos destinos ni inventan política. Cambiarlos requiere revisión
+explícita de esta autoridad, no una decisión autónoma del motor.
+
+Este incremento no implementa publicador, transporte ni acceso GitHub.
+Una intersección declarativa válida no es aprobación ni autorización de ejecución.
+No crea tags, credenciales, PAT o DPAPI; no activa backend, engine wiring,
+workflow dispatch ni modifica Rulesets. ACTIVATION_BLOCKER_FUTURE=OPEN.

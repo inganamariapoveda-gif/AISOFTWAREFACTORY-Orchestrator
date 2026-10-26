@@ -150,7 +150,21 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
     _require_true(data, "prohibitions.uncontrolled_git_push", path)
     if "git_push" in data["prohibitions"]:
         raise ConfigError("obsolete push prohibition schema")
-    actions = _closed_mapping(data.get("controlled_actions"), {"git_publish_task_branch"}, "controlled_actions")
+    actions = data.get("controlled_actions")
+    if not isinstance(actions, dict) or set(actions) not in (
+        {"git_publish_task_branch"},
+        {"git_publish_task_branch", "git_publish_safe_test_source_tag"},
+    ):
+        raise ConfigError("invalid controlled_actions keys")
+    if "git_publish_safe_test_source_tag" in actions:
+        tag_action = _closed_mapping(actions["git_publish_safe_test_source_tag"],
+                                     {"enabled", "classification", "approval", "on_violation"},
+                                     "controlled source-tag action")
+        if (type(tag_action["enabled"]) is not bool
+                or tag_action["classification"] != "AMARILLO"
+                or tag_action["approval"] != "DIRECTOR_INTERNAL_GATE"
+                or tag_action["on_violation"] != "BLOCKED"):
+            raise ConfigError("invalid controlled source-tag policy")
     action = _closed_mapping(actions["git_publish_task_branch"],
                              {"enabled", "classification", "approval", "on_violation"},
                              "controlled_actions.git_publish_task_branch")
@@ -365,6 +379,30 @@ def require_controlled_publication_authority(config: OrchestratorConfig) -> None
                   Path("POLICIES.yaml"))
 
 
+def require_controlled_source_tag_authority(config: OrchestratorConfig) -> None:
+    """Pure configuration intersection, NOT approval or execution authority.
+
+    Absence is compatible with legacy configurations but never grants this
+    capability. A future publisher must separately admit the Task Packet,
+    Director approval, clean worktree, remote absence and live Ruleset evidence.
+    """
+    if not isinstance(config, OrchestratorConfig) or any(
+        not isinstance(block, dict) for block in (config.permissions, config.policies, config.gates)
+    ):
+        raise ConfigError("source-tag authority requires core config")
+    _validate_permissions(config.permissions, Path("PERMISSIONS.yaml"))
+    _validate_policies(config.policies, Path("POLICIES.yaml"))
+    _validate_gates(config.gates, Path("GATES.yaml"))
+    _validate_git_tag_publish(config.permissions.get("git_tag_publish"))
+    _require_true(config.permissions, "git_tag_publish.enabled", Path("PERMISSIONS.yaml"))
+    _require_true(config.policies, "controlled_actions.git_publish_safe_test_source_tag.enabled",
+                  Path("POLICIES.yaml"))
+    _require_true(config.gates, "director_internal_gate.git_publish_safe_test_source_tag",
+                  Path("GATES.yaml"))
+    if "publish_authorized_safe_test_source_tag" not in config.permissions.get("role_capabilities", {}).get("builder", []):
+        raise ConfigError("Builder source-tag capability is not authorized")
+
+
 def _validate_developer_handshake_config(developer: dict[str, Any], path: Path) -> None:
     """CLAUDE-EXECUTION-001: si developer.enabled es true, exige declarar
     todos los campos del handshake seguro con Claude Code CLI. Falla cerrado
@@ -520,6 +558,9 @@ def _validate_gates(data: dict[str, Any], path: Path) -> None:
     _require_true(data, "automatic_approval.verde", path)
     _require_true(data, "director_internal_gate.amarillo_contemplado", path)
     _require_true(data, "director_internal_gate.git_publish_task_branch", path)
+    gate = data["director_internal_gate"]
+    if "git_publish_safe_test_source_tag" in gate and type(gate["git_publish_safe_test_source_tag"]) is not bool:
+        raise ConfigError("source-tag gate must be boolean")
 
     human_gates = _require(data, "human_gates", path)
     if not isinstance(human_gates, list) or not human_gates:
@@ -541,7 +582,8 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
     for role, grants in capabilities.items():
         if role not in {"director", "builder", "verifier"} or not isinstance(grants, list):
             raise ConfigError("invalid role capability policy")
-        if any(grant not in ("implement_authorized_changes", "publish_authorized_task_branch") or role != "builder" for grant in grants):
+        if any(grant not in ("implement_authorized_changes", "publish_authorized_task_branch",
+                             "publish_authorized_safe_test_source_tag") or role != "builder" for grant in grants):
             raise ConfigError("unsupported role capability")
     for key in REQUIRED_PERMISSION_DENY_KEYS:
         _require_true(data, key, path)
@@ -552,6 +594,8 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
     if controls["local_project_commands"] is not False:
         raise ConfigError("execution_controls.local_project_commands must be false")
     _validate_git_publish(data.get("git_publish"))
+    if "git_tag_publish" in data:
+        _validate_git_tag_publish(data["git_tag_publish"])
     allowed_commands = _require(data, "allowed_commands", path)
     if not isinstance(allowed_commands, list):
         raise ConfigError(f"'allowed_commands' must be a list in {path}")
@@ -638,6 +682,51 @@ def _validate_git_publish(value: Any) -> None:
             raise ConfigError(f"git_publish.{key} must be true")
     if block["refspec_mode"] != "current_branch_only":
         raise ConfigError("invalid git_publish.refspec_mode")
+
+
+def _validate_git_tag_publish(value: Any) -> None:
+    """Validate the versioned 030A1 trust object; never publish or access GitHub.
+
+    These exact schema constraints implement the explicit canonical 030A1
+    decision. A different trust object requires a separately reviewed change.
+    """
+    expected = {
+        "enabled": True,
+        "remote_name": "origin",
+        "allowed_repository_url": "https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator.git",
+        "allowed_tag_ref": "refs/tags/safe-test-runner-v1",
+        "allowed_target_sha": "db38ef6e6cbc73d8e54b591d4f0eb747073d500b",
+        "allowed_target_tree": "a0e83537b75fa4341d6e32b477ff07adec4cda1c",
+        "tag_type": "lightweight",
+        "create_only": True,
+        "allow_update": False,
+        "allow_delete": False,
+        "allow_force": False,
+        "require_explicit_task_packet": True,
+        "require_director_approval": True,
+        "require_clean_worktree": True,
+        "require_verified_protective_ruleset": True,
+        "protective_ruleset": {
+            "id": 25739744,
+            "name": "protect-safe-test-runner-v1",
+            "target": "tag",
+            "enforcement": "active",
+            "include": "refs/tags/safe-test-runner-v1",
+            "rules": ["deletion", "update"],
+            "bypass_actors": [],
+            "current_user_can_bypass": "never",
+            "creation_restricted": False,
+        },
+    }
+    block = _closed_mapping(value, set(expected), "git_tag_publish")
+    for key, required in expected.items():
+        actual = block[key]
+        if key == "protective_ruleset":
+            ruleset = _closed_mapping(actual, set(required), "protective_ruleset")
+            if any(type(ruleset[k]) is not type(v) or ruleset[k] != v for k, v in required.items()):
+                raise ConfigError("invalid protective Ruleset condition")
+        elif type(actual) is not type(required) or actual != required:
+            raise ConfigError(f"invalid git_tag_publish.{key}")
 
 
 def _validate_commands(commands: dict[str, Any], path: Path) -> None:

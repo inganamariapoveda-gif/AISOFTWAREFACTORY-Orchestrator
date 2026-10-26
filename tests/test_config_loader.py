@@ -1067,6 +1067,8 @@ class GitPublishGovernanceTests(unittest.TestCase):
     def test_canonical_publication_policy(self):
         config = load_core_config(CONFIG_DIR)
         self.assertEqual(config.policies["controlled_actions"], {
+            "git_publish_safe_test_source_tag": {"enabled": True, "classification": "AMARILLO",
+                                                 "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED"},
             "git_publish_task_branch": {"enabled": True, "classification": "AMARILLO",
                                        "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED"}})
         self.assertEqual(config.permissions["git_publish"], _baseline_permissions()["git_publish"])
@@ -1737,6 +1739,113 @@ class SafeTestBackendPolicyTests(unittest.TestCase):
         data["credential_strategy"] = {"mvp": "fine_grained_pat_dpapi"}
         with self.assertRaises(ConfigError):
             self.load_policy(data)
+
+
+class SafeTestSourceTagAuthorityTests(unittest.TestCase):
+    def setUp(self):
+        from orchestrator.config_loader import require_controlled_source_tag_authority
+        self.require_authority = require_controlled_source_tag_authority
+        self.config = load_core_config(CONFIG_DIR)
+
+    def reject_permission(self, key, value):
+        import copy
+        from orchestrator.config_loader import load_permissions_from_yaml_bytes
+        permissions = copy.deepcopy(self.config.permissions)
+        permissions["git_tag_publish"][key] = value
+        with self.assertRaises(ConfigError):
+            load_permissions_from_yaml_bytes(yaml.safe_dump(permissions).encode(), "unused.yaml")
+
+    def test_exact_canonical_authority_and_ordinary_contract(self):
+        import copy
+        from orchestrator.config_loader import require_controlled_publication_authority
+        before = copy.deepcopy(self.config)
+        self.assertIsNone(self.require_authority(self.config))
+        self.assertIsNone(require_controlled_publication_authority(self.config))
+        self.assertEqual(self.config, before)
+        self.assertEqual(self.config.permissions["git_publish"], _baseline_permissions()["git_publish"])
+        self.assertIs(self.config.permissions["git_publish"]["allow_tags"], False)
+        self.assertEqual(set(self.config.permissions["role_capabilities"]["builder"]), {
+            "implement_authorized_changes", "publish_authorized_task_branch",
+            "publish_authorized_safe_test_source_tag"})
+        for role in ("director", "verifier"):
+            self.assertEqual(self.config.permissions["role_capabilities"][role], [])
+
+    def test_exact_destination_and_object(self):
+        cases = {
+            "remote_name": ["other", "Origin", None],
+            "allowed_repository_url": ["https://evil.invalid/repo.git", "https://github.com/other/repo.git"],
+            "allowed_tag_ref": ["refs/tags/other", "refs/heads/main", "refs/tags/*", "../main"],
+            "allowed_target_sha": ["a" * 40, "DB38EF6E6CBC73D8E54B591D4F0EB747073D500B", "db38ef6", "g" * 40, None],
+            "allowed_target_tree": ["a" * 40, "short"],
+            "tag_type": ["annotated", "signed", None],
+        }
+        for key, values in cases.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.reject_permission(key, value)
+
+    def test_all_boolean_constraints_without_coercion(self):
+        block = self.config.permissions["git_tag_publish"]
+        for key, value in block.items():
+            if type(value) is bool:
+                for invalid in (not value, int(value), str(value), None):
+                    with self.subTest(key=key, invalid=invalid):
+                        self.reject_permission(key, invalid)
+
+    def test_closed_permission_and_ruleset_schema(self):
+        import copy
+        from orchestrator.config_loader import load_permissions_from_yaml_bytes
+        baseline = self.config.permissions
+        for key in baseline["git_tag_publish"]:
+            permissions = copy.deepcopy(baseline)
+            del permissions["git_tag_publish"][key]
+            with self.subTest(missing=key), self.assertRaises(ConfigError):
+                load_permissions_from_yaml_bytes(yaml.safe_dump(permissions).encode(), "unused.yaml")
+        self.reject_permission("extra", True)
+        ruleset = baseline["git_tag_publish"]["protective_ruleset"]
+        for key in ruleset:
+            missing = dict(ruleset)
+            del missing[key]
+            with self.subTest(missing_ruleset=key):
+                self.reject_permission("protective_ruleset", missing)
+            altered = dict(ruleset)
+            altered[key] = None
+            with self.subTest(changed_ruleset=key):
+                self.reject_permission("protective_ruleset", altered)
+        for key, value in (("extra", True), ("bypass_actors", ["actor"]),
+                           ("rules", ["update"]), ("enforcement", "disabled"),
+                           ("creation_restricted", 0)):
+            with self.subTest(key=key):
+                self.reject_permission("protective_ruleset", dict(ruleset, **{key: value}))
+
+    def test_intersection_missing_disabled_wrong_or_unauthorized(self):
+        import copy
+        action = "git_publish_safe_test_source_tag"
+        mutations = [
+            lambda c: c.permissions.pop("git_tag_publish"),
+            lambda c: c.policies["controlled_actions"].pop(action),
+            lambda c: c.policies["controlled_actions"][action].update(enabled=False),
+            lambda c: c.policies["controlled_actions"][action].update(enabled=1),
+            lambda c: c.policies["controlled_actions"][action].update(classification="VERDE"),
+            lambda c: c.policies["controlled_actions"][action].update(approval="OTHER"),
+            lambda c: c.policies["controlled_actions"][action].update(on_violation="ALLOW"),
+            lambda c: c.policies["controlled_actions"][action].update(extra=True),
+            lambda c: c.gates["director_internal_gate"].pop(action),
+            lambda c: c.gates["director_internal_gate"].update({action: False}),
+            lambda c: c.gates["director_internal_gate"].update({action: 1}),
+            lambda c: c.permissions["role_capabilities"]["builder"].remove("publish_authorized_safe_test_source_tag"),
+            lambda c: c.permissions["role_capabilities"]["builder"].append("publish_any_tag"),
+            lambda c: c.permissions["role_capabilities"]["director"].append("publish_authorized_safe_test_source_tag"),
+            lambda c: c.permissions["role_capabilities"]["verifier"].append("publish_authorized_safe_test_source_tag"),
+        ]
+        for mutate in mutations:
+            altered = copy.deepcopy(self.config)
+            mutate(altered)
+            with self.subTest(mutation=mutate), self.assertRaises(ConfigError):
+                self.require_authority(altered)
+        for invalid in (None, {}):
+            with self.assertRaises(ConfigError):
+                self.require_authority(invalid)
 
 
 if __name__ == "__main__":
