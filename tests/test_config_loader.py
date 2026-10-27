@@ -1715,6 +1715,30 @@ class SafeTestBackendPolicyTests(unittest.TestCase):
         del policy["safe_test_backend"]
         self.assertIsNone(validate_safe_test_backend(self.load_policy(policy)))
 
+    def test_exact_protected_source_tag_and_sha_contract(self):
+        import copy
+        policy = yaml.safe_load((CONFIG_DIR / "POLICIES.yaml").read_text(encoding="utf-8"))
+        github = self.load_policy(policy)["safe_test_backend"]["github"]
+        self.assertEqual(github["workflow_ref"], "safe-test-runner-v1")
+        self.assertEqual(github["workflow_source_sha"], "db38ef6e6cbc73d8e54b591d4f0eb747073d500b")
+        for key, values in {
+            "workflow_ref": ["main", "refs/heads/main", "task/other", "other-tag",
+                             "refs/tags/safe-test-runner-v1", None],
+            "workflow_source_sha": ["a" * 40, "DB38EF6E6CBC73D8E54B591D4F0EB747073D500B",
+                                    "db38ef6", "g" * 40, None, True, 1],
+        }.items():
+            for value in values:
+                data = copy.deepcopy(policy)
+                data["safe_test_backend"]["github"][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                    self.load_policy(data)
+        for mutate in (lambda g: g.pop("workflow_source_sha"),
+                       lambda g: g.update(extra="SENTINEL")):
+            data = copy.deepcopy(policy)
+            mutate(data["safe_test_backend"]["github"])
+            with self.assertRaises(ConfigError):
+                self.load_policy(data)
+
     def test_migration_must_cannot_be_weakened(self):
         for key, value in (("mvp", "other"), ("production_required", "optional"),
                            ("github_app_required_before", []), ("token", "SENTINEL")):

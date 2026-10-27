@@ -29,6 +29,8 @@ class GitHubBackendContractTests(unittest.TestCase):
     def test_valid_disabled_configuration(self):
         config = backend.GitHubBackendConfig.from_policies(self.policies)
         self.assertEqual(config.activation, "disabled")
+        self.assertEqual(config.workflow_ref, "safe-test-runner-v1")
+        self.assertEqual(config.workflow_source_sha, "db38ef6e6cbc73d8e54b591d4f0eb747073d500b")
         self.assertEqual(config.mvp, "fine_grained_pat_dpapi")
         self.assertEqual(config.production_required, "github_app_installation_token")
         self.assertEqual(config.github_app_required_before,
@@ -42,7 +44,7 @@ class GitHubBackendContractTests(unittest.TestCase):
         for name, value in (
             ("provider", "other"), ("activation", "enabled"),
             ("repository", "other/repo"), ("workflow_id", "other.yml"),
-            ("workflow_ref", "task/example"), ("api_version", "2022-11-28"),
+            ("workflow_ref", "task/example"), ("workflow_source_sha", "a" * 40), ("api_version", "2022-11-28"),
             ("return_run_details", False), ("return_run_details", 1),
             ("mvp", "plain_pat"), ("production_required", "fine_grained_pat_dpapi"),
             ("github_app_required_before", ("production",)),
@@ -82,23 +84,21 @@ class GitHubBackendContractTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(ValueError):
                 backend.argv_sha256(argv)
 
-    def test_dispatch_has_only_fixed_control_and_three_identity_inputs(self):
+    def test_dispatch_contains_only_candidate_and_test_identity(self):
         request = backend.DispatchRequest("a" * 40, "unit", "b" * 64)
-        self.assertEqual(request.to_payload(), {
-            "ref": "main", "return_run_details": True,
-            "inputs": {"candidate_sha": "a" * 40, "logical_test_id": "unit", "argv_sha256": "b" * 64},
-        })
+        self.assertEqual({f.name for f in fields(request)},
+                         {"candidate_sha", "logical_test_id", "argv_sha256"})
         with self.assertRaises(FrozenInstanceError):
-            request.workflow_ref = "other"
-        for key in ("argv", "token", "stdout", "stderr", "secret"):
+            request.candidate_sha = "c" * 40
+        for key in ("workflow_ref", "workflow_source_sha", "return_run_details",
+                    "argv", "token", "stdout", "stderr", "secret"):
             with self.subTest(key=key), self.assertRaises(TypeError):
                 backend.DispatchRequest("a" * 40, "unit", "b" * 64, **{key: "SENTINEL"})
 
     def test_dispatch_identity_and_control_validation(self):
         request = backend.DispatchRequest("a" * 40, "unit", "b" * 64)
         for key, value in (("candidate_sha", "A" * 40), ("candidate_sha", "main"),
-                           ("logical_test_id", "unit;evil"), ("argv_sha256", "x" * 64),
-                           ("workflow_ref", "other"), ("return_run_details", 1)):
+                           ("logical_test_id", "unit;evil"), ("argv_sha256", "x" * 64)):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 replace(request, **{key: value})
 
@@ -106,8 +106,7 @@ class GitHubBackendContractTests(unittest.TestCase):
         response = backend.DispatchResponse(1, backend._run_url(1),
                                             f"https://github.com/{backend.REPOSITORY}/actions/runs/1")
         snapshot = backend.WorkflowRunSnapshot(1, "workflow_dispatch", "completed", "success",
-                                               "a" * 40, 1, 7, backend.WORKFLOW_PATH + "@main",
-                                               "main", backend.REPOSITORY)
+                                               "db38ef6e6cbc73d8e54b591d4f0eb747073d500b", 1, 7, backend.REPOSITORY)
         for value in (response, snapshot):
             names = {field.name for field in fields(value)}
             self.assertFalse(names & {"token", "secret", "credential", "technical_review", "security_review"})
@@ -130,7 +129,7 @@ class GitHubBackendContractTests(unittest.TestCase):
         with mock.patch("socket.socket", side_effect=AssertionError("network forbidden")), \
                 mock.patch("socket.create_connection", side_effect=AssertionError("network forbidden")):
             config = backend.GitHubBackendConfig.from_policies(self.policies)
-            backend.DispatchRequest("a" * 40, "unit", backend.argv_sha256(("python",))).to_payload()
+            backend.DispatchRequest("a" * 40, "unit", backend.argv_sha256(("python",)))
         self.assertEqual(config.activation, "disabled")
         self.assertNotRegex(source, r"gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9]+")
 
@@ -205,8 +204,8 @@ class GitHubActionsTransportTests(unittest.TestCase):
         self.request = backend.DispatchRequest("a" * 40, "safe_runner_smoke_v1",
                                              "07e2764d9cb675f8894363f08ae9a52e7e6ebdbef8092a60a2ec403dc6fdd601")
         self.workflow_url = f"{backend.API_BASE}/repos/{backend.REPOSITORY}/actions/workflows/safe-test-runner.yml"
-        self.workflow_sha = "b" * 40
-        self.ref_url = f"{backend.API_BASE}/repos/{backend.REPOSITORY}/git/ref/heads/main"
+        self.workflow_sha = "db38ef6e6cbc73d8e54b591d4f0eb747073d500b"
+        self.ref_url = f"{backend.API_BASE}/repos/{backend.REPOSITORY}/git/ref/tags/safe-test-runner-v1"
         self.run_id = 431
         self.run_url = f"{backend.API_BASE}/repos/{backend.REPOSITORY}/actions/runs/{self.run_id}"
         self.html_url = f"https://github.com/{backend.REPOSITORY}/actions/runs/{self.run_id}"
@@ -217,38 +216,38 @@ class GitHubActionsTransportTests(unittest.TestCase):
     def metadata(self, **changes):
         return dict({"id": 17, "path": backend.WORKFLOW_PATH, "state": "active"}, **changes)
 
-    def main_ref(self):
-        return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": self.workflow_sha}}
+    def source_ref(self):
+        return {"ref": "refs/tags/safe-test-runner-v1", "object": {"type": "commit", "sha": self.workflow_sha}}
 
     def test_distinct_workflow_and_candidate_identity(self):
         result, _, opener = self.invoke(self.valid_responses())
-        self.assertEqual(result.head_sha, "b" * 40)
+        self.assertEqual(result.head_sha, self.workflow_sha)
         self.assertEqual(json.loads(opener.calls[2][0].data)["inputs"]["candidate_sha"], "a" * 40)
         self.assertNotEqual(result.head_sha, self.request.candidate_sha)
 
-    def test_expected_workflow_sha_invalid_before_http(self):
-        for sha in (True, None, 1, b"b" * 40, "B" * 40, "b" * 39, "g" * 40, "b" * 40 + "\n"):
+    def test_call_cannot_override_configured_workflow_source(self):
+        for key in ("expected_workflow_sha", "workflow_source_sha", "workflow_ref", "return_run_details"):
             transport, opener = self.transport([])
-            with self.subTest(sha=sha), self.assertRaises(backend.GitHubTransportError):
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=sha,
+            with self.subTest(key=key), self.assertRaises(TypeError):
+                transport.dispatch_and_wait(self.request, **{key: "SENTINEL"},
                     request_timeout_seconds=5, overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertFalse(opener.calls)
         self.assertEqual(self.provider.call_count, 0)
 
-    def test_invalid_main_ref_blocks_before_post(self):
-        bad = [None, [], {}, {"ref": "refs/heads/main"}]
-        for ref in ("main", "refs/heads/other", None):
-            value = self.main_ref()
+    def test_invalid_source_ref_blocks_before_post(self):
+        bad = [None, [], {}, {"ref": "refs/tags/safe-test-runner-v1"}]
+        for ref in ("main", "refs/heads/main", "refs/heads/other", "refs/tags/other", None):
+            value = self.source_ref()
             value["ref"] = ref
             bad.append(value)
-        for obj in (None, [], {}, {"type": "tree", "sha": self.workflow_sha},
+        for obj in (None, [], {}, {"type": "tree", "sha": self.workflow_sha}, {"type": "tag", "sha": self.workflow_sha},
                     *({"type": "commit", "sha": sha} for sha in
                       (True, None, "B" * 40, "b" * 39, "a" * 40))):
-            bad.append({"ref": "refs/heads/main", "object": obj})
+            bad.append({"ref": "refs/tags/safe-test-runner-v1", "object": obj})
         for value in bad:
             transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(value)])
             with self.subTest(value=value), self.assertRaises(backend.GitHubTransportError):
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha,
+                transport.dispatch_and_wait(self.request,
                     request_timeout_seconds=5, overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertEqual([c[0].full_url for c in opener.calls], [self.workflow_url, self.ref_url])
             self.assertEqual([c[0].method for c in opener.calls], ["GET", "GET"])
@@ -260,7 +259,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
     def run_data(self, **changes):
         return dict({"id": self.run_id, "event": "workflow_dispatch", "status": "completed",
                      "conclusion": "success", "head_sha": self.workflow_sha, "run_attempt": 1,
-                     "workflow_id": 17, "path": backend.WORKFLOW_PATH + "@main", "head_branch": "main",
+                     "workflow_id": 17,
                      "repository": {"full_name": backend.REPOSITORY}}, **changes)
 
     def transport(self, responses, *, duration=0):
@@ -271,12 +270,19 @@ class GitHubActionsTransportTests(unittest.TestCase):
 
     def invoke(self, responses, **timeouts):
         transport, opener = self.transport(responses)
-        result = transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, **dict({"request_timeout_seconds": 5,
+        result = transport.dispatch_and_wait(self.request, **dict({"request_timeout_seconds": 5,
             "overall_timeout_seconds": 20, "poll_interval_seconds": 1}, **timeouts))
         return result, transport, opener
 
+    def expected_payload(self):
+        return {"ref": "safe-test-runner-v1", "return_run_details": True,
+                "inputs": {"candidate_sha": self.request.candidate_sha,
+                           "logical_test_id": self.request.logical_test_id,
+                           "argv_sha256": self.request.argv_sha256,
+                           "workflow_source_sha": self.workflow_sha}}
+
     def valid_responses(self, *runs):
-        return [FakeResponse(self.metadata()), FakeResponse(self.main_ref()), FakeResponse(self.dispatch()),
+        return [FakeResponse(self.metadata()), FakeResponse(self.source_ref()), FakeResponse(self.dispatch()),
                 *(FakeResponse(value) for value in (runs or (self.run_data(),)))]
 
     def test_exact_request_headers_body_and_returned_id_endpoints(self):
@@ -296,7 +302,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
             self.assertEqual(headers, expected)
             self.assertGreater(timeout, 0)
         self.assertEqual(opener.calls[2][0].data, json.dumps(
-            self.request.to_payload(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            self.expected_payload(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         self.assertEqual(self.provider.call_count, 4)
 
     def test_http_helper_rejects_destinations_before_credential(self):
@@ -310,6 +316,13 @@ class GitHubActionsTransportTests(unittest.TestCase):
             self.workflow_url + "/", "https://evil.invalid/arbitrary",
             self.workflow_url.replace("safe-test-runner.yml", "other.yml"),
             self.ref_url.replace("/git/ref/", "/git/refs/"),
+            self.ref_url.replace("tags/safe-test-runner-v1", "heads/main"),
+            self.ref_url.replace("safe-test-runner-v1", "other"),
+            self.ref_url + "?x=1", self.ref_url + "#fragment", self.ref_url + "/",
+            self.ref_url.replace("api.github.com", "api.github.com:443"),
+            self.ref_url.replace("api.github.com", "user@api.github.com"),
+            self.ref_url.replace("api.github.com", "evil.invalid"),
+            self.ref_url.replace("https://", "http://"),
             self.run_url.rsplit("/", 1)[0], None, True, 1,
         ]
         run_prefix = self.run_url.rsplit("/", 1)[0] + "/"
@@ -355,7 +368,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
                            ("path", "other.yml"), ("state", "disabled_manually"), ("state", None)):
             transport, opener = self.transport([FakeResponse(self.metadata(**{key: value}))])
             with self.subTest(key=key, value=value), self.assertRaises(backend.GitHubTransportError):
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                             overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertEqual(len(opener.calls), 1)
 
@@ -364,10 +377,10 @@ class GitHubActionsTransportTests(unittest.TestCase):
                            ("workflow_run_id", "431"), ("workflow_run_id", 431.0),
                            ("run_url", self.run_url + "/"), ("run_url", "https://evil.invalid"),
                            ("html_url", self.html_url + "?x=1")):
-            transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.main_ref()),
+            transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
                                                 FakeResponse(self.dispatch(**{key: value}))])
             with self.subTest(key=key, value=value), self.assertRaises(backend.GitHubTransportError):
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                             overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertEqual(len(opener.calls), 3)
             with self.assertRaises(backend.GitHubTransportError):
@@ -375,14 +388,13 @@ class GitHubActionsTransportTests(unittest.TestCase):
 
     def test_wrong_run_identity_is_rejected_immediately_even_when_queued(self):
         for key, value in (("id", 432), ("id", True), ("event", "push"), ("head_sha", "a" * 40),
-                           ("workflow_id", 18), ("workflow_id", True), ("path", backend.WORKFLOW_PATH),
-                           ("path", backend.WORKFLOW_PATH + "@task/other"), ("head_branch", "other"),
+                           ("workflow_id", 18), ("workflow_id", True),
                            ("repository", {"full_name": "other/repo"}), ("repository", None),
                            ("run_attempt", 2), ("run_attempt", True), ("run_attempt", 1.0)):
             responses = self.valid_responses(self.run_data(status="queued", conclusion=None, **{key: value}))
             transport, opener = self.transport(responses)
             with self.subTest(key=key, value=value), self.assertRaises(backend.GitHubTransportError):
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                             overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertEqual(len(opener.calls), 4)
             self.assertFalse(self.clock.sleeps)
@@ -394,10 +406,12 @@ class GitHubActionsTransportTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(backend.GitHubTransportError):
                 self.invoke(self.valid_responses(run))
 
-    def test_only_two_workflow_main_paths_accepted(self):
-        for path in backend.WORKFLOW_PATHS:
-            result, _, _ = self.invoke(self.valid_responses(self.run_data(path=path)))
-            self.assertEqual(result.path, path)
+    def test_run_path_and_head_branch_are_not_source_authority(self):
+        for extra in ({}, {"path": None, "head_branch": None},
+                      {"path": "undocumented-tag-format", "head_branch": "anything"}):
+            result, _, _ = self.invoke(self.valid_responses(self.run_data(**extra)))
+            self.assertEqual(result.head_sha, self.workflow_sha)
+            self.assertFalse({f.name for f in fields(result)} & {"path", "head_branch"})
 
     def test_all_known_nonterminal_states_poll_same_run(self):
         runs = [self.run_data(status=status, conclusion=None)
@@ -427,7 +441,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
                 responses[phase].status = status
                 transport, opener = self.transport(responses)
                 with self.subTest(phase=phase, status=status), self.assertRaises(backend.GitHubTransportError):
-                    transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                    transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                                 overall_timeout_seconds=20, poll_interval_seconds=1)
                 self.assertEqual(len(opener.calls), phase + 1)
 
@@ -485,7 +499,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
             responses[phase].url = "https://evil.invalid/" + self.token
             transport, opener = self.transport(responses)
             with self.subTest(phase=phase), self.assertRaises(backend.GitHubTransportError) as error:
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                             overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertNotIn(self.token, str(error.exception))
             self.assertEqual(len(opener.calls), phase + 1)
@@ -506,7 +520,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
             with self.subTest(exception=type(exception).__name__):
                 transport, opener = self.transport([exception])
                 with self.assertRaises(backend.GitHubTransportError) as error:
-                    transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                    transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                                 overall_timeout_seconds=20, poll_interval_seconds=1)
                 self.assertEqual(len(opener.calls), 1)
                 self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
@@ -514,7 +528,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
         self.provider.side_effect = RuntimeError(self.token)
         transport, opener = self.transport([])
         with self.assertRaises(backend.GitHubTransportError) as error:
-            transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                         overall_timeout_seconds=20, poll_interval_seconds=1)
         self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
         self.assertFalse(opener.calls)
@@ -524,7 +538,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
             self.provider.return_value = token
             transport, opener = self.transport([])
             with self.subTest(token=repr(token)), self.assertRaises(backend.GitHubTransportError) as error:
-                transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                             overall_timeout_seconds=20, poll_interval_seconds=1)
             self.assertEqual(str(error.exception), "Credential unavailable")
             self.assertFalse(opener.calls)
@@ -551,7 +565,7 @@ class GitHubActionsTransportTests(unittest.TestCase):
     def test_timeout_validation_including_bool_nan_and_infinity(self):
         for name, values in (("request_timeout_seconds", [False, True, 0, -1, 31, float("nan"), float("inf"), "1"]),
                              ("overall_timeout_seconds", [True, 0, -1, 601, float("nan"), float("inf")]),
-                             ("poll_interval_seconds", [False, -1, 31, float("nan"), float("inf")])):
+                             ("poll_interval_seconds", [False, True, 0, 0.5, -1, 31, float("nan"), float("inf")])):
             for value in values:
                 with self.subTest(name=name, value=value), self.assertRaises(backend.GitHubTransportError):
                     self.invoke([], **{name: value})
@@ -560,22 +574,22 @@ class GitHubActionsTransportTests(unittest.TestCase):
     def test_absolute_deadline_caps_sleep_and_stops_polling(self):
         transport, opener = self.transport(self.valid_responses(self.run_data(status="queued", conclusion=None)))
         with self.assertRaises(backend.GitHubTransportError):
-            transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=5,
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
                                         overall_timeout_seconds=2, poll_interval_seconds=30)
         self.assertEqual(self.clock.sleeps, [2])
         self.assertEqual(len(opener.calls), 4)
 
     def test_each_request_timeout_is_capped_by_remaining_overall_time(self):
         transport, opener = self.transport(self.valid_responses(), duration=1)
-        transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=30,
-                                    overall_timeout_seconds=5, poll_interval_seconds=0)
+        transport.dispatch_and_wait(self.request, request_timeout_seconds=30,
+                                    overall_timeout_seconds=5, poll_interval_seconds=1)
         self.assertEqual([call[1] for call in opener.calls], [5, 4, 3, 2])
 
     def test_late_response_cannot_succeed_after_deadline(self):
         transport, opener = self.transport(self.valid_responses(), duration=3)
         with self.assertRaises(backend.GitHubTransportError):
-            transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=1,
-                                        overall_timeout_seconds=2, poll_interval_seconds=0)
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=1,
+                                        overall_timeout_seconds=2, poll_interval_seconds=1)
         self.assertEqual(len(opener.calls), 1)
 
     def test_credential_acquisition_time_counts_against_deadline(self):
@@ -585,15 +599,119 @@ class GitHubActionsTransportTests(unittest.TestCase):
         self.provider.side_effect = delayed
         transport, opener = self.transport([])
         with self.assertRaises(backend.GitHubTransportError):
-            transport.dispatch_and_wait(self.request, expected_workflow_sha=self.workflow_sha, request_timeout_seconds=1,
-                                        overall_timeout_seconds=2, poll_interval_seconds=0)
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=1,
+                                        overall_timeout_seconds=2, poll_interval_seconds=1)
         self.assertFalse(opener.calls)
 
     def test_extra_remote_fields_ignored_without_retaining_raw_response(self):
-        responses = [FakeResponse(self.metadata(extra=self.token)), FakeResponse(self.main_ref()), FakeResponse(self.dispatch(extra=self.token)),
+        responses = [FakeResponse(self.metadata(extra=self.token)), FakeResponse(self.source_ref()), FakeResponse(self.dispatch(extra=self.token)),
                      FakeResponse(self.run_data(extra=self.token))]
         result, _, _ = self.invoke(responses)
         self.assertNotIn(self.token, repr(result))
+
+    def test_pre_dispatch_failure_has_no_run_identity(self):
+        for responses in ([RuntimeError(self.token)],
+                          [FakeResponse(self.metadata()), FakeResponse({})]):
+            with self.subTest(responses=len(responses)), self.assertRaises(backend.GitHubTransportError) as error:
+                self.invoke(responses)
+            self.assertIsNone(error.exception.workflow_run_id)
+
+    def test_post_dispatch_failures_keep_id_without_secret_or_exception_chain(self):
+        for failure in (RuntimeError(self.token), URLError(self.token),
+                        FakeResponse({}, raw=self.token.encode()),
+                        FakeResponse(self.run_data(id=999)),
+                        FakeResponse(self.run_data(), status=500)):
+            transport, opener = self.transport(self.valid_responses()[:3] + [failure])
+            with self.subTest(failure=type(failure).__name__), self.assertRaises(backend.GitHubTransportError) as error:
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
+                                            overall_timeout_seconds=20, poll_interval_seconds=1)
+            self.assertEqual(error.exception.workflow_run_id, self.run_id)
+            self.assertEqual(vars(error.exception), {"workflow_run_id": self.run_id})
+            self.assertIsNone(error.exception.__context__)
+            self.assertIsNone(error.exception.__cause__)
+            self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
+            self.assertEqual(sum(c[0].method == "POST" for c in opener.calls), 1)
+            self.assertEqual(opener.calls[-1][0].full_url, self.run_url)
+
+    def test_post_dispatch_timeout_and_sleep_failure_keep_id(self):
+        for broken_sleep in (False, True):
+            transport, opener = self.transport(self.valid_responses(self.run_data(status="queued", conclusion=None)))
+            if broken_sleep:
+                transport._sleep = mock.Mock(side_effect=RuntimeError(self.token))
+            with self.subTest(broken_sleep=broken_sleep), self.assertRaises(backend.GitHubTransportError) as error:
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
+                                            overall_timeout_seconds=2, poll_interval_seconds=30)
+            self.assertEqual(error.exception.workflow_run_id, self.run_id)
+            self.assertIsNone(error.exception.__context__)
+            self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
+            self.assertEqual(sum(c[0].method == "POST" for c in opener.calls), 1)
+
+    def test_successful_dispatch_id_survives_subsequent_response_identity_failure(self):
+        responses = self.valid_responses()
+        responses[2] = FakeResponse(self.dispatch(run_url="https://evil.invalid/" + self.token))
+        transport, opener = self.transport(responses)
+        with self.assertRaises(backend.GitHubTransportError) as error:
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
+                                        overall_timeout_seconds=20, poll_interval_seconds=1)
+        self.assertEqual(error.exception.workflow_run_id, self.run_id)
+        self.assertIsNone(error.exception.__context__)
+        self.assertNotIn(self.token, repr(error.exception))
+        self.assertEqual(len(opener.calls), 3)
+
+    def test_invalid_dispatch_id_is_never_failure_metadata(self):
+        for value in (None, True, 0, -1, "431", 431.0):
+            responses = self.valid_responses()
+            responses[2] = FakeResponse(self.dispatch(workflow_run_id=value))
+            with self.subTest(value=value), self.assertRaises(backend.GitHubTransportError) as error:
+                self.invoke(responses)
+            self.assertIsNone(error.exception.workflow_run_id)
+
+    def test_decoded_dispatch_id_survives_response_close_failure(self):
+        token = self.token
+        class BrokenClose(FakeResponse):
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                raise RuntimeError(token)
+        responses = self.valid_responses()
+        responses[2] = BrokenClose(self.dispatch())
+        transport, opener = self.transport(responses)
+        with self.assertRaises(backend.GitHubTransportError) as error:
+            transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
+                                        overall_timeout_seconds=20, poll_interval_seconds=1)
+        self.assertEqual(error.exception.workflow_run_id, self.run_id)
+        self.assertIsNone(error.exception.__context__)
+        self.assertNotIn(token, "".join(traceback.format_exception(error.exception)))
+        self.assertEqual(len(opener.calls), 3)
+
+    def test_deadline_after_dispatch_decode_keeps_id_and_does_not_poll(self):
+        decode = json.loads
+        def delayed_decode(body, **kwargs):
+            value = decode(body, **kwargs)
+            if type(value) is dict and "workflow_run_id" in value:
+                self.clock.now += 21
+            return value
+        transport, opener = self.transport(self.valid_responses())
+        with mock.patch.object(backend.json, "loads", side_effect=delayed_decode):
+            with self.assertRaises(backend.GitHubTransportError) as error:
+                transport.dispatch_and_wait(self.request, request_timeout_seconds=5,
+                                            overall_timeout_seconds=20, poll_interval_seconds=1)
+        self.assertEqual(error.exception.workflow_run_id, self.run_id)
+        self.assertIsNone(error.exception.__context__)
+        self.assertEqual(len(opener.calls), 3)
+        self.assertEqual(sum(c[0].method == "POST" for c in opener.calls), 1)
+
+    def test_positive_poll_bounds_accepted(self):
+        for interval in (1, 30):
+            with self.subTest(interval=interval):
+                result, _, _ = self.invoke(self.valid_responses(), poll_interval_seconds=interval)
+                self.assertEqual(result.conclusion, "success")
+
+    def test_success_grants_no_approval_or_mutation_authority(self):
+        result, _, _ = self.invoke(self.valid_responses())
+        self.assertFalse({f.name for f in fields(result)} & {
+            "approval", "technical_approval", "security_approval", "human_approval",
+            "merge_authority", "production_authority"})
+        self.assertEqual(self.config.activation, "disabled")
 
 
 if __name__ == "__main__":

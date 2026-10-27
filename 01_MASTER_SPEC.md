@@ -1559,3 +1559,19 @@ Este incremento no implementa publicador, transporte ni acceso GitHub.
 Una intersección declarativa válida no es aprobación ni autorización de ejecución.
 No crea tags, credenciales, PAT o DPAPI; no activa backend, engine wiring,
 workflow dispatch ni modifica Rulesets. ACTIVATION_BLOCKER_FUTURE=OPEN.
+
+### SAFE_TEST_GITHUB_SOURCE_PIN_030B - disabled control-plane source pin
+
+El backend GitHub desacoplado usa el tag protegido `safe-test-runner-v1` y el
+workflow_source_sha exacto `db38ef6e6cbc73d8e54b591d4f0eb747073d500b`.
+Ref/SHA son autoridad de configuracion validada, nunca del Task Packet o
+DispatchRequest. Antes del dispatch se verifican el tag exacto (objeto commit)
+y la identidad/path/state del workflow registrado. Cada run observado exige
+head_sha igual al SHA fuente fijado, workflow_id, repositorio, evento e intento
+exactos; no se infiere autoridad de head_branch ni del path REST del run.
+El workflow protegido verifica independientemente ref completo, tipo tag,
+proteccion y SHA. Un fallo posterior al ID de dispatch conserva solo ese ID
+como evidencia de reconciliacion, sin redispatch ni datos remotos sensibles.
+Backend disabled y sin wiring; success es evidencia, no aprobacion tecnica,
+de seguridad, humana, de merge o produccion. Credenciales y activacion quedan
+para trabajo futuro separado.
