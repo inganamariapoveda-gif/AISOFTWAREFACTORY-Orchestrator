@@ -227,11 +227,13 @@ def validate_safe_test_backend(policies: dict[str, Any]) -> dict[str, Any] | Non
         raise ConfigError("safe test backend must be github_actions and disabled")
     _validate_safe_test_credential_strategy(block["credential_strategy"])
     github = _closed_mapping(block["github"],
-                             {"repository", "workflow_id", "workflow_ref", "api_version", "return_run_details"},
+                             {"repository", "workflow_id", "workflow_ref", "workflow_source_sha",
+                              "api_version", "return_run_details"},
                              "safe_test_backend.github")
     expected = {
         "repository": "inganamariapoveda-gif/AISOFTWAREFACTORY-Orchestrator",
-        "workflow_id": "safe-test-runner.yml", "workflow_ref": "main",
+        "workflow_id": "safe-test-runner.yml", "workflow_ref": "safe-test-runner-v1",
+        "workflow_source_sha": "db38ef6e6cbc73d8e54b591d4f0eb747073d500b",
         "api_version": "2026-03-10", "return_run_details": True,
     }
     if github != expected or github["return_run_details"] is not True:
