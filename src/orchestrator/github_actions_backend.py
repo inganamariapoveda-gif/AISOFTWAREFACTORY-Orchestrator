@@ -300,35 +300,29 @@ class GitHubActionsTransport:
             self._remaining(deadline)
         return result
 
-    def dispatch_and_wait(self, request: DispatchRequest, *,
-                          request_timeout_seconds: float,
-                          overall_timeout_seconds: float, poll_interval_seconds: float) -> WorkflowRunSnapshot:
-        """One dispatch from validated configuration; success never grants approval.
-
-        Task inputs identify only the candidate/test. The protected tag and
-        source SHA belong exclusively to the validated control-plane config.
-        """
-        if type(request) is not DispatchRequest:
-            raise GitHubTransportError("Invalid dispatch request")
-        request.__post_init__()
+    def _deadline(self, request_timeout, overall_timeout, poll_interval):
         self._config.__post_init__()
-        for value, minimum, maximum in ((request_timeout_seconds, 0, 30),
-                                        (overall_timeout_seconds, 0, 600),
-                                        (poll_interval_seconds, 1, 30)):
+        for value, minimum, maximum in ((request_timeout, 0, 30),
+                                        (overall_timeout, 0, 600), (poll_interval, 1, 30)):
             if (type(value) not in (int, float) or not minimum <= value <= maximum
                     or value == 0):
                 raise GitHubTransportError("Invalid timeout")
-        deadline = self._monotonic() + overall_timeout_seconds
+        return self._monotonic() + overall_timeout
+
+    def _workflow_identity(self, deadline, request_timeout):
         workflow_url = f"{API_BASE}/repos/{REPOSITORY}/actions/workflows/{self._config.workflow_id}"
-        metadata = self._request(workflow_url, None, deadline, request_timeout_seconds)
+        metadata = self._request(workflow_url, None, deadline, request_timeout)
         workflow = WorkflowIdentity(metadata.get("id"), metadata.get("path"), metadata.get("state"))
         source = self._request(f"{API_BASE}/repos/{REPOSITORY}/git/ref/tags/safe-test-runner-v1",
-                               None, deadline, request_timeout_seconds)
+                               None, deadline, request_timeout)
         obj = source.get("object")
         if (source.get("ref") != "refs/tags/safe-test-runner-v1" or type(obj) is not dict
                 or obj.get("type") != "commit" or type(obj.get("sha")) is not str
                 or obj["sha"] != self._config.workflow_source_sha):
             raise GitHubTransportError("Workflow source tag identity mismatch")
+        return workflow
+
+    def _dispatch_once(self, request, deadline, request_timeout):
         payload = {
             "ref": self._config.workflow_ref,
             "return_run_details": self._config.return_run_details,
@@ -339,39 +333,87 @@ class GitHubActionsTransport:
         }
         workflow_run_id = None
         try:
-            dispatch_data = self._request(workflow_url + "/dispatches", payload, deadline,
-                                          request_timeout_seconds)
-            returned_id = dispatch_data.get("workflow_run_id")
-            _positive_id(returned_id)
-            workflow_run_id = returned_id
-            # Retain the established ID even if subsequent URL validation fails.
-            dispatch = DispatchResponse(workflow_run_id, dispatch_data.get("run_url"),
-                                        dispatch_data.get("html_url"))
+            url = f"{API_BASE}/repos/{REPOSITORY}/actions/workflows/{self._config.workflow_id}/dispatches"
+            data = self._request(url, payload, deadline, request_timeout)
+            _positive_id(data.get("workflow_run_id"))
+            workflow_run_id = data["workflow_run_id"]
+            result = DispatchResponse(workflow_run_id, data.get("run_url"), data.get("html_url"))
             self._remaining(deadline)
-            # Build locally, never use a server-provided URL as an endpoint.
-            run_url = _run_url(dispatch.workflow_run_id)
-            while True:
-                data = self._request(run_url, None, deadline, request_timeout_seconds)
-                required = {"id", "event", "status", "conclusion", "head_sha", "run_attempt",
-                            "workflow_id", "repository"}
-                if not required <= data.keys() or type(data["repository"]) is not dict:
-                    raise GitHubTransportError("Incomplete workflow run metadata")
-                snapshot = WorkflowRunSnapshot(
-                    data["id"], data["event"], data["status"], data["conclusion"], data["head_sha"],
-                    data["run_attempt"], data["workflow_id"], data["repository"].get("full_name"),
-                )
-                if (snapshot.run_id != workflow_run_id or snapshot.workflow_id != workflow.workflow_id
-                        or snapshot.head_sha != self._config.workflow_source_sha):
-                    raise GitHubTransportError("Workflow run continuity mismatch")
-                remaining = self._remaining(deadline)
-                if snapshot.status == "completed":
-                    return snapshot
-                self._sleep(min(poll_interval_seconds, remaining))
+            return result
         except GitHubTransportError as error:
             if workflow_run_id is None:
                 workflow_run_id = error.workflow_run_id
         except Exception:
-            # Raise outside the exception context. No response, remote URL,
-            # credential, or dependency exception chain is exposed or retained.
+            pass
+        # None after a POST attempt does NOT prove the server did not receive it.
+        raise GitHubTransportError("Dispatch or run observation failed", workflow_run_id=workflow_run_id)
+
+    def _wait_existing(self, workflow_run_id, workflow, deadline, request_timeout, poll_interval):
+        # This path has no dispatch call and all HTTP calls have payload=None (GET).
+        run_url = _run_url(workflow_run_id)
+        while True:
+            data = self._request(run_url, None, deadline, request_timeout)
+            required = {"id", "event", "status", "conclusion", "head_sha", "run_attempt",
+                        "workflow_id", "repository"}
+            if not required <= data.keys() or type(data["repository"]) is not dict:
+                raise GitHubTransportError("Incomplete workflow run metadata")
+            snapshot = WorkflowRunSnapshot(
+                data["id"], data["event"], data["status"], data["conclusion"], data["head_sha"],
+                data["run_attempt"], data["workflow_id"], data["repository"].get("full_name"),
+            )
+            if (snapshot.run_id != workflow_run_id or snapshot.workflow_id != workflow.workflow_id
+                    or snapshot.head_sha != self._config.workflow_source_sha):
+                raise GitHubTransportError("Workflow run continuity mismatch")
+            remaining = self._remaining(deadline)
+            if snapshot.status == "completed":
+                return snapshot
+            self._sleep(min(poll_interval, remaining))
+
+    def dispatch(self, request: DispatchRequest, *, request_timeout_seconds: float,
+                 overall_timeout_seconds: float) -> DispatchResponse:
+        """One validated dispatch, no polling or retry.
+
+        A future coordinator must durably mark DISPATCH_ATTEMPTED before calling
+        this method. No missing ID authorizes redispatch; this transport does not
+        persist evidence or grant execution authority.
+        """
+        if type(request) is not DispatchRequest:
+            raise GitHubTransportError("Invalid dispatch request")
+        request.__post_init__()
+        deadline = self._deadline(request_timeout_seconds, overall_timeout_seconds, 1)
+        self._workflow_identity(deadline, request_timeout_seconds)
+        return self._dispatch_once(request, deadline, request_timeout_seconds)
+
+    def observe(self, workflow_run_id: int, *, request_timeout_seconds: float,
+                overall_timeout_seconds: float, poll_interval_seconds: float) -> WorkflowRunSnapshot:
+        """GET-only observation of an existing ID; no approval or redispatch.
+
+        The caller must obtain the ID from trusted operational evidence. There
+        is no run discovery by time, branch or latest-result heuristics.
+        """
+        _positive_id(workflow_run_id)
+        deadline = self._deadline(request_timeout_seconds, overall_timeout_seconds, poll_interval_seconds)
+        try:
+            workflow = self._workflow_identity(deadline, request_timeout_seconds)
+            return self._wait_existing(workflow_run_id, workflow, deadline,
+                                       request_timeout_seconds, poll_interval_seconds)
+        except Exception:
             pass
         raise GitHubTransportError("Dispatch or run observation failed", workflow_run_id=workflow_run_id)
+
+    def dispatch_and_wait(self, request: DispatchRequest, *,
+                          request_timeout_seconds: float,
+                          overall_timeout_seconds: float, poll_interval_seconds: float) -> WorkflowRunSnapshot:
+        """Compatibility composition with one shared deadline and at most one POST."""
+        if type(request) is not DispatchRequest:
+            raise GitHubTransportError("Invalid dispatch request")
+        request.__post_init__()
+        deadline = self._deadline(request_timeout_seconds, overall_timeout_seconds, poll_interval_seconds)
+        workflow = self._workflow_identity(deadline, request_timeout_seconds)
+        dispatch = self._dispatch_once(request, deadline, request_timeout_seconds)
+        try:
+            return self._wait_existing(dispatch.workflow_run_id, workflow, deadline,
+                                       request_timeout_seconds, poll_interval_seconds)
+        except Exception:
+            pass
+        raise GitHubTransportError("Dispatch or run observation failed", workflow_run_id=dispatch.workflow_run_id)
