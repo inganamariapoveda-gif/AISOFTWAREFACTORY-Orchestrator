@@ -418,6 +418,20 @@ class Store:
         """
         return self._advance_external_operation(operation_id, "PREPARED", "DISPATCH_ATTEMPTED", {})
 
+    def claim_external_dispatch(self, operation_id: int) -> bool:
+        """Only the transaction advancing PREPARED acquires dispatch authority."""
+        with self._write_transaction():
+            row = self.get_external_operation(operation_id)
+            if row is None:
+                raise StoreError("external operation not found")
+            if row["phase"] != "PREPARED":
+                return False
+            self._conn.execute(
+                "UPDATE external_operation SET phase = 'DISPATCH_ATTEMPTED', updated_at = ? WHERE id = ?",
+                (_utcnow(), operation_id),
+            )
+            return True
+
     def bind_external_operation(
         self, operation_id: int, *, remote_operation_id: str,
     ) -> dict[str, Any]:
