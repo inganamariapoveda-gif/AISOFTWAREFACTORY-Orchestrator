@@ -33,6 +33,257 @@ class StoreTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class ExternalOperationStoreTests(StoreTestCase):
+    def setUp(self):
+        super().setUp()
+        self.store.register_project("SAMPLE", "Sample", ".", "ref")
+        self.store.create_task("T-1", "SAMPLE", "Title", "Need")
+        self.intent = dict(provider="github_actions", operation_type="workflow_dispatch",
+                           operation_key="a" * 64, request_fingerprint="b" * 64)
+
+    def prepare(self, **changes):
+        return self.store.prepare_external_operation("T-1", **dict(self.intent, **changes))
+
+    def identified(self):
+        row = self.prepare()
+        self.store.mark_external_dispatch_attempted(row["id"])
+        return self.store.bind_external_operation(row["id"], remote_operation_id="431")
+
+    def terminal(self, operation_id, **changes):
+        return self.store.complete_external_operation(operation_id, **dict(
+            dict(remote_operation_id="431", terminal_status="completed", terminal_result="success"), **changes))
+
+    def test_prepared_durable_and_queries(self):
+        row = self.prepare()
+        self.assertEqual(row["phase"], "PREPARED")
+        self.assertIsNone(row["remote_operation_id"])
+        self.assertIsNone(row["terminal_status"])
+        self.assertIsNone(row["terminal_result"])
+        self.store.close()
+        self.store = Store(Path(self._tmp.name) / "test.db")
+        self.assertEqual(self.store.get_external_operation(row["id"]), row)
+        self.assertEqual(self.store.get_external_operation_by_key("a" * 64), row)
+        self.assertIsNone(self.store.get_external_operation_by_key("c" * 64))
+
+    def test_intent_idempotent_and_conflicts(self):
+        row = self.prepare()
+        self.assertEqual(self.prepare(), row)
+        for field, value in (("provider", "other"), ("operation_type", "other"),
+                             ("request_fingerprint", "c" * 64)):
+            with self.subTest(field=field), self.assertRaises(StoreError):
+                self.prepare(**{field: value})
+        self.store.create_task("T-2", "SAMPLE", "Other", "Need")
+        with self.assertRaises(StoreError):
+            self.store.prepare_external_operation("T-2", **self.intent)
+        self.assertEqual(self.store.get_external_operation(row["id"]), row)
+
+    def test_strict_hash_and_metadata_structure(self):
+        for field in ("operation_key", "request_fingerprint"):
+            for value in (None, True, 1, "A" * 64, "g" * 64, "a" * 63, "a" * 65, "a" * 64 + "\n"):
+                with self.subTest(field=field, value=value), self.assertRaises(StoreError):
+                    self.prepare(**{field: value})
+        for field in ("provider", "operation_type"):
+            with self.subTest(field=field), self.assertRaises(StoreError) as error:
+                self.prepare(**{field: "SECRET_SENTINEL\n"})
+            self.assertNotIn("SECRET_SENTINEL", str(error.exception))
+        for value in (True, 0, -1, "1", None):
+            with self.subTest(value=value), self.assertRaises(StoreError):
+                self.store.get_external_operation(value)
+        with self.assertRaises(StoreError):
+            self.store.prepare_external_operation("MISSING", **self.intent)
+
+    def test_attempted_without_id_survives_restart_and_replay(self):
+        row = self.prepare()
+        attempted = self.store.mark_external_dispatch_attempted(row["id"])
+        self.assertEqual(attempted["phase"], "DISPATCH_ATTEMPTED")
+        self.assertIsNone(attempted["remote_operation_id"])
+        self.store.close()
+        self.store = Store(Path(self._tmp.name) / "test.db")
+        self.assertEqual(self.prepare(), attempted)
+        self.assertEqual(self.store.mark_external_dispatch_attempted(row["id"]), attempted)
+        # No automatic operation replacement, phase reset or provider invocation.
+        self.assertEqual(self.store._conn.execute("SELECT count(*) FROM external_operation").fetchone()[0], 1)
+
+    def test_forward_only_no_skipped_phases(self):
+        row = self.prepare()
+        with self.assertRaises(StoreError):
+            self.store.bind_external_operation(row["id"], remote_operation_id="431")
+        with self.assertRaises(StoreError):
+            self.terminal(row["id"])
+        self.store.mark_external_dispatch_attempted(row["id"])
+        with self.assertRaises(StoreError):
+            self.terminal(row["id"])
+        self.store.bind_external_operation(row["id"], remote_operation_id="431")
+        with self.assertRaises(StoreError):
+            self.store.mark_external_dispatch_attempted(row["id"])
+        self.terminal(row["id"])
+        with self.assertRaises(StoreError):
+            self.store.bind_external_operation(row["id"], remote_operation_id="431")
+        with self.assertRaises(StoreError):
+            self.store.mark_external_dispatch_attempted(999)
+
+    def test_binding_idempotent_conflicting_identity_rejected(self):
+        row = self.identified()
+        self.assertEqual(self.store.bind_external_operation(row["id"], remote_operation_id="431"), row)
+        with self.assertRaises(StoreError):
+            self.store.bind_external_operation(row["id"], remote_operation_id="432")
+        self.assertEqual(self.store.get_external_operation(row["id"]), row)
+        self.store.close()
+        self.store = Store(Path(self._tmp.name) / "test.db")
+        self.assertEqual(self.store.get_external_operation(row["id"]), row)
+
+    def test_remote_identity_unique_within_provider_and_type(self):
+        self.identified()
+        other = self.prepare(operation_key="c" * 64)
+        attempted = self.store.mark_external_dispatch_attempted(other["id"])
+        with self.assertRaises(StoreError) as error:
+            self.store.bind_external_operation(other["id"], remote_operation_id="431")
+        self.assertIsNone(error.exception.__context__)
+        self.assertEqual(self.store.get_external_operation(other["id"]), attempted)
+        for changes in ({"provider": "other"}, {"operation_type": "other"}):
+            key = "d" * 64 if "provider" in changes else "e" * 64
+            row = self.prepare(operation_key=key, **changes)
+            self.store.mark_external_dispatch_attempted(row["id"])
+            self.store.bind_external_operation(row["id"], remote_operation_id="431")
+
+    def test_terminal_idempotence_conflicts_and_restart(self):
+        row = self.identified()
+        with self.assertRaises(StoreError):
+            self.terminal(row["id"], remote_operation_id="432")
+        terminal = self.terminal(row["id"])
+        self.assertEqual(terminal["phase"], "TERMINAL_OBSERVED")
+        self.assertEqual(self.terminal(row["id"]), terminal)
+        for changes in ({"terminal_result": "failure"}, {"terminal_status": "other"},
+                        {"remote_operation_id": "432"}):
+            with self.subTest(changes=changes), self.assertRaises(StoreError):
+                self.terminal(row["id"], **changes)
+        self.store.close()
+        self.store = Store(Path(self._tmp.name) / "test.db")
+        self.assertEqual(self.terminal(row["id"]), terminal)
+        self.assertEqual(self.prepare(), terminal)
+
+    def test_no_task_budget_history_or_approval_side_effects(self):
+        task = self.store.get_task("T-1")
+        history = self.store.get_history("T-1")
+        result = self.terminal(self.identified()["id"])
+        self.assertEqual(self.store.get_task("T-1"), task)
+        self.assertEqual(self.store.get_history("T-1"), history)
+        self.assertEqual(self.store.list_agent_runs("T-1"), [])
+        self.assertIsNone(self.store.get_suspension("T-1"))
+        self.assertFalse(set(result) & {"approval", "technical_approval", "human_approval", "token", "body"})
+
+    def _race_external_writes(self, actions):
+        # Independent connections, synchronized start, no sleeps or fixed winner.
+        barrier = threading.Barrier(2)
+        outcomes = [None, None]
+        updates = [[], []]
+        def worker(index):
+            try:
+                with Store(Path(self._tmp.name) / "test.db") as other:
+                    other._conn.set_trace_callback(lambda sql: updates[index].append(sql)
+                        if sql.startswith("UPDATE external_operation ") else None)
+                    barrier.wait(timeout=10)
+                    outcomes[index] = ("ok", actions[index](other))
+            except Exception as error:
+                outcomes[index] = ("error", error)
+        workers = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertTrue(all(outcome is not None for outcome in outcomes))
+        return outcomes, updates
+
+    def test_concurrent_binding_same_operation_same_remote_id_is_idempotent(self):
+        operation = self.prepare()
+        self.store.mark_external_dispatch_attempted(operation["id"])
+        action = lambda store: store.bind_external_operation(operation["id"], remote_operation_id="431")
+        outcomes, updates = self._race_external_writes([action, action])
+        self.assertEqual([kind for kind, _ in outcomes], ["ok", "ok"])
+        final = self.store.get_external_operation(operation["id"])
+        self.assertEqual(final["phase"], "RUN_IDENTIFIED")
+        self.assertEqual(final["remote_operation_id"], "431")
+        self.assertEqual([row for _, row in outcomes], [final, final])
+        self.assertEqual(sum(map(len, updates)), 1)
+        self.assertEqual(self.store._conn.execute("SELECT count(*) FROM external_operation").fetchone()[0], 1)
+
+    def test_concurrent_binding_different_operations_same_remote_id_has_one_winner(self):
+        operations = [self.prepare(), self.prepare(operation_key="c" * 64)]
+        before = [self.store.mark_external_dispatch_attempted(row["id"]) for row in operations]
+        actions = [lambda store, op_id=row["id"]: store.bind_external_operation(op_id, remote_operation_id="431")
+                   for row in operations]
+        outcomes, _ = self._race_external_writes(actions)
+        self.assertEqual(sorted(kind for kind, _ in outcomes), ["error", "ok"])
+        for index, (kind, value) in enumerate(outcomes):
+            final = self.store.get_external_operation(operations[index]["id"])
+            if kind == "ok":
+                self.assertEqual(final, value)
+                self.assertEqual(final["phase"], "RUN_IDENTIFIED")
+                self.assertEqual(final["remote_operation_id"], "431")
+            else:
+                self.assertIs(type(value), StoreError)
+                self.assertEqual(str(value), "external operation uniqueness or structure conflict")
+                self.assertIsNone(value.__context__)
+                self.assertEqual(final, before[index])
+        self.assertEqual(self.store._conn.execute(
+            "SELECT count(*) FROM external_operation WHERE remote_operation_id = '431'"
+        ).fetchone()[0], 1)
+
+    def test_concurrent_terminalization_identical_evidence_is_idempotent(self):
+        operation = self.identified()
+        action = lambda store: store.complete_external_operation(operation["id"],
+            remote_operation_id="431", terminal_status="completed", terminal_result="success")
+        outcomes, updates = self._race_external_writes([action, action])
+        self.assertEqual([kind for kind, _ in outcomes], ["ok", "ok"])
+        final = self.store.get_external_operation(operation["id"])
+        self.assertEqual(final["phase"], "TERMINAL_OBSERVED")
+        self.assertEqual((final["remote_operation_id"], final["terminal_status"], final["terminal_result"]),
+                         ("431", "completed", "success"))
+        self.assertEqual([row for _, row in outcomes], [final, final])
+        self.assertEqual(sum(map(len, updates)), 1)
+
+    def test_concurrent_terminalization_conflicting_evidence_has_one_winner(self):
+        operation = self.identified()
+        results = ["success", "failure"]
+        actions = [lambda store, result=result: store.complete_external_operation(operation["id"],
+            remote_operation_id="431", terminal_status="completed", terminal_result=result) for result in results]
+        outcomes, updates = self._race_external_writes(actions)
+        self.assertEqual(sorted(kind for kind, _ in outcomes), ["error", "ok"])
+        final = self.store.get_external_operation(operation["id"])
+        self.assertEqual(final["phase"], "TERMINAL_OBSERVED")
+        self.assertEqual(final["remote_operation_id"], "431")
+        self.assertEqual(final["terminal_status"], "completed")
+        for index, (kind, value) in enumerate(outcomes):
+            if kind == "ok":
+                self.assertEqual(final, value)
+                self.assertEqual(final["terminal_result"], results[index])
+            else:
+                self.assertIs(type(value), StoreError)
+                self.assertEqual(str(value), "external operation phase conflict")
+                self.assertNotEqual(final["terminal_result"], results[index])
+        self.assertEqual(sum(map(len, updates)), 1)
+
+    def test_concurrent_same_key_has_one_identity(self):
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def worker():
+            try:
+                with Store(Path(self._tmp.name) / "test.db") as other:
+                    barrier.wait(timeout=10)
+                    results.append(other.prepare_external_operation("T-1", **self.intent)["id"])
+            except Exception as error:
+                errors.append(type(error).__name__)
+        workers = [threading.Thread(target=worker) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(set(results)), 1)
+
+
 class ResourceBudgetStoreTests(StoreTestCase):
     def test_profile_correction_ceiling_isolated_from_invocation_limits(self):
         limits = self.policies["resource_budget"]["profiles"]["standard"]

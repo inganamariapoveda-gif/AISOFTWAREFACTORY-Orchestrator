@@ -714,5 +714,168 @@ class GitHubActionsTransportTests(unittest.TestCase):
         self.assertEqual(self.config.activation, "disabled")
 
 
+    def observe_existing(self, transport, **timeouts):
+        return transport.observe(self.run_id, **dict(
+            {"request_timeout_seconds": 5, "overall_timeout_seconds": 20,
+             "poll_interval_seconds": 1}, **timeouts))
+
+    def test_separate_dispatch_performs_one_post_without_polling(self):
+        transport, opener = self.transport(self.valid_responses()[:3])
+        result = transport.dispatch(self.request, request_timeout_seconds=5, overall_timeout_seconds=20)
+        self.assertEqual(result.workflow_run_id, self.run_id)
+        self.assertEqual([call[0].method for call in opener.calls], ["GET", "GET", "POST"])
+        self.assertFalse(self.clock.sleeps)
+
+    def test_observer_get_only_continues_known_run_to_terminal(self):
+        responses = [FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
+                     FakeResponse(self.run_data(status="queued", conclusion=None)), FakeResponse(self.run_data())]
+        transport, opener = self.transport(responses)
+        with mock.patch.object(transport, "dispatch", side_effect=AssertionError("dispatch forbidden")), \
+             mock.patch.object(transport, "_dispatch_once", side_effect=AssertionError("POST forbidden")):
+            result = self.observe_existing(transport)
+        self.assertEqual(result.run_id, self.run_id)
+        self.assertEqual(result.conclusion, "success")
+        self.assertEqual(self.clock.sleeps, [1])
+        self.assertEqual([call[0].full_url for call in opener.calls],
+                         [self.workflow_url, self.ref_url, self.run_url, self.run_url])
+        self.assertTrue(all(call[0].method == "GET" and call[0].data is None for call in opener.calls))
+        self.assertFalse({f.name for f in fields(result)} & {
+            "approval", "technical_approval", "security_approval", "human_approval",
+            "merge_authority", "production_authority"})
+
+    def test_observer_rejects_each_wrong_or_missing_run_identity(self):
+        changes = [("id", 432), ("workflow_id", 18), ("repository", {"full_name": "other/repo"}),
+                   ("event", "push"), ("run_attempt", 2), ("head_sha", "a" * 40)]
+        runs = [self.run_data(**{key: value}) for key, value in changes]
+        for field in self.run_data():
+            run = self.run_data()
+            del run[field]
+            runs.append(run)
+        for run in runs:
+            with self.subTest(run=run):
+                transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()), FakeResponse(run)])
+                with self.assertRaises(backend.GitHubTransportError) as error:
+                    self.observe_existing(transport)
+                self.assertEqual(error.exception.workflow_run_id, self.run_id)
+                self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+
+    def test_observer_rejects_invalid_input_id_without_http(self):
+        for value in (None, True, 0, -1, "431", 431.0, "https://evil.invalid"):
+            transport, opener = self.transport([])
+            with self.subTest(value=value), self.assertRaises(backend.GitHubTransportError):
+                transport.observe(value, request_timeout_seconds=5, overall_timeout_seconds=20, poll_interval_seconds=1)
+            self.assertFalse(opener.calls)
+
+    def test_observer_timeout_keeps_id_and_never_dispatches(self):
+        transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
+                                           FakeResponse(self.run_data(status="in_progress", conclusion=None))])
+        with self.assertRaises(backend.GitHubTransportError) as error:
+            transport.observe(self.run_id, request_timeout_seconds=5, overall_timeout_seconds=2, poll_interval_seconds=30)
+        self.assertEqual(error.exception.workflow_run_id, self.run_id)
+        self.assertEqual(self.clock.sleeps, [2])
+        self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+
+    def test_observer_errors_sanitize_secrets_and_chains_at_every_get(self):
+        for phase in range(3):
+            responses = [FakeResponse(self.metadata()), FakeResponse(self.source_ref()), FakeResponse(self.run_data())]
+            responses[phase] = RuntimeError(self.token)
+            transport, opener = self.transport(responses)
+            with self.subTest(phase=phase), self.assertRaises(backend.GitHubTransportError) as error:
+                self.observe_existing(transport)
+            self.assertEqual(error.exception.workflow_run_id, self.run_id)
+            self.assertIsNone(error.exception.__context__)
+            self.assertIsNone(error.exception.__cause__)
+            self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
+            self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+
+    def test_dispatch_uncertain_response_does_not_retry_or_infer_absence(self):
+        transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()), RuntimeError(self.token)])
+        with self.assertRaises(backend.GitHubTransportError) as error:
+            transport.dispatch(self.request, request_timeout_seconds=5, overall_timeout_seconds=20)
+        self.assertIsNone(error.exception.workflow_run_id)
+        self.assertIsNone(error.exception.__context__)
+        self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
+        self.assertEqual(sum(call[0].method == "POST" for call in opener.calls), 1)
+        self.assertEqual(len(opener.calls), 3)
+
+    def test_observer_terminal_failure_is_evidence_without_mutation(self):
+        transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
+                                           FakeResponse(self.run_data(conclusion="failure"))])
+        result = self.observe_existing(transport)
+        self.assertEqual(result.conclusion, "failure")
+        self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+
+
+    def test_observer_rejects_workflow_and_source_before_run_get(self):
+        for responses in ([FakeResponse(self.metadata(id=True))],
+                          [FakeResponse(self.metadata(state="disabled_manually"))],
+                          [FakeResponse(self.metadata(path="other.yml"))],
+                          [FakeResponse(self.metadata()), FakeResponse({})]):
+            transport, opener = self.transport(responses)
+            with self.subTest(count=len(responses)), self.assertRaises(backend.GitHubTransportError):
+                self.observe_existing(transport)
+            self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+            self.assertNotIn(self.run_url, [c[0].full_url for c in opener.calls])
+
+    def test_observer_invalid_limits_never_contact_provider(self):
+        for key, value in (("request_timeout_seconds", 0), ("overall_timeout_seconds", 601),
+                           ("poll_interval_seconds", 0), ("poll_interval_seconds", True),
+                           ("overall_timeout_seconds", float("nan"))):
+            transport, opener = self.transport([])
+            with self.subTest(key=key), self.assertRaises(backend.GitHubTransportError):
+                self.observe_existing(transport, **{key: value})
+            self.assertFalse(opener.calls)
+
+    def test_observer_http_failures_never_dispatch_and_are_sanitized(self):
+        import io
+        remote_url = "https://evil.invalid/REMOTE_URL_SENTINEL"
+        body = "REMOTE_BODY_SENTINEL " + self.token
+        for failure_kind in ("http_error", "rejected_response"):
+            with self.subTest(failure_kind=failure_kind):
+                stream = io.BytesIO(body.encode())
+                failure = (HTTPError(remote_url, 503, self.token, {"X-Secret": self.token}, stream)
+                           if failure_kind == "http_error" else
+                           FakeResponse({}, status=503, raw=body.encode()))
+                responses = [FakeResponse(self.metadata()), FakeResponse(self.source_ref()), failure]
+                transport, opener = self.transport(responses)
+                with mock.patch.object(transport, "dispatch") as dispatch, \
+                     mock.patch.object(transport, "_dispatch_once") as dispatch_once, \
+                     mock.patch.object(transport, "_request", wraps=transport._request) as request:
+                    with self.assertRaises(backend.GitHubTransportError) as caught:
+                        self.observe_existing(transport)
+                    dispatch.assert_not_called()
+                    dispatch_once.assert_not_called()
+                    self.assertEqual(request.call_count, 3)
+                    self.assertTrue(all(call.args[1] is None for call in request.call_args_list))
+                error = caught.exception
+                self.assertEqual(error.workflow_run_id, self.run_id)
+                self.assertEqual(str(error), "Dispatch or run observation failed")
+                self.assertIsNone(error.__context__)
+                self.assertIsNone(error.__cause__)
+                self.assertEqual(vars(error), {"workflow_run_id": self.run_id})
+                rendered = str(error) + repr(error) + "".join(traceback.format_exception(error))
+                for secret in (self.token, body, "REMOTE_BODY_SENTINEL", remote_url):
+                    self.assertNotIn(secret, rendered)
+                self.assertEqual([call[0].method for call in opener.calls], ["GET", "GET", "GET"])
+                self.assertEqual([call[0].full_url for call in opener.calls],
+                                 [self.workflow_url, self.ref_url, self.run_url])
+                self.assertFalse(self.clock.sleeps)
+                if failure_kind == "http_error":
+                    self.assertTrue(stream.closed)
+                else:
+                    self.assertTrue(failure.closed)
+                    stream.close()
+
+    def test_separate_dispatch_retains_known_id_after_invalid_response(self):
+        transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
+                                           FakeResponse(self.dispatch(run_url="https://evil.invalid/" + self.token))])
+        with self.assertRaises(backend.GitHubTransportError) as error:
+            transport.dispatch(self.request, request_timeout_seconds=5, overall_timeout_seconds=20)
+        self.assertEqual(error.exception.workflow_run_id, self.run_id)
+        self.assertIsNone(error.exception.__context__)
+        self.assertNotIn(self.token, "".join(traceback.format_exception(error.exception)))
+        self.assertEqual(sum(c[0].method == "POST" for c in opener.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

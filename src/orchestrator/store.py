@@ -68,6 +68,33 @@ CREATE TABLE IF NOT EXISTS agent_run (
     UNIQUE(task_id, ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS external_operation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES task(id),
+    provider TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    operation_key TEXT NOT NULL UNIQUE
+        CHECK (length(operation_key) = 64 AND operation_key NOT GLOB '*[^0-9a-f]*'),
+    request_fingerprint TEXT NOT NULL
+        CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    phase TEXT NOT NULL CHECK (phase IN (
+        'PREPARED', 'DISPATCH_ATTEMPTED', 'RUN_IDENTIFIED', 'TERMINAL_OBSERVED')),
+    remote_operation_id TEXT,
+    terminal_status TEXT,
+    terminal_result TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, operation_type, remote_operation_id),
+    CHECK (
+        (phase IN ('PREPARED', 'DISPATCH_ATTEMPTED') AND remote_operation_id IS NULL
+            AND terminal_status IS NULL AND terminal_result IS NULL)
+        OR (phase = 'RUN_IDENTIFIED' AND remote_operation_id IS NOT NULL
+            AND terminal_status IS NULL AND terminal_result IS NULL)
+        OR (phase = 'TERMINAL_OBSERVED' AND remote_operation_id IS NOT NULL
+            AND terminal_status IS NOT NULL AND terminal_result IS NOT NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS task_suspension (
     task_id TEXT NOT NULL PRIMARY KEY REFERENCES task(id),
     task_packet_path TEXT NOT NULL,
@@ -324,6 +351,124 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 
 class Store:
     """SQLite persistence and transactional operational resource accounting."""
+
+    @staticmethod
+    def _external_code(value: str, label: str) -> str:
+        # Logical evidence identifiers/codes only, never raw provider responses.
+        if type(value) is not str or ID_PATTERN.fullmatch(value) is None:
+            raise StoreError("invalid external operation " + label)
+        return value
+
+    def get_external_operation(self, operation_id: int) -> dict[str, Any] | None:
+        if type(operation_id) is not int or operation_id <= 0:
+            raise StoreError("invalid external operation id")
+        return self._external_operation_row("id", operation_id)
+
+    def get_external_operation_by_key(self, operation_key: str) -> dict[str, Any] | None:
+        _require_hex(operation_key, "operation_key", re.compile(r"[0-9a-f]{64}"))
+        return self._external_operation_row("operation_key", operation_key)
+
+    def _external_operation_row(self, column: str, value: Any) -> dict[str, Any] | None:
+        # Column comes only from the two fixed callers above.
+        cursor = self._conn.execute(
+            f"SELECT * FROM external_operation WHERE {column} = ?", (value,)
+        )
+        row = cursor.fetchone()
+        return dict(zip((item[0] for item in cursor.description), row)) if row else None
+
+    def prepare_external_operation(
+        self, task_id: str, *, provider: str, operation_type: str,
+        operation_key: str, request_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Durable intent only, never permission to dispatch or task approval.
+
+        The coordinator supplies both hashes. No alternate key is generated.
+        Replaying identical intent returns its current phase without resetting it.
+        """
+        for label, value in (("task_id", task_id), ("provider", provider),
+                             ("operation_type", operation_type)):
+            self._external_code(value, label)
+        for label, value in (("operation_key", operation_key),
+                             ("request_fingerprint", request_fingerprint)):
+            _require_hex(value, label, re.compile(r"[0-9a-f]{64}"))
+        identity = dict(task_id=task_id, provider=provider, operation_type=operation_type,
+                        operation_key=operation_key, request_fingerprint=request_fingerprint)
+        with self._write_transaction():
+            existing = self.get_external_operation_by_key(operation_key)
+            if existing is not None:
+                if any(existing[key] != value for key, value in identity.items()):
+                    raise StoreError("external operation intent conflict")
+                return existing
+            if self.get_task(task_id) is None:
+                raise StoreError("external operation task not found")
+            now = _utcnow()
+            cursor = self._conn.execute(
+                "INSERT INTO external_operation (task_id, provider, operation_type, operation_key, "
+                "request_fingerprint, phase, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'PREPARED', ?, ?)",
+                (task_id, provider, operation_type, operation_key, request_fingerprint, now, now),
+            )
+            return self.get_external_operation(cursor.lastrowid)
+
+    def mark_external_dispatch_attempted(self, operation_id: int) -> dict[str, Any]:
+        """Persist BEFORE POST. Missing remote identity remains uncertain.
+
+        Idempotence of this write never grants permission for another POST.
+        No provider call, retry, claim, task transition or budget change occurs.
+        """
+        return self._advance_external_operation(operation_id, "PREPARED", "DISPATCH_ATTEMPTED", {})
+
+    def bind_external_operation(
+        self, operation_id: int, *, remote_operation_id: str,
+    ) -> dict[str, Any]:
+        # Store accepts an opaque identifier, not remote URLs or response bodies.
+        self._external_code(remote_operation_id, "remote_operation_id")
+        return self._advance_external_operation(
+            operation_id, "DISPATCH_ATTEMPTED", "RUN_IDENTIFIED",
+            {"remote_operation_id": remote_operation_id},
+        )
+
+    def complete_external_operation(
+        self, operation_id: int, *, remote_operation_id: str,
+        terminal_status: str, terminal_result: str,
+    ) -> dict[str, Any]:
+        """Record terminal evidence codes, never raw provider output or approval."""
+        for label, value in (("remote_operation_id", remote_operation_id),
+                             ("terminal_status", terminal_status), ("terminal_result", terminal_result)):
+            self._external_code(value, label)
+        return self._advance_external_operation(
+            operation_id, "RUN_IDENTIFIED", "TERMINAL_OBSERVED",
+            dict(remote_operation_id=remote_operation_id,
+                 terminal_status=terminal_status, terminal_result=terminal_result),
+        )
+
+    def _advance_external_operation(
+        self, operation_id: int, previous: str, phase: str, values: dict[str, str],
+    ) -> dict[str, Any]:
+        conflict = False
+        try:
+            with self._write_transaction():
+                row = self.get_external_operation(operation_id)
+                if row is None:
+                    raise StoreError("external operation not found")
+                if row["phase"] == phase and all(row[key] == value for key, value in values.items()):
+                    return row
+                if row["phase"] != previous:
+                    raise StoreError("external operation phase conflict")
+                if row["remote_operation_id"] is not None and values.get("remote_operation_id") != row["remote_operation_id"]:
+                    raise StoreError("external operation remote identity conflict")
+                # Field names are fixed by the public methods, never caller data.
+                fields = {"phase": phase, "updated_at": _utcnow(), **values}
+                assignments = ", ".join(key + " = ?" for key in fields)
+                self._conn.execute(
+                    f"UPDATE external_operation SET {assignments} WHERE id = ?",
+                    (*fields.values(), operation_id),
+                )
+                return self.get_external_operation(operation_id)
+        except sqlite3.IntegrityError:
+            conflict = True
+        if conflict:
+            raise StoreError("external operation uniqueness or structure conflict")
 
     def list_agent_runs(self, task_id: str) -> list[dict[str, Any]]:
         validate_id(task_id, "task_id")
