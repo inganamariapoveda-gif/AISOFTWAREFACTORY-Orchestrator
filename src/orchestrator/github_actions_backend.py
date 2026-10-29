@@ -212,6 +212,11 @@ class GitHubActionsTransport:
         if not callable(getattr(self._opener, "open", None)):
             raise GitHubTransportError("Invalid HTTP dependency")
 
+    @property
+    def config(self) -> GitHubBackendConfig:
+        """Immutable trusted configuration actually used by this transport."""
+        return self._config
+
     def _remaining(self, deadline):
         remaining = deadline - self._monotonic()
         if not math.isfinite(remaining) or remaining <= 0:
@@ -370,18 +375,28 @@ class GitHubActionsTransport:
             self._sleep(min(poll_interval, remaining))
 
     def dispatch(self, request: DispatchRequest, *, request_timeout_seconds: float,
-                 overall_timeout_seconds: float) -> DispatchResponse:
+                 overall_timeout_seconds: float,
+                 before_post: Callable[[], bool] | None = None) -> DispatchResponse:
         """One validated dispatch, no polling or retry.
 
-        A future coordinator must durably mark DISPATCH_ATTEMPTED before calling
-        this method. No missing ID authorizes redispatch; this transport does not
-        persist evidence or grant execution authority.
+        The optional caller-owned barrier runs after trusted preflight and must
+        return True exactly. No missing ID authorizes redispatch; this transport
+        does not persist evidence or grant execution authority.
         """
         if type(request) is not DispatchRequest:
             raise GitHubTransportError("Invalid dispatch request")
         request.__post_init__()
         deadline = self._deadline(request_timeout_seconds, overall_timeout_seconds, 1)
         self._workflow_identity(deadline, request_timeout_seconds)
+        if before_post is not None:
+            authorized = False
+            try:
+                authorized = before_post() is True
+            except Exception:
+                pass
+            # Outside callback exception context; no arbitrary details escape.
+            if not authorized:
+                raise GitHubTransportError("Dispatch barrier rejected")
         return self._dispatch_once(request, deadline, request_timeout_seconds)
 
     def observe(self, workflow_run_id: int, *, request_timeout_seconds: float,

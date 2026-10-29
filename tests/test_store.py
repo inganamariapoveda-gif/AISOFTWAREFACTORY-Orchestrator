@@ -283,6 +283,37 @@ class ExternalOperationStoreTests(StoreTestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(len(set(results)), 1)
 
+    def test_claim_dispatch_only_first_prepared_transition_authorizes(self):
+        row = self.prepare()
+        trace = []
+        self.store._conn.set_trace_callback(trace.append)
+        self.assertIs(self.store.claim_external_dispatch(row["id"]), True)
+        attempted = self.store.get_external_operation(row["id"])
+        self.assertEqual(attempted["phase"], "DISPATCH_ATTEMPTED")
+        self.assertIs(self.store.claim_external_dispatch(row["id"]), False)
+        self.assertEqual(self.store.get_external_operation(row["id"]), attempted)
+        self.assertIn("BEGIN IMMEDIATE", trace)
+        self.assertEqual(sum(sql.startswith("UPDATE external_operation ") for sql in trace), 1)
+        self.store.bind_external_operation(row["id"], remote_operation_id="431")
+        self.assertIs(self.store.claim_external_dispatch(row["id"]), False)
+        self.terminal(row["id"])
+        self.assertIs(self.store.claim_external_dispatch(row["id"]), False)
+
+    def test_claim_missing_or_invalid_operation_fails_closed(self):
+        for value in (999, True, 0, -1, "1", None):
+            with self.subTest(value=value), self.assertRaises(StoreError):
+                self.store.claim_external_dispatch(value)
+        self.assertFalse(self.store._conn.in_transaction)
+
+    def test_concurrent_dispatch_claim_has_one_winner_and_one_write(self):
+        row = self.prepare()
+        action = lambda store: store.claim_external_dispatch(row["id"])
+        outcomes, updates = self._race_external_writes([action, action])
+        self.assertEqual([kind for kind, _ in outcomes], ["ok", "ok"])
+        self.assertEqual(sorted(value for _, value in outcomes), [False, True])
+        self.assertEqual(sum(map(len, updates)), 1)
+        self.assertEqual(self.store.get_external_operation(row["id"])["phase"], "DISPATCH_ATTEMPTED")
+
 
 class ResourceBudgetStoreTests(StoreTestCase):
     def test_profile_correction_ceiling_isolated_from_invocation_limits(self):

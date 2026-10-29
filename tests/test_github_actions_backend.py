@@ -225,6 +225,60 @@ class GitHubActionsTransportTests(unittest.TestCase):
         self.assertEqual(json.loads(opener.calls[2][0].data)["inputs"]["candidate_sha"], "a" * 40)
         self.assertNotEqual(result.head_sha, self.request.candidate_sha)
 
+    def test_dispatch_barrier_runs_after_preflight_before_exactly_one_post(self):
+        transport, opener = self.transport([
+            FakeResponse(self.metadata()), FakeResponse(self.source_ref()), FakeResponse(self.dispatch())])
+        events = []
+        def barrier():
+            events.extend(call[0].method for call in opener.calls)
+            events.append("CLAIM")
+            return True
+        callback = mock.Mock(side_effect=barrier)
+        result = transport.dispatch(self.request, request_timeout_seconds=5,
+                                    overall_timeout_seconds=20, before_post=callback)
+        self.assertEqual(events, ["GET", "GET", "CLAIM"])
+        self.assertEqual([c[0].method for c in opener.calls], ["GET", "GET", "POST"])
+        callback.assert_called_once_with()
+        self.assertEqual(result.workflow_run_id, self.run_id)
+        self.assertIs(transport.config, self.config)
+
+    def test_preflight_failure_never_invokes_dispatch_barrier(self):
+        for responses in ([FakeResponse({}, status=503)],
+                          [FakeResponse(self.metadata()), FakeResponse({}, status=503)]):
+            transport, opener = self.transport(responses)
+            callback = mock.Mock(return_value=True)
+            with self.assertRaises(backend.GitHubTransportError):
+                transport.dispatch(self.request, request_timeout_seconds=5,
+                                   overall_timeout_seconds=20, before_post=callback)
+            callback.assert_not_called()
+            self.assertTrue(all(c[0].method == "GET" for c in opener.calls))
+
+    def test_barrier_rejects_non_true_and_sanitizes_callback_failure(self):
+        for value in (False, None, 1, "true", RuntimeError("SECRET body https://evil.invalid")):
+            transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref())])
+            callback = mock.Mock(**({"side_effect": value} if isinstance(value, Exception)
+                                    else {"return_value": value}))
+            with self.subTest(value=type(value)), self.assertRaises(backend.GitHubTransportError) as caught:
+                transport.dispatch(self.request, request_timeout_seconds=5,
+                                   overall_timeout_seconds=20, before_post=callback)
+            self.assertEqual(str(caught.exception), "Dispatch barrier rejected")
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+            callback.assert_called_once_with()
+            self.assertEqual([c[0].method for c in opener.calls], ["GET", "GET"])
+
+    def test_authorized_barrier_post_failure_has_no_retry_or_provider_chain(self):
+        transport, opener = self.transport([FakeResponse(self.metadata()), FakeResponse(self.source_ref()),
+                                            RuntimeError("SECRET body https://evil.invalid")])
+        callback = mock.Mock(return_value=True)
+        with self.assertRaises(backend.GitHubTransportError) as caught:
+            transport.dispatch(self.request, request_timeout_seconds=5,
+                               overall_timeout_seconds=20, before_post=callback)
+        self.assertEqual([c[0].method for c in opener.calls], ["GET", "GET", "POST"])
+        callback.assert_called_once_with()
+        self.assertIsNone(caught.exception.__context__)
+        self.assertNotIn("SECRET", str(caught.exception))
+
     def test_call_cannot_override_configured_workflow_source(self):
         for key in ("expected_workflow_sha", "workflow_source_sha", "workflow_ref", "return_run_details"):
             transport, opener = self.transport([])
