@@ -33,6 +33,117 @@ class StoreTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class CandidateMaterializationStoreTests(StoreTestCase):
+    def setUp(self):
+        super().setUp()
+        from orchestrator import candidate_materialization as cm
+        from dataclasses import asdict
+        self.store.register_project("SAMPLE", "Sample", ".", "ref")
+        self.store.create_task("T-1", "SAMPLE", "Title", "Need")
+        root = str(Path(self._tmp.name).resolve())
+        metadata = cm.CommitMetadata("candidate\n", "Test", "test@example.invalid", 1700000000,
+                                     "+0000", "Test", "test@example.invalid", 1700000000, "+0000")
+        self.intent = dict(materialization_key=cm.materialization_key("T-1", root, "task/test", "a" * 40),
+            task_packet_sha256="b" * 64, repo_root=root, branch="task/test", base_head_sha="a" * 40,
+            base_tree_sha="c" * 40, manifest_sha256=cm.digest(b"[]"), manifest_json="[]",
+            commit_metadata_json=cm.canonical(asdict(metadata)))
+
+    def prepare(self, **changes):
+        return self.store.prepare_candidate_materialization("T-1", **dict(self.intent, **changes))
+
+    def seal(self, operation_id, **changes):
+        return self.store.seal_candidate_materialization(operation_id,
+            **dict(dict(candidate_tree_sha="d" * 40, candidate_commit_sha="e" * 40), **changes))
+
+    def test_candidate_prepare_replay_and_persisted_identity(self):
+        row = self.prepare()
+        self.assertEqual(row["phase"], "PREPARED")
+        self.assertIsNone(row["candidate_tree_sha"])
+        self.assertEqual(self.prepare(), row)
+        with Store(Path(self._tmp.name) / "test.db") as other:
+            self.assertEqual(other.get_candidate_materialization(row["id"]), row)
+            self.assertEqual(other.get_candidate_materialization_by_key(self.intent["materialization_key"]), row)
+
+    def test_candidate_same_key_different_intent_conflicts(self):
+        row = self.prepare()
+        for field, value in (("task_packet_sha256", "f" * 64), ("base_tree_sha", "f" * 40),
+                             ("commit_metadata_json", self.intent["commit_metadata_json"].replace("candidate", "changed"))):
+            with self.subTest(field=field), self.assertRaises(StoreError):
+                self.prepare(**{field: value})
+        self.assertEqual(self.store.get_candidate_materialization(row["id"]), row)
+
+    def test_candidate_seal_idempotent_and_divergent_conflict(self):
+        row = self.prepare()
+        sealed = self.seal(row["id"])
+        self.assertEqual(sealed["phase"], "SEALED")
+        self.assertEqual(self.seal(row["id"]), sealed)
+        self.assertEqual(self.prepare(), sealed)
+        for field in ("candidate_tree_sha", "candidate_commit_sha"):
+            with self.assertRaises(StoreError):
+                self.seal(row["id"], **{field: "f" * 40})
+        self.assertEqual(self.store.get_candidate_materialization(row["id"]), sealed)
+
+    def test_candidate_invalid_data_and_schema_phases_fail_closed(self):
+        for changes in ({"materialization_key": "x" * 64}, {"manifest_sha256": "d" * 64},
+                        {"manifest_json": "[ ]"}, {"commit_metadata_json": "{}"}, {"unexpected": True}):
+            with self.assertRaises(StoreError):
+                self.prepare(**changes)
+        row = self.prepare()
+        for value in (True, 0, -1, "1"):
+            with self.assertRaises(StoreError):
+                self.store.get_candidate_materialization(value)
+        for value in (None, "0" * 40, "A" * 40, "a" * 64):
+            with self.assertRaises(StoreError):
+                self.seal(row["id"], candidate_tree_sha=value)
+        with self.assertRaises(StoreError):
+            self.seal(999)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE candidate_materialization SET phase='INSTALLED'")
+        self.store._conn.rollback()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE candidate_materialization SET phase='SEALED'")
+        self.store._conn.rollback()
+
+    def test_candidate_missing_task_and_no_state_budget_effects(self):
+        from orchestrator.candidate_materialization import materialization_key
+        missing = dict(self.intent, materialization_key=materialization_key(
+            "MISSING", self.intent["repo_root"], self.intent["branch"], self.intent["base_head_sha"]))
+        with self.assertRaises(StoreError):
+            self.store.prepare_candidate_materialization("MISSING", **missing)
+        before = self.store.get_task("T-1"), self.store.get_history("T-1"), self.store.list_agent_runs("T-1")
+        self.seal(self.prepare()["id"])
+        self.assertEqual(before, (self.store.get_task("T-1"), self.store.get_history("T-1"), self.store.list_agent_runs("T-1")))
+
+    def race(self, action):
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def worker():
+            try:
+                with Store(Path(self._tmp.name) / "test.db") as other:
+                    barrier.wait(timeout=10)
+                    results.append(action(other))
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+
+    def test_candidate_concurrent_prepare_converges(self):
+        self.race(lambda store: store.prepare_candidate_materialization("T-1", **self.intent))
+        self.assertEqual(self.store._conn.execute("SELECT count(*) FROM candidate_materialization").fetchone()[0], 1)
+
+    def test_candidate_concurrent_seal_converges(self):
+        row = self.prepare()
+        self.race(lambda store: store.seal_candidate_materialization(row["id"],
+            candidate_tree_sha="d" * 40, candidate_commit_sha="e" * 40))
+
+
 class ExternalOperationStoreTests(StoreTestCase):
     def setUp(self):
         super().setUp()

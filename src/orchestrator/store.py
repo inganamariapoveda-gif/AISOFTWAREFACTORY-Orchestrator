@@ -95,6 +95,29 @@ CREATE TABLE IF NOT EXISTS external_operation (
     )
 );
 
+CREATE TABLE IF NOT EXISTS candidate_materialization (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES task(id),
+    materialization_key TEXT NOT NULL UNIQUE CHECK (length(materialization_key) = 64 AND materialization_key NOT GLOB '*[^0-9a-f]*'),
+    task_packet_sha256 TEXT NOT NULL CHECK (length(task_packet_sha256) = 64 AND task_packet_sha256 NOT GLOB '*[^0-9a-f]*'),
+    repo_root TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_head_sha TEXT NOT NULL CHECK (length(base_head_sha) = 40 AND base_head_sha NOT GLOB '*[^0-9a-f]*'),
+    base_tree_sha TEXT NOT NULL CHECK (length(base_tree_sha) = 40 AND base_tree_sha NOT GLOB '*[^0-9a-f]*'),
+    manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'),
+    manifest_json TEXT NOT NULL,
+    commit_metadata_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('PREPARED', 'SEALED')),
+    candidate_tree_sha TEXT,
+    candidate_commit_sha TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((phase = 'PREPARED' AND candidate_tree_sha IS NULL AND candidate_commit_sha IS NULL)
+        OR (phase = 'SEALED' AND candidate_tree_sha IS NOT NULL AND candidate_commit_sha IS NOT NULL
+            AND length(candidate_tree_sha) = 40 AND candidate_tree_sha NOT GLOB '*[^0-9a-f]*'
+            AND length(candidate_commit_sha) = 40 AND candidate_commit_sha NOT GLOB '*[^0-9a-f]*'))
+);
+
 CREATE TABLE IF NOT EXISTS task_suspension (
     task_id TEXT NOT NULL PRIMARY KEY REFERENCES task(id),
     task_packet_path TEXT NOT NULL,
@@ -351,6 +374,70 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 
 class Store:
     """SQLite persistence and transactional operational resource accounting."""
+
+    def get_candidate_materialization(self, materialization_id: int) -> dict[str, Any] | None:
+        if type(materialization_id) is not int or materialization_id <= 0:
+            raise StoreError("invalid materialization id")
+        return self._candidate_row("id", materialization_id)
+
+    def get_candidate_materialization_by_key(self, key: str) -> dict[str, Any] | None:
+        _require_hex(key, "materialization_key", re.compile(r"[0-9a-f]{64}"))
+        return self._candidate_row("materialization_key", key)
+
+    def _candidate_row(self, column, value):
+        cursor = self._conn.execute(
+            "SELECT * FROM candidate_materialization WHERE " + column + " = ?", (value,))
+        row = cursor.fetchone()
+        return dict(zip((item[0] for item in cursor.description), row)) if row else None
+
+    def prepare_candidate_materialization(self, task_id: str, **intent) -> dict[str, Any]:
+        # Shared pure validation; importing here avoids module initialization cycles.
+        from .candidate_materialization import validate_intent
+        valid = False
+        try:
+            validate_intent(task_id, intent)
+            valid = True
+        except Exception:
+            pass
+        if not valid:
+            raise StoreError("invalid materialization intent")
+        with self._write_transaction():
+            if self.get_task(task_id) is None:
+                raise StoreError("materialization task not found")
+            row = self.get_candidate_materialization_by_key(intent["materialization_key"])
+            if row is not None:
+                if row["task_id"] != task_id or any(row[key] != value for key, value in intent.items()):
+                    raise StoreError("materialization intent conflict")
+                return row
+            now = _utcnow()
+            cursor = self._conn.execute(
+                "INSERT INTO candidate_materialization (task_id, materialization_key, task_packet_sha256, "
+                "repo_root, branch, base_head_sha, base_tree_sha, manifest_sha256, manifest_json, "
+                "commit_metadata_json, phase, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)",
+                (task_id, intent["materialization_key"], intent["task_packet_sha256"], intent["repo_root"],
+                 intent["branch"], intent["base_head_sha"], intent["base_tree_sha"], intent["manifest_sha256"],
+                 intent["manifest_json"], intent["commit_metadata_json"], now, now))
+            return self.get_candidate_materialization(cursor.lastrowid)
+
+    def seal_candidate_materialization(self, materialization_id: int, *, candidate_tree_sha: str,
+                                       candidate_commit_sha: str) -> dict[str, Any]:
+        for value in (candidate_tree_sha, candidate_commit_sha):
+            _require_hex(value, "candidate object", re.compile(r"[0-9a-f]{40}"))
+            if value == "0" * 40:
+                raise StoreError("invalid candidate object")
+        with self._write_transaction():
+            row = self.get_candidate_materialization(materialization_id)
+            if row is None:
+                raise StoreError("materialization not found")
+            if row["phase"] == "SEALED":
+                if (row["candidate_tree_sha"], row["candidate_commit_sha"]) != (candidate_tree_sha, candidate_commit_sha):
+                    raise StoreError("materialization seal conflict")
+                return row
+            self._conn.execute(
+                "UPDATE candidate_materialization SET phase = 'SEALED', candidate_tree_sha = ?, "
+                "candidate_commit_sha = ?, updated_at = ? WHERE id = ?",
+                (candidate_tree_sha, candidate_commit_sha, _utcnow(), materialization_id))
+            return self.get_candidate_materialization(materialization_id)
 
     @staticmethod
     def _external_code(value: str, label: str) -> str:
