@@ -13,6 +13,12 @@ prohibitions:
 
 # Declarative governance only; operational publication is not implemented.
 controlled_actions:
+  git_install_candidate_authority:
+    enabled: true
+    classification: "AMARILLO"
+    approval: "DIRECTOR_INTERNAL_GATE"
+    on_violation: "BLOCKED"
+
   git_publish_task_branch:
     enabled: true
     classification: "AMARILLO"

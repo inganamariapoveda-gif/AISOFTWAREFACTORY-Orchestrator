@@ -1575,3 +1575,48 @@ como evidencia de reconciliacion, sin redispatch ni datos remotos sensibles.
 Backend disabled y sin wiring; success es evidencia, no aprobacion tecnica,
 de seguridad, humana, de merge o produccion. Credenciales y activacion quedan
 para trabajo futuro separado.
+
+### AUTHORITY_INSTALLATION-001 — instalación local de candidate SEALED
+
+`git_install_candidate_authority` es una acción cerrada independiente de
+publicación: AMARILLO, DIRECTOR_INTERNAL_GATE, on_violation BLOCKED. Requiere
+acción explícita en el Task Packet existente, capability Builder
+`install_authorized_candidate_authority`, permiso local habilitado, política
+habilitada y gate interno habilitado. No concede autoridad a Director/Verifier
+ni implica git_publish. La ausencia de cualquiera deniega instalación.
+
+El caller confiable suministra una aprobación estructural específica e inmutable
+ligada a task/packet digest, materialization id, repo, branch, base, manifiesto,
+candidate tree/commit, identidades RAW de PERMISSIONS/POLICIES/GATES e identidad
+de la fuente/registro del Director. Este slice no autentica un emisor ni conecta
+la primitive al motor. Un SHA suelto nunca es autoridad suficiente.
+
+`candidate_materialization` mantiene PREPARED/SEALED. La entidad aditiva
+`candidate_authority_installation` conserva bindings inmutables y fases
+PREPARED/VERIFIED; replay exacto es idempotente y diferencias bloquean.
+La inicialización rechaza una tabla preexistente incompatible, sin reconstruir
+materialization ni estados de tareas.
+
+El instalador readmite objetos y bytes RAW completos. Git construye el índice
+temporal. La creación exclusiva de index.lock precede a la readmisión bajo lock
+y a una transacción preparada de una sola task ref, CAS BASE→CANDIDATE.
+Mientras Git retiene sus locks se comprueban HEAD simbólico exacto y task ref
+directa. Tras commit se readmite el índice real bajo el lock propio, se escriben
+los bytes temporales validados, se hace flush/fsync y reemplazo en el mismo
+filesystem. Nunca se borra el índice destino para facilitar un replace.
+
+Recovery PREPARED admite B/B (continuar), C/B (solo índice), C/C (verificar sin
+mutar Git). B/C, tercera ref/índice, HEAD incorrecto y locks de propiedad ambigua
+bloquean. Un lock preexistente no se elimina. Solo se libera un lock propio
+cuya identidad siga demostrada; no hay stale-lock cleanup ni reset/rollback.
+
+VERIFIED requiere identidad SEALED intacta, ref/HEAD candidate, índice exacto,
+status limpio, bytes físicos del worktree intactos y contexto Git readmitido.
+No se escribe worktree, ejecuta candidate, publica, emite aprobación de
+publicación ni cambia app/state machine. Hooks se neutralizan, el entorno Git
+es explícito y no hay red ni interacción de credenciales.
+
+Los locks excluyen escritores cooperativos, no escrituras arbitrarias ni ABA.
+NO_EXACTLY_ATOMIC_SQLITE_REF_INDEX_GUARANTEE. No se afirma durabilidad eléctrica
+del rename. INSTALLED no significa TECH_APPROVED, PUBLICATION_APPROVED,
+PUSHED, MERGED ni EXECUTABLE.

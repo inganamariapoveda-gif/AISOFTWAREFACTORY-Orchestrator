@@ -198,6 +198,14 @@ class _Git:
         # Only module-owned command forms; no shell, remote commands or porcelain mutations.
         require(args[0] in {"config", "rev-parse", "symbolic-ref", "ls-tree", "ls-files", "diff",
                             "check-attr", "cat-file", "hash-object", "read-tree", "update-index", "write-tree", "commit-tree"})
+        command, env = self.execution_context(args, index=index, source=source, metadata=metadata)
+        result = subprocess.run(command, cwd=self.repo, env=env, input=data, capture_output=True,
+                                timeout=30, shell=False)
+        require(result.returncode == 0, "BLOCKED_GIT_OBSERVATION")
+        return result.stdout
+
+    def execution_context(self, args, *, index=None, source=None, metadata=None):
+        """Shared context construction; callers retain their own closed command admission."""
         ordinary(self.hooks, True)
         require(read_regular(self.empty) == b"" and not list(self.hooks.iterdir()))
         env = dict(self.env)
@@ -215,10 +223,7 @@ class _Git:
                    "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
                    "-c", "core.attributesFile=" + str(self.empty), "-c", "commit.gpgSign=false",
                    "-c", "i18n.commitEncoding=UTF-8", "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args]
-        result = subprocess.run(command, cwd=self.repo, env=env, input=data, capture_output=True,
-                                timeout=30, shell=False)
-        require(result.returncode == 0, "BLOCKED_GIT_OBSERVATION")
-        return result.stdout
+        return command, env
 
     def oid(self, *args, **kwargs):
         value = self.run(*args, **kwargs).decode("ascii").strip()
@@ -239,12 +244,20 @@ class _Git:
         require(len({p.casefold() for p in result}) == len(result), "BLOCKED_UNSAFE_PATH")
         return result
 
-    def admit_metadata(self):
+    def admit_metadata(self, *, owned_locks=None):
+        # Only the installer supplies identities of locks it currently owns.
+        # Default sealing admission remains unchanged.
+        owned_locks = {} if owned_locks is None else owned_locks
         gitdir = self.repo / ".git"
         for name in ("commondir", "config.worktree", "shallow", "info/grafts", "info/attributes",
                      "objects/info/alternates", "objects/info/http-alternates", "info/sparse-checkout",
                      "index.lock", "HEAD.lock", "packed-refs.lock"):
-            require(not os.path.lexists(gitdir / name), "BLOCKED_GIT_CONTEXT")
+            path = gitdir / name
+            if path in owned_locks:
+                info = ordinary(path)
+                require((info.st_dev, info.st_ino) == owned_locks[path], "BLOCKED_LOCK_OWNERSHIP")
+            else:
+                require(not os.path.lexists(path), "BLOCKED_GIT_CONTEXT")
         # Metadata path redirection could otherwise redirect an object write.
         for directory, dirs, files in os.walk(gitdir, followlinks=False):
             ordinary(Path(directory), True)

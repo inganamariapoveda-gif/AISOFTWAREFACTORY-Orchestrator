@@ -151,11 +151,15 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
     if "git_push" in data["prohibitions"]:
         raise ConfigError("obsolete push prohibition schema")
     actions = data.get("controlled_actions")
-    if not isinstance(actions, dict) or set(actions) not in (
-        {"git_publish_task_branch"},
-        {"git_publish_task_branch", "git_publish_safe_test_source_tag"},
-    ):
+    if (not isinstance(actions, dict) or "git_publish_task_branch" not in actions
+            or set(actions) - {"git_publish_task_branch", "git_publish_safe_test_source_tag", "git_install_candidate_authority"}):
         raise ConfigError("invalid controlled_actions keys")
+    if "git_install_candidate_authority" in actions:
+        installation = _closed_mapping(actions["git_install_candidate_authority"],
+            {"enabled", "classification", "approval", "on_violation"}, "installation action")
+        if (type(installation["enabled"]) is not bool or installation["classification"] != "AMARILLO"
+                or installation["approval"] != "DIRECTOR_INTERNAL_GATE" or installation["on_violation"] != "BLOCKED"):
+            raise ConfigError("invalid installation action")
     if "git_publish_safe_test_source_tag" in actions:
         tag_action = _closed_mapping(actions["git_publish_safe_test_source_tag"],
                                      {"enabled", "classification", "approval", "on_violation"},
@@ -381,6 +385,32 @@ def require_controlled_publication_authority(config: OrchestratorConfig) -> None
                   Path("POLICIES.yaml"))
 
 
+def _validate_installation_permission(value):
+    block = _closed_mapping(value, {"enabled", "branch_prefix", "forbidden_branches",
+        "require_explicit_task_packet", "require_director_approval", "require_sealed_materialization",
+        "require_exact_task_ref_cas", "allow_worktree_write"}, "installation permission")
+    if (type(block["enabled"]) is not bool or block["branch_prefix"] != "task/"
+            or block["forbidden_branches"] != ["main", "master"] or block["allow_worktree_write"] is not False
+            or any(block[k] is not True for k in ("require_explicit_task_packet", "require_director_approval",
+                "require_sealed_materialization", "require_exact_task_ref_cas"))):
+        raise ConfigError("invalid installation permission")
+
+
+def require_candidate_installation_authority(config: OrchestratorConfig) -> None:
+    """Declarative intersection only; never substitutes specific Director approval."""
+    if not isinstance(config, OrchestratorConfig):
+        raise ConfigError("installation authority requires core config")
+    _validate_permissions(config.permissions, Path("PERMISSIONS.yaml"))
+    _validate_policies(config.policies, Path("POLICIES.yaml"))
+    _validate_gates(config.gates, Path("GATES.yaml"))
+    _validate_installation_permission(config.permissions.get("git_install_candidate_authority"))
+    if "install_authorized_candidate_authority" not in config.permissions.get("role_capabilities", {}).get("builder", []):
+        raise ConfigError("installation capability missing")
+    _require_true(config.permissions, "git_install_candidate_authority.enabled", Path("PERMISSIONS.yaml"))
+    _require_true(config.policies, "controlled_actions.git_install_candidate_authority.enabled", Path("POLICIES.yaml"))
+    _require_true(config.gates, "director_internal_gate.git_install_candidate_authority", Path("GATES.yaml"))
+
+
 def require_controlled_source_tag_authority(config: OrchestratorConfig) -> None:
     """Pure configuration intersection, NOT approval or execution authority.
 
@@ -561,6 +591,8 @@ def _validate_gates(data: dict[str, Any], path: Path) -> None:
     _require_true(data, "director_internal_gate.amarillo_contemplado", path)
     _require_true(data, "director_internal_gate.git_publish_task_branch", path)
     gate = data["director_internal_gate"]
+    if "git_install_candidate_authority" in gate and type(gate["git_install_candidate_authority"]) is not bool:
+        raise ConfigError("installation gate must be boolean")
     if "git_publish_safe_test_source_tag" in gate and type(gate["git_publish_safe_test_source_tag"]) is not bool:
         raise ConfigError("source-tag gate must be boolean")
 
@@ -585,7 +617,7 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
         if role not in {"director", "builder", "verifier"} or not isinstance(grants, list):
             raise ConfigError("invalid role capability policy")
         if any(grant not in ("implement_authorized_changes", "publish_authorized_task_branch",
-                             "publish_authorized_safe_test_source_tag") or role != "builder" for grant in grants):
+                             "publish_authorized_safe_test_source_tag", "install_authorized_candidate_authority") or role != "builder" for grant in grants):
             raise ConfigError("unsupported role capability")
     for key in REQUIRED_PERMISSION_DENY_KEYS:
         _require_true(data, key, path)
@@ -596,6 +628,8 @@ def _validate_permissions(data: dict[str, Any], path: Path) -> None:
     if controls["local_project_commands"] is not False:
         raise ConfigError("execution_controls.local_project_commands must be false")
     _validate_git_publish(data.get("git_publish"))
+    if "git_install_candidate_authority" in data:
+        _validate_installation_permission(data["git_install_candidate_authority"])
     if "git_tag_publish" in data:
         _validate_git_tag_publish(data["git_tag_publish"])
     allowed_commands = _require(data, "allowed_commands", path)

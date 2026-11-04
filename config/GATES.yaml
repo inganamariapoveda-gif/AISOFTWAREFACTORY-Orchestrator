@@ -13,6 +13,7 @@ automatic_approval:
 # Gate interno de aprobación del Director para AMARILLO expresamente
 # contemplado (§8). No requiere intervención humana.
 director_internal_gate:
+  git_install_candidate_authority: true
   amarillo_contemplado: true
   git_publish_task_branch: true
   git_publish_safe_test_source_tag: true

@@ -22,6 +22,21 @@ from .state_machine import INITIAL_STATE, validate_transition
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+INSTALLATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS candidate_authority_installation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    materialization_id INTEGER NOT NULL UNIQUE REFERENCES candidate_materialization(id),
+    installation_key TEXT NOT NULL UNIQUE CHECK (length(installation_key) = 64 AND installation_key NOT GLOB '*[^0-9a-f]*'),
+    bindings_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('PREPARED', 'VERIFIED')),
+    verification_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((phase = 'PREPARED' AND verification_json IS NULL)
+        OR (phase = 'VERIFIED' AND verification_json IS NOT NULL))
+);
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS project (
     id TEXT PRIMARY KEY,
@@ -375,6 +390,62 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 class Store:
     """SQLite persistence and transactional operational resource accounting."""
 
+    def get_candidate_authority_installation(self, materialization_id: int):
+        if type(materialization_id) is not int or materialization_id <= 0:
+            raise StoreError("invalid materialization id")
+        cursor = self._conn.execute("SELECT * FROM candidate_authority_installation WHERE materialization_id = ?", (materialization_id,))
+        row = cursor.fetchone()
+        return dict(zip((item[0] for item in cursor.description), row)) if row else None
+
+    def prepare_candidate_authority_installation(self, materialization_id: int, installation_key: str, bindings_json: str):
+        from .candidate_authority_installation import validate_bindings
+        try:
+            validate_bindings(materialization_id, installation_key, bindings_json)
+        except Exception:
+            raise StoreError("invalid installation bindings") from None
+        with self._write_transaction():
+            materialization = self.get_candidate_materialization(materialization_id)
+            if materialization is None or materialization["phase"] != "SEALED":
+                raise StoreError("installation requires SEALED materialization")
+            from .candidate_materialization import canonical, digest
+            if json.loads(bindings_json)["materialization_sha256"] != digest(canonical(materialization).encode()):
+                raise StoreError("installation materialization mismatch")
+            row = self.get_candidate_authority_installation(materialization_id)
+            if row is not None:
+                if row["installation_key"] != installation_key or row["bindings_json"] != bindings_json:
+                    raise StoreError("installation intent conflict")
+                return row
+            now = _utcnow()
+            self._conn.execute("INSERT INTO candidate_authority_installation "
+                "(materialization_id, installation_key, bindings_json, phase, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'PREPARED', ?, ?)", (materialization_id, installation_key, bindings_json, now, now))
+            return self.get_candidate_authority_installation(materialization_id)
+
+    def verify_candidate_authority_installation(self, materialization_id: int, installation_key: str,
+                                              bindings_json: str, verification_json: str):
+        from .candidate_authority_installation import validate_bindings, validate_verification
+        try:
+            validate_bindings(materialization_id, installation_key, bindings_json)
+            validate_verification(bindings_json, verification_json)
+        except Exception:
+            raise StoreError("invalid installation verification") from None
+        with self._write_transaction():
+            row = self.get_candidate_authority_installation(materialization_id)
+            if row is None or row["installation_key"] != installation_key or row["bindings_json"] != bindings_json:
+                raise StoreError("installation intent conflict")
+            from .candidate_materialization import canonical, digest
+            materialization = self.get_candidate_materialization(materialization_id)
+            if (materialization is None or materialization["phase"] != "SEALED"
+                    or json.loads(bindings_json)["materialization_sha256"] != digest(canonical(materialization).encode())):
+                raise StoreError("installation materialization mismatch")
+            if row["phase"] == "VERIFIED":
+                if row["verification_json"] != verification_json:
+                    raise StoreError("installation verification conflict")
+                return row
+            self._conn.execute("UPDATE candidate_authority_installation SET phase='VERIFIED', verification_json=?, updated_at=? WHERE id=?",
+                               (verification_json, _utcnow(), row["id"]))
+            return self.get_candidate_authority_installation(materialization_id)
+
     def get_candidate_materialization(self, materialization_id: int) -> dict[str, Any] | None:
         if type(materialization_id) is not int or materialization_id <= 0:
             raise StoreError("invalid materialization id")
@@ -662,8 +733,21 @@ class Store:
             raise
 
     def _init_schema(self) -> None:
+        existing = self._conn.execute("SELECT sql FROM sqlite_master WHERE name='candidate_authority_installation'").fetchone()
+        normalize = lambda sql: " ".join(sql.replace("IF NOT EXISTS ", "").rstrip(";\n ").split())
+        if existing is not None and normalize(existing[0] or "") != normalize(INSTALLATION_SCHEMA):
+            raise StoreError("incompatible candidate authority installation schema")
         with closing(self._conn.cursor()) as cur:
             cur.executescript(SCHEMA)
+            cur.executescript(INSTALLATION_SCHEMA)
+            cur.executescript("""
+                CREATE TRIGGER IF NOT EXISTS installation_bindings_immutable
+                BEFORE UPDATE ON candidate_authority_installation
+                WHEN OLD.phase = 'VERIFIED' OR NEW.materialization_id != OLD.materialization_id
+                  OR NEW.installation_key != OLD.installation_key OR NEW.bindings_json != OLD.bindings_json
+                  OR NEW.created_at != OLD.created_at
+                BEGIN SELECT RAISE(ABORT, 'immutable installation'); END;
+            """)
         self._conn.commit()
 
     def close(self) -> None:
