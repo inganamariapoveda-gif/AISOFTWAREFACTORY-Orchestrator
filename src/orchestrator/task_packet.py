@@ -344,7 +344,7 @@ class TaskPacket:
 
     def authorizes_action(self, action: str) -> bool:
         """Explicit logical intent only; never approval or permission to execute."""
-        return action == "git_publish_task_branch" and action in self.authorized_actions
+        return action in {"git_publish_task_branch", "git_install_candidate_authority"} and action in self.authorized_actions
 
 
 def _validate_identifier(value: Any, field_name: str) -> str:
@@ -596,7 +596,7 @@ def parse_task_packet(data: Any, *, policies: dict[str, Any] | None = None) -> T
     actions = data.get("authorized_actions", [])
     if not isinstance(actions, list):
         raise TaskPacketError("authorized_actions must be a list")
-    if any(not isinstance(action, str) or action != "git_publish_task_branch" for action in actions):
+    if any(not isinstance(action, str) or action not in {"git_publish_task_branch", "git_install_candidate_authority"} for action in actions):
         raise TaskPacketError("unsupported authorized action")
     if len(actions) != len(set(actions)):
         raise TaskPacketError("duplicate authorized action")

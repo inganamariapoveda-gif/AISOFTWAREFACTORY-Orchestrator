@@ -1,4 +1,5 @@
 import inspect
+from contextlib import closing
 import json
 import sqlite3
 import sys
@@ -143,6 +144,118 @@ class CandidateMaterializationStoreTests(StoreTestCase):
         self.race(lambda store: store.seal_candidate_materialization(row["id"],
             candidate_tree_sha="d" * 40, candidate_commit_sha="e" * 40))
 
+
+class CandidateAuthorityInstallationStoreTests(StoreTestCase):
+    def setUp(self):
+        super().setUp()
+        from orchestrator import candidate_materialization as cm
+        from orchestrator import candidate_authority_installation as ai
+        from dataclasses import asdict
+        self.store.register_project("SAMPLE", "Sample", ".", "ref")
+        self.store.create_task("T-1", "SAMPLE", "Title", "Need")
+        root = str(Path(self._tmp.name).resolve())
+        metadata = cm.CommitMetadata("candidate\n", "Test", "test@example.invalid", 1700000000,
+                                     "+0000", "Test", "test@example.invalid", 1700000000, "+0000")
+        self.intent = dict(materialization_key=cm.materialization_key("T-1", root, "task/test", "a" * 40),
+            task_packet_sha256="b" * 64, repo_root=root, branch="task/test", base_head_sha="a" * 40,
+            base_tree_sha="c" * 40, manifest_sha256=cm.digest(b"[]"), manifest_json="[]",
+            commit_metadata_json=cm.canonical(asdict(metadata)))
+        self.materialization = self.store.seal_candidate_materialization(
+            self.store.prepare_candidate_materialization("T-1", **self.intent)["id"],
+            candidate_tree_sha="d"*40, candidate_commit_sha="e"*40)
+        m=self.materialization
+        approval=ai.InstallationApproval("T-1","b"*64,m["id"],m["repo_root"],m["branch"],m["base_head_sha"],
+            m["candidate_tree_sha"],m["candidate_commit_sha"],m["manifest_sha256"],"a"*64,"a"*64,"a"*64,
+            "synthetic-director","approval-001","a"*64)
+        self.bindings=cm.canonical(dict(approval=asdict(approval),materialization_sha256=cm.digest(cm.canonical(m).encode()),
+            packet_model_sha256="a"*64,worktree={},context=["a"*64,"a"*64],other_refs=[]))
+        self.key=ai.installation_key(m["id"],m["repo_root"],m["branch"])
+        self.verification=cm.canonical(dict(head=m["candidate_commit_sha"],tree=m["candidate_tree_sha"],
+            worktree_sha256=cm.digest(b"{}"),bindings_sha256=cm.digest(self.bindings.encode()),clean=True))
+
+    def prepare_install(self, store=None, bindings=None):
+        return (store or self.store).prepare_candidate_authority_installation(
+            self.materialization["id"],self.key,bindings or self.bindings)
+
+    def test_new_db_prepare_reopen_and_exact_replay(self):
+        row=self.prepare_install()
+        self.assertEqual(row["phase"],"PREPARED")
+        self.assertEqual(self.prepare_install(),row)
+        with Store(Path(self._tmp.name)/"test.db") as other:
+            self.assertEqual(self.prepare_install(other),row)
+            self.assertEqual(other._conn.execute("PRAGMA foreign_keys").fetchone()[0],1)
+
+    def test_same_key_conflict(self):
+        from orchestrator.candidate_materialization import canonical
+        row=self.prepare_install()
+        altered=json.loads(self.bindings);altered["packet_model_sha256"]="c"*64
+        with self.assertRaises(StoreError):self.prepare_install(bindings=canonical(altered))
+        self.assertEqual(self.store.get_candidate_authority_installation(self.materialization["id"]),row)
+
+    def test_verified_replay_immutable_and_no_reverse(self):
+        self.prepare_install()
+        args=(self.materialization["id"],self.key,self.bindings,self.verification)
+        verified=self.store.verify_candidate_authority_installation(*args)
+        self.assertEqual(verified["phase"],"VERIFIED")
+        self.assertEqual(self.store.verify_candidate_authority_installation(*args),verified)
+        self.assertEqual(self.prepare_install(),verified)
+        with self.assertRaises(StoreError):
+            self.store.verify_candidate_authority_installation(*args[:-1],"{}")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE candidate_authority_installation SET phase='PREPARED', verification_json=NULL")
+        self.store._conn.rollback()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE candidate_authority_installation SET bindings_json='{}'")
+        self.store._conn.rollback()
+
+    def test_upgrade_previous_db_preserves_sealed_rows(self):
+        old=Path(self._tmp.name)/"previous.db"
+        with closing(sqlite3.connect(old)) as conn:
+            self.store._conn.backup(conn)
+            conn.execute("DROP TABLE candidate_authority_installation")
+            conn.commit()
+        with Store(old) as upgraded:
+            self.assertEqual(upgraded.get_candidate_materialization(self.materialization["id"]),self.materialization)
+            self.assertIsNone(upgraded.get_candidate_authority_installation(self.materialization["id"]))
+            self.prepare_install(upgraded)
+        with Store(old) as reopened:
+            self.assertEqual(reopened.get_candidate_materialization(self.materialization["id"]),self.materialization)
+            self.assertEqual(reopened.get_candidate_authority_installation(self.materialization["id"])["phase"],"PREPARED")
+
+    def test_incompatible_preexisting_schema_rejected_without_rebuild(self):
+        path=Path(self._tmp.name)/"incompatible.db"
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute("CREATE TABLE candidate_authority_installation (id TEXT)")
+            conn.execute("INSERT INTO candidate_authority_installation VALUES ('preserve')")
+            conn.commit()
+        with self.assertRaisesRegex(StoreError,"incompatible"):Store(path)
+        with closing(sqlite3.connect(path)) as conn:
+            self.assertEqual(conn.execute("SELECT * FROM candidate_authority_installation").fetchall(),[("preserve",)])
+
+    def test_foreign_key_and_phase_constraints(self):
+        self.prepare_install()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("DELETE FROM candidate_materialization WHERE id=?",(self.materialization["id"],))
+        self.store._conn.rollback()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE candidate_authority_installation SET phase='INDEX_INSTALLED'")
+        self.store._conn.rollback()
+
+    def test_concurrent_preparation_converges(self):
+        CandidateMaterializationStoreTests.race(self,lambda other:self.prepare_install(other))
+
+    def test_concurrent_verification_converges(self):
+        self.prepare_install()
+        CandidateMaterializationStoreTests.race(self, lambda other: other.verify_candidate_authority_installation(
+            self.materialization["id"], self.key, self.bindings, self.verification))
+
+    def test_materialization_changed_before_verification_blocks(self):
+        self.prepare_install()
+        self.store._conn.execute("UPDATE candidate_materialization SET candidate_commit_sha=? WHERE id=?", ("f"*40,self.materialization["id"]))
+        self.store._conn.commit()
+        with self.assertRaises(StoreError):
+            self.store.verify_candidate_authority_installation(self.materialization["id"], self.key, self.bindings, self.verification)
+        self.assertEqual(self.store.get_candidate_authority_installation(self.materialization["id"])["phase"], "PREPARED")
 
 class ExternalOperationStoreTests(StoreTestCase):
     def setUp(self):

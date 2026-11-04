@@ -1067,6 +1067,8 @@ class GitPublishGovernanceTests(unittest.TestCase):
     def test_canonical_publication_policy(self):
         config = load_core_config(CONFIG_DIR)
         self.assertEqual(config.policies["controlled_actions"], {
+            "git_install_candidate_authority": {"enabled": True, "classification": "AMARILLO",
+                                                "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED"},
             "git_publish_safe_test_source_tag": {"enabled": True, "classification": "AMARILLO",
                                                  "approval": "DIRECTOR_INTERNAL_GATE", "on_violation": "BLOCKED"},
             "git_publish_task_branch": {"enabled": True, "classification": "AMARILLO",
@@ -1789,7 +1791,7 @@ class SafeTestSourceTagAuthorityTests(unittest.TestCase):
         self.assertEqual(self.config.permissions["git_publish"], _baseline_permissions()["git_publish"])
         self.assertIs(self.config.permissions["git_publish"]["allow_tags"], False)
         self.assertEqual(set(self.config.permissions["role_capabilities"]["builder"]), {
-            "implement_authorized_changes", "publish_authorized_task_branch",
+            "implement_authorized_changes", "publish_authorized_task_branch", "install_authorized_candidate_authority",
             "publish_authorized_safe_test_source_tag"})
         for role in ("director", "verifier"):
             self.assertEqual(self.config.permissions["role_capabilities"][role], [])
@@ -1871,6 +1873,47 @@ class SafeTestSourceTagAuthorityTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 self.require_authority(invalid)
 
+
+class CandidateInstallationGovernanceTests(unittest.TestCase):
+    def test_canonical_intersection_and_no_publication_implication(self):
+        from orchestrator.config_loader import require_candidate_installation_authority
+        import copy
+        config=load_core_config(CONFIG_DIR)
+        require_candidate_installation_authority(config)
+        for section,path in (("permissions",("git_install_candidate_authority",)),
+            ("permissions",("role_capabilities","builder")),
+            ("policies",("controlled_actions","git_install_candidate_authority")),
+            ("gates",("director_internal_gate","git_install_candidate_authority"))):
+            current=copy.deepcopy(config)
+            node=getattr(current,section)
+            for part in path[:-1]:node=node[part]
+            if path[-1]=="builder":node["builder"].remove("install_authorized_candidate_authority")
+            else:node.pop(path[-1])
+            with self.subTest(section=section,path=path),self.assertRaises(ConfigError):
+                require_candidate_installation_authority(current)
+
+    def test_closed_installation_permission(self):
+        from orchestrator.config_loader import require_candidate_installation_authority
+        import copy
+        for key,value in (("extra",True),("enabled",False),("enabled",1),("branch_prefix",""),
+            ("forbidden_branches",[]),("allow_worktree_write",True),("require_exact_task_ref_cas",False),
+            ("require_sealed_materialization",False),("require_director_approval",False),("require_explicit_task_packet",False)):
+            config=copy.deepcopy(load_core_config(CONFIG_DIR))
+            config.permissions["git_install_candidate_authority"][key]=value
+            with self.subTest(key=key,value=value),self.assertRaises(ConfigError):
+                require_candidate_installation_authority(config)
+
+    def test_closed_policy_gate_and_capability(self):
+        from orchestrator.config_loader import require_candidate_installation_authority
+        import copy
+        for key,value in (("enabled",False),("enabled",1),("classification","VERDE"),
+            ("approval","AUTOMATIC"),("on_violation","ALLOW"),("extra",True)):
+            config=copy.deepcopy(load_core_config(CONFIG_DIR))
+            config.policies["controlled_actions"]["git_install_candidate_authority"][key]=value
+            with self.subTest(key=key),self.assertRaises(ConfigError):require_candidate_installation_authority(config)
+        config=load_core_config(CONFIG_DIR)
+        config.gates["director_internal_gate"]["git_install_candidate_authority"]=False
+        with self.assertRaises(ConfigError):require_candidate_installation_authority(config)
 
 if __name__ == "__main__":
     unittest.main()

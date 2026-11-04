@@ -160,6 +160,7 @@ class CliFixtureTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.config_dir = self.root / "config"
         self.projects_dir = self.root / "projects"
@@ -220,11 +221,7 @@ class CliFixtureTestCase(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-
-    def tearDown(self) -> None:
-        for p in self._patches:
-            p.stop()
-        self._tmp.cleanup()
+            self.addCleanup(p.stop)
 
     def run_cli(self, *argv: str) -> int:
         return app.main(["--db-path", str(self.db_path), *argv])
@@ -311,6 +308,48 @@ class CliFixtureTestCase(unittest.TestCase):
         }
         data["agents"]["developer"] = developer
         _write_yaml(self.config_dir / "AGENTS.yaml", data)
+
+
+class CliFixtureCleanupTests(unittest.TestCase):
+    def test_derived_setup_failure_restores_globals_and_cleans_temporary_directory(self):
+        names = ("REPO_ROOT", "CONFIG_DIR", "PROJECTS_DIR", "TASKS_DIR", "SAMPLE_TASK_PACKET_PATH")
+        originals = {name: getattr(app, name) for name in names}
+        observed = {}
+        teardown_calls = []
+
+        class FailingSetup(CliFixtureTestCase):
+            def setUp(self):
+                super().setUp()
+                observed["root"] = self.root
+                observed["exists_during_setup"] = self.root.is_dir()
+                observed["globals"] = {name: getattr(app, name) for name in names}
+                raise RuntimeError("controlled derived setup failure")
+
+            def runTest(self):
+                self.fail("test body must not run after setup failure")
+
+            def tearDown(self):
+                teardown_calls.append(True)
+                super().tearDown()
+
+        # Protect the outer runner even if the restoration assertion regresses.
+        with mock.patch.multiple(app, **originals):
+            result = unittest.TestResult()
+            case = FailingSetup()
+            case.run(result)
+            self.assertEqual(result.testsRun, 1)
+            self.assertEqual(result.failures, [])
+            self.assertEqual(len(result.errors), 1)
+            self.assertIn("RuntimeError: controlled derived setup failure", result.errors[0][1])
+            self.assertEqual(teardown_calls, [])
+            self.assertTrue(observed["exists_during_setup"])
+            root = observed["root"]
+            self.assertEqual(observed["globals"], dict(zip(names, (
+                root, root / "config", root / "projects", root / "tasks",
+                root / "tasks/SAMPLE_TASK.yaml",
+            ))))
+            self.assertEqual({name: getattr(app, name) for name in names}, originals)
+            self.assertFalse(root.exists())
 
 
 class InitAndRegisterTests(CliFixtureTestCase):

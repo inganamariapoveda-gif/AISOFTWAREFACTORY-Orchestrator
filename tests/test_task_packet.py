@@ -1229,6 +1229,18 @@ class UnicodeLineSeparatorHardeningTests(unittest.TestCase):
 
 
 class AuthorizedActionsTests(unittest.TestCase):
+    def test_installation_is_explicit_and_independent_from_publication(self):
+        for action, other in (("git_install_candidate_authority", "git_publish_task_branch"),
+                              ("git_publish_task_branch", "git_install_candidate_authority")):
+            data = _valid_packet_data()
+            data["authorized_actions"] = [action]
+            packet = parse_task_packet(data)
+            self.assertTrue(packet.authorizes_action(action))
+            self.assertFalse(packet.authorizes_action(other))
+        data["authorized_actions"] = ["git_install_candidate_authority"] * 2
+        with self.assertRaises(TaskPacketError):
+            parse_task_packet(data)
+
     def test_absent_empty_and_explicit_action(self):
         for actions in (None, [], ["git_publish_task_branch"]):
             data = _valid_packet_data()

@@ -31,6 +31,16 @@ git_publish:
   require_clean_worktree: true
   refspec_mode: "current_branch_only"
 
+git_install_candidate_authority:
+  enabled: true
+  branch_prefix: "task/"
+  forbidden_branches: [main, master]
+  require_explicit_task_packet: true
+  require_director_approval: true
+  require_sealed_materialization: true
+  require_exact_task_ref_cas: true
+  allow_worktree_write: false
+
 # Separate trust primitive; never widens git_publish.
 git_tag_publish:
   enabled: true
@@ -79,6 +89,7 @@ allowed_commands:
 role_capabilities:
   builder:
     - implement_authorized_changes
+    - install_authorized_candidate_authority
     - publish_authorized_task_branch
     - publish_authorized_safe_test_source_tag
   director: []
