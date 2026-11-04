@@ -22,6 +22,81 @@ from .state_machine import INITIAL_STATE, validate_transition
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+# Additive ledger only. These exact schema objects are admitted before use.
+PUBLICATION_APPROVAL_SCHEMA = """
+CREATE TABLE controlled_publication_approval (
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    approval_id TEXT PRIMARY KEY NOT NULL,
+    operation_key TEXT NOT NULL UNIQUE CHECK (length(operation_key) = 64 AND operation_key NOT GLOB '*[^0-9a-f]*'),
+    director_request_id TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL REFERENCES project(id),
+    repository_identity TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES task(id),
+    task_packet_sha256 TEXT NOT NULL,
+    builder_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action = 'git_publish_task_branch'),
+    branch TEXT NOT NULL,
+    candidate_head_sha TEXT NOT NULL,
+    remote_name TEXT NOT NULL,
+    effective_push_url TEXT NOT NULL,
+    target_ref TEXT NOT NULL CHECK (target_ref = 'refs/heads/' || branch),
+    permissions_sha256 TEXT NOT NULL,
+    policies_sha256 TEXT NOT NULL,
+    gates_sha256 TEXT NOT NULL,
+    director_profile_id TEXT NOT NULL,
+    director_profile_version TEXT NOT NULL,
+    decision_digest TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('ISSUED', 'CLAIMED', 'REVOKED'))
+)
+"""
+PUBLICATION_APPROVAL_TRIGGERS = {
+    "publication_approval_insert": """
+CREATE TRIGGER publication_approval_insert
+BEFORE INSERT ON controlled_publication_approval
+WHEN NEW.phase != 'ISSUED'
+  OR (SELECT project_id FROM task WHERE id = NEW.task_id) IS NOT NEW.project_id
+  OR EXISTS (SELECT 1 FROM controlled_publication_approval
+             WHERE approval_id = NEW.approval_id OR operation_key = NEW.operation_key
+                OR director_request_id = NEW.director_request_id)
+BEGIN SELECT RAISE(ABORT, 'conflicting publication approval'); END
+""",
+    "publication_approval_update": """
+CREATE TRIGGER publication_approval_update
+BEFORE UPDATE ON controlled_publication_approval
+WHEN OLD.phase != 'ISSUED' OR NEW.phase NOT IN ('CLAIMED', 'REVOKED')
+  OR NEW.schema_version IS NOT OLD.schema_version
+  OR NEW.approval_id IS NOT OLD.approval_id
+  OR NEW.operation_key IS NOT OLD.operation_key
+  OR NEW.director_request_id IS NOT OLD.director_request_id
+  OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.repository_identity IS NOT OLD.repository_identity
+  OR NEW.task_id IS NOT OLD.task_id
+  OR NEW.task_packet_sha256 IS NOT OLD.task_packet_sha256
+  OR NEW.builder_id IS NOT OLD.builder_id
+  OR NEW.action IS NOT OLD.action
+  OR NEW.branch IS NOT OLD.branch
+  OR NEW.candidate_head_sha IS NOT OLD.candidate_head_sha
+  OR NEW.remote_name IS NOT OLD.remote_name
+  OR NEW.effective_push_url IS NOT OLD.effective_push_url
+  OR NEW.target_ref IS NOT OLD.target_ref
+  OR NEW.permissions_sha256 IS NOT OLD.permissions_sha256
+  OR NEW.policies_sha256 IS NOT OLD.policies_sha256
+  OR NEW.gates_sha256 IS NOT OLD.gates_sha256
+  OR NEW.director_profile_id IS NOT OLD.director_profile_id
+  OR NEW.director_profile_version IS NOT OLD.director_profile_version
+  OR NEW.decision_digest IS NOT OLD.decision_digest
+  OR NEW.issued_at IS NOT OLD.issued_at
+BEGIN SELECT RAISE(ABORT, 'immutable publication approval'); END
+""",
+    "publication_approval_delete": """
+CREATE TRIGGER publication_approval_delete
+BEFORE DELETE ON controlled_publication_approval
+BEGIN SELECT RAISE(ABORT, 'publication evidence cannot be deleted'); END
+""",
+}
+
+
 INSTALLATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidate_authority_installation (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -390,6 +465,147 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 class Store:
     """SQLite persistence and transactional operational resource accounting."""
 
+    def _check_publication_approval_schema(self, *, allow_absent: bool = False) -> bool:
+        """Definition admission, not protection against a writer controlling SQLite."""
+        name = "controlled_publication_approval"
+        with closing(self._conn.cursor()) as cursor:
+            objects = cursor.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE "
+                "OR tbl_name = ? COLLATE NOCASE", (name, name),
+            ).fetchall()
+            triggers = {key: cursor.execute(
+                "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE", (key,),
+            ).fetchone() for key in PUBLICATION_APPROVAL_TRIGGERS}
+        if not objects and not any(triggers.values()) and allow_absent:
+            return False
+        expected = PUBLICATION_APPROVAL_SCHEMA.strip().rstrip(";")
+        tables = [row for row in objects if row[0] != "index" and row[0] != "trigger"]
+        if tables != [("table", name, name, expected)]:
+            raise StoreError("incompatible publication approval schema")
+        if {row[1] for row in objects if row[0] == "trigger"} != set(PUBLICATION_APPROVAL_TRIGGERS):
+            raise StoreError("incompatible publication approval triggers")
+        if any(row[3] is not None for row in objects if row[0] == "index"):
+            raise StoreError("incompatible publication approval indexes")
+        for key, sql in PUBLICATION_APPROVAL_TRIGGERS.items():
+            if triggers[key] != ("trigger", name, sql.strip().rstrip(";")):
+                raise StoreError("incompatible publication approval trigger definition")
+        return True
+
+    def _initialize_publication_approval_schema(self) -> None:
+        with self._write_transaction():
+            if not self._check_publication_approval_schema(allow_absent=True):
+                self._conn.execute(PUBLICATION_APPROVAL_SCHEMA)
+                for sql in PUBLICATION_APPROVAL_TRIGGERS.values():
+                    self._conn.execute(sql)
+            self._check_publication_approval_schema()
+
+    @contextmanager
+    def _publication_approval_transaction(self):
+        try:
+            with self._write_transaction():
+                self._check_publication_approval_schema()
+                yield
+        except sqlite3.Error:
+            raise StoreError("publication approval persistence blocked") from None
+
+    @staticmethod
+    def _publication_intent_values(intent):
+        from dataclasses import asdict
+        from .director_issuance import ApprovalIntent, LedgerValidationError
+        if type(intent) is not ApprovalIntent:
+            raise StoreError("publication ledger intent required")
+        try:
+            intent.validate()
+        except LedgerValidationError:
+            raise StoreError("invalid publication ledger intent") from None
+        return dict(asdict(intent.bindings), operation_key=intent.operation_key,
+                    decision_digest=intent.decision_digest)
+
+    def _publication_approval_row(self, approval_id):
+        from .director_issuance import ApprovalBindings, ApprovalIntent, BINDING_FIELDS
+        with closing(self._conn.cursor()) as cursor:
+            row = cursor.execute("SELECT * FROM controlled_publication_approval WHERE approval_id = ?",
+                                 (approval_id,)).fetchone()
+            if row is None:
+                return None
+            record = dict(zip((item[0] for item in cursor.description), row))
+        try:
+            ApprovalIntent(ApprovalBindings(**{key: record[key] for key in BINDING_FIELDS}),
+                           record["operation_key"], record["decision_digest"])
+            stamp = datetime.fromisoformat(record["issued_at"])
+            if stamp.utcoffset() is None or record["phase"] not in {"ISSUED", "CLAIMED", "REVOKED"}:
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise StoreError("invalid persisted publication ledger record") from None
+        return record
+
+    def get_controlled_publication_approval(self, approval_id: str):
+        """Return untrusted ledger DATA; never an authenticated approval."""
+        validate_id(approval_id, "approval_id")
+        self._check_publication_approval_schema()
+        return self._publication_approval_row(approval_id)
+
+    def issue_controlled_publication_approval(self, intent):
+        """Persist data only: LEDGER_RECORD_EXISTS != TRUSTED_APPROVAL.
+
+        No issuer authentication, CLI, provider or publication authority exists
+        here. A future trusted_runtime must admit the Store before consumption.
+        """
+        values = self._publication_intent_values(intent)
+        with self._publication_approval_transaction():
+            task = self.get_task(values["task_id"])
+            if task is None or task["project_id"] != values["project_id"]:
+                raise StoreError("publication ledger task/project mismatch")
+            with closing(self._conn.cursor()) as cursor:
+                matches = cursor.execute(
+                    "SELECT approval_id FROM controlled_publication_approval WHERE approval_id = ? "
+                    "OR director_request_id = ? OR operation_key = ?",
+                    (values["approval_id"], values["director_request_id"], values["operation_key"]),
+                ).fetchall()
+                if matches:
+                    if len(matches) != 1:
+                        raise StoreError("publication approval identity conflict")
+                    row = self._publication_approval_row(matches[0][0])
+                    if any(row[key] != value for key, value in values.items()):
+                        raise StoreError("publication approval binding conflict")
+                    return row  # Includes terminal phases; no reset or new timestamp.
+                # All column names originate from the closed dataclass, never caller SQL.
+                columns = tuple(values) + ("issued_at", "phase")
+                cursor.execute(
+                    "INSERT INTO controlled_publication_approval (" + ", ".join(columns) + ") VALUES (" +
+                    ", ".join("?" for _ in columns) + ")", (*values.values(), _utcnow(), "ISSUED"),
+                )
+            return self._publication_approval_row(values["approval_id"])
+
+    def _transition_publication_approval(self, approval_id, operation_key, decision_digest, phase):
+        from .director_issuance import validate_digest, LedgerValidationError
+        validate_id(approval_id, "approval_id")
+        try:
+            validate_digest(operation_key)
+            validate_digest(decision_digest)
+        except LedgerValidationError:
+            raise StoreError("invalid publication ledger digest") from None
+        if phase not in {"CLAIMED", "REVOKED"}:
+            raise StoreError("invalid publication ledger transition")
+        with self._publication_approval_transaction():
+            row = self._publication_approval_row(approval_id)
+            if row is None or row["operation_key"] != operation_key or row["decision_digest"] != decision_digest:
+                raise StoreError("publication approval binding mismatch")
+            if row["phase"] != "ISSUED":
+                return False
+            self._conn.execute("UPDATE controlled_publication_approval SET phase = ? "
+                               "WHERE approval_id = ? AND phase = 'ISSUED'", (phase, approval_id))
+            return True
+
+    def claim_controlled_publication_approval(self, approval_id: str, *, operation_key: str,
+                                             decision_digest: str) -> bool:
+        """Reserve ledger intent once; NOT permission to execute a push."""
+        return self._transition_publication_approval(approval_id, operation_key, decision_digest, "CLAIMED")
+
+    def revoke_controlled_publication_approval(self, approval_id: str, *, operation_key: str,
+                                              decision_digest: str) -> bool:
+        return self._transition_publication_approval(approval_id, operation_key, decision_digest, "REVOKED")
+
     def get_candidate_authority_installation(self, materialization_id: int):
         if type(materialization_id) is not int or materialization_id <= 0:
             raise StoreError("invalid materialization id")
@@ -733,6 +949,8 @@ class Store:
             raise
 
     def _init_schema(self) -> None:
+        # Reject incompatible ledger objects before any legacy schema writes.
+        self._check_publication_approval_schema(allow_absent=True)
         existing = self._conn.execute("SELECT sql FROM sqlite_master WHERE name='candidate_authority_installation'").fetchone()
         normalize = lambda sql: " ".join(sql.replace("IF NOT EXISTS ", "").rstrip(";\n ").split())
         if existing is not None and normalize(existing[0] or "") != normalize(INSTALLATION_SCHEMA):
@@ -749,6 +967,8 @@ class Store:
                 BEGIN SELECT RAISE(ABORT, 'immutable installation'); END;
             """)
         self._conn.commit()
+
+        self._initialize_publication_approval_schema()
 
     def close(self) -> None:
         self._conn.close()

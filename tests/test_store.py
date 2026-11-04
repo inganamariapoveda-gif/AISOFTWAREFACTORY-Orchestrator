@@ -2342,6 +2342,247 @@ class NotificationEventStoreTests(SuspensionTestCase):
             self.store.get_notifications("../x")
 
 
+class PublicationApprovalLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "ledger.db"
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+        self.store.register_project("SAMPLE", "Sample", ".", "ref")
+        self.store.create_task("T-1", "SAMPLE", "Title", "Need")
+        self.intent = self.make_intent()
+
+    @staticmethod
+    def make_intent(**changes):
+        from orchestrator.director_issuance import ApprovalIntent
+        from tests.test_director_issuance import make_bindings
+        return ApprovalIntent.from_bindings(make_bindings(**changes))
+
+    def issue(self, **changes):
+        return self.store.issue_controlled_publication_approval(self.make_intent(**changes))
+
+    def transition(self, store=None, method="claim", **changes):
+        values = dict(operation_key=self.intent.operation_key, decision_digest=self.intent.decision_digest)
+        values.update(changes)
+        return getattr(store or self.store, method + "_controlled_publication_approval")("approval-1", **values)
+
+    def row(self):
+        return self.store.get_controlled_publication_approval("approval-1")
+
+    def test_issue_assigns_timestamp_and_exact_replay_survives_reopen(self):
+        with mock.patch("orchestrator.store._utcnow", return_value="2026-01-01T00:00:00+00:00"):
+            row = self.issue()
+        self.assertEqual(row["phase"], "ISSUED")
+        self.assertEqual(row["issued_at"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(self.issue(), row)
+        with Store(self.path) as other:
+            self.assertEqual(other.issue_controlled_publication_approval(self.intent), row)
+        with self.assertRaises(TypeError):
+            self.store.issue_controlled_publication_approval(self.intent, issued_at="caller")
+
+    def test_conflicting_request_or_approval_preserves_original_evidence(self):
+        row = self.issue()
+        for changes in ({"candidate_head_sha": "f" * 40},
+                        {"approval_id": "approval-2", "candidate_head_sha": "f" * 40},
+                        {"director_request_id": "request-2", "policies_sha256": "f" * 64}):
+            with self.subTest(changes=changes), self.assertRaises(StoreError):
+                self.issue(**changes)
+            self.assertEqual(self.row(), row)
+
+    def test_same_operation_new_ids_or_profile_block_before_and_after_claim(self):
+        self.issue()
+        for claimed in (False, True):
+            if claimed:
+                self.assertTrue(self.transition())
+            for changes in ({"approval_id": "approval-2", "director_request_id": "request-2"},
+                            {"director_profile_id": "director-2"}, {"director_profile_version": "v2"}):
+                with self.subTest(claimed=claimed, changes=changes), self.assertRaises(StoreError):
+                    self.issue(**changes)
+        self.assertEqual(self.store._conn.execute("SELECT count(*) FROM controlled_publication_approval").fetchone(), (1,))
+
+    def test_task_project_binding_must_exist_and_match(self):
+        self.store.register_project("OTHER", "Other", ".", "ref")
+        for changes in ({"project_id": "OTHER"}, {"task_id": "missing"}):
+            with self.assertRaises(StoreError):
+                self.issue(**changes)
+        self.assertIsNone(self.row())
+
+    def test_every_binding_is_immutable_even_with_terminal_transition(self):
+        row = self.issue()
+        for field, value in row.items():
+            if field == "phase":
+                continue
+            with self.subTest(field=field), self.assertRaises(sqlite3.IntegrityError):
+                self.store._conn.execute("UPDATE controlled_publication_approval SET " + field +
+                                         " = ?, phase = 'CLAIMED'", (2 if field == "schema_version" else "changed",))
+            self.store._conn.rollback()
+            self.assertEqual(self.row(), row)
+
+    def test_delete_and_replace_cannot_reset_evidence(self):
+        row = self.issue()
+        self.assertTrue(self.transition())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("DELETE FROM controlled_publication_approval")
+        self.store._conn.rollback()
+        columns = tuple(row)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("INSERT OR REPLACE INTO controlled_publication_approval (" +
+                                    ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")",
+                                    tuple(row.values()))
+        self.store._conn.rollback()
+        self.assertEqual(self.row()["phase"], "CLAIMED")
+
+    def test_claim_is_durable_irreversible_and_never_retried(self):
+        original = self.issue()
+        self.assertTrue(self.transition())
+        with Store(self.path) as reopened:
+            self.assertFalse(self.transition(reopened))
+            self.assertFalse(self.transition(reopened, "revoke"))
+            terminal = reopened.issue_controlled_publication_approval(self.intent)
+        self.assertEqual(terminal, dict(original, phase="CLAIMED"))
+        for phase in ("ISSUED", "REVOKED", "CLAIMED", "CONSUMED"):
+            with self.subTest(phase=phase), self.assertRaises(sqlite3.IntegrityError):
+                self.store._conn.execute("UPDATE controlled_publication_approval SET phase = ?", (phase,))
+            self.store._conn.rollback()
+
+    def test_revoked_evidence_persists_and_never_claims(self):
+        original = self.issue()
+        self.assertTrue(self.transition(method="revoke"))
+        with Store(self.path) as reopened:
+            self.assertFalse(self.transition(reopened))
+            self.assertFalse(self.transition(reopened, "revoke"))
+            self.assertEqual(reopened.issue_controlled_publication_approval(self.intent), dict(original, phase="REVOKED"))
+        with self.assertRaises(StoreError):
+            self.issue(approval_id="new", director_request_id="new")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._conn.execute("UPDATE controlled_publication_approval SET phase = 'ISSUED'")
+        self.store._conn.rollback()
+
+    def test_claim_wrong_expected_bindings_fail_closed(self):
+        row = self.issue()
+        for changes in ({"operation_key": "f" * 64}, {"decision_digest": "f" * 64},
+                        {"decision_digest": "not-a-digest"}):
+            with self.assertRaises(StoreError):
+                self.transition(**changes)
+        self.assertEqual(self.row(), row)
+
+    def race(self, actions):
+        barrier = threading.Barrier(2, timeout=10)
+        results = [None, None]
+        def worker(index):
+            try:
+                with Store(self.path) as connection:
+                    barrier.wait()
+                    results[index] = actions[index](connection)
+            except Exception as exc:
+                results[index] = exc
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        return results
+
+    def test_concurrent_claim_has_exactly_one_winner(self):
+        self.issue()
+        results = self.race([lambda connection: self.transition(connection)] * 2)
+        self.assertCountEqual(results, [True, False])
+        self.assertEqual(self.row()["phase"], "CLAIMED")
+
+    def test_concurrent_exact_issue_returns_same_persisted_row(self):
+        results = self.race([lambda connection: connection.issue_controlled_publication_approval(self.intent)] * 2)
+        self.assertEqual(results, [self.row(), self.row()])
+        self.assertIsInstance(results[0], dict)
+
+    def test_concurrent_same_operation_new_ids_has_one_conflict(self):
+        other = self.make_intent(approval_id="approval-2", director_request_id="request-2")
+        results = self.race([lambda connection: connection.issue_controlled_publication_approval(self.intent),
+                             lambda connection: connection.issue_controlled_publication_approval(other)])
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
+        self.assertEqual(sum(isinstance(result, StoreError) for result in results), 1)
+        self.assertEqual(self.store._conn.execute("SELECT count(*) FROM controlled_publication_approval").fetchone(), (1,))
+
+    def test_concurrent_claim_vs_revoke_has_one_terminal_result(self):
+        self.issue()
+        results = self.race([lambda connection: self.transition(connection),
+                             lambda connection: self.transition(connection, "revoke")])
+        self.assertCountEqual(results, [True, False])
+        self.assertEqual(self.row()["phase"], "CLAIMED" if results[0] else "REVOKED")
+
+    def test_additive_migration_preserves_all_existing_tables_and_rows(self):
+        # The current pre-ledger schema, populated with legacy project/task evidence.
+        self.store._conn.execute("DROP TABLE controlled_publication_approval")
+        self.store._conn.commit()
+        tables = [row[0] for row in self.store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        before = {name: self.store._conn.execute('SELECT * FROM "' + name + '"').fetchall() for name in tables}
+        schema = self.store._conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
+        with Store(self.path) as reopened:
+            after = {name: reopened._conn.execute('SELECT * FROM "' + name + '"').fetchall() for name in tables}
+            self.assertEqual(before, after)
+            new_schema = dict(reopened._conn.execute("SELECT name, sql FROM sqlite_master"))
+            for name, sql in schema:
+                self.assertEqual(new_schema[name], sql)
+            self.assertEqual(reopened.issue_controlled_publication_approval(self.intent)["phase"], "ISSUED")
+
+    def test_incompatible_existing_table_rejected_without_repair(self):
+        path = Path(self.tmp.name) / "incompatible.db"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("CREATE TABLE controlled_publication_approval (evidence TEXT)")
+            connection.execute("INSERT INTO controlled_publication_approval VALUES ('preserve')")
+            connection.commit()
+        before = path.read_bytes()
+        with self.assertRaises(StoreError):
+            Store(path)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_or_modified_or_extra_trigger_rejected_without_repair(self):
+        from orchestrator.store import PUBLICATION_APPROVAL_TRIGGERS
+        for variant in ("missing", "modified", "extra", "homonym"):
+            with self.subTest(variant=variant):
+                path = Path(self.tmp.name) / (variant + ".db")
+                with Store(path) as other:
+                    other._conn.execute("DROP TRIGGER publication_approval_update")
+                    if variant == "modified":
+                        other._conn.execute("CREATE TRIGGER publication_approval_update BEFORE UPDATE ON controlled_publication_approval BEGIN SELECT 1; END")
+                    elif variant == "extra":
+                        other._conn.execute(PUBLICATION_APPROVAL_TRIGGERS["publication_approval_update"])
+                        other._conn.execute("CREATE TRIGGER extra AFTER INSERT ON controlled_publication_approval BEGIN SELECT 1; END")
+                    elif variant == "homonym":
+                        other._conn.execute("CREATE TRIGGER publication_approval_update BEFORE UPDATE ON task BEGIN SELECT 1; END")
+                    other._conn.commit()
+                before = path.read_bytes()
+                with self.assertRaises(StoreError):
+                    Store(path)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_live_schema_tamper_blocks_read_issue_claim_and_revoke(self):
+        self.issue()
+        self.store._conn.execute("DROP TRIGGER publication_approval_update")
+        self.store._conn.commit()
+        for operation in (self.row, self.issue, self.transition, lambda: self.transition(method="revoke")):
+            with self.assertRaises(StoreError):
+                operation()
+        self.assertEqual(self.store._conn.execute("SELECT phase FROM controlled_publication_approval").fetchone(), ("ISSUED",))
+
+    def test_fabricated_rows_or_intents_never_become_execution_approval(self):
+        from orchestrator import app
+        task = self.store.get_task("T-1")
+        events = self.store._conn.execute("SELECT * FROM status_event").fetchall()
+        with mock.patch("socket.socket", side_effect=AssertionError("network forbidden")), \
+                mock.patch("subprocess.run", side_effect=AssertionError("execution forbidden")):
+            row = self.issue()
+            self.assertTrue(self.transition())
+        with self.assertRaises(app.ControlledPublicationApprovalError):
+            app.validate_controlled_publication_approval(row, None, None, "a" * 64, "builder-1", "b" * 40, "origin", "")
+        for value in (row, "director", "TECH_APPROVED", {"actor": "director"}):
+            with self.assertRaises(StoreError):
+                self.store.issue_controlled_publication_approval(value)
+        self.assertEqual(self.store.get_task("T-1"), task)
+        self.assertEqual(self.store._conn.execute("SELECT * FROM status_event").fetchall(), events)
+
+
 class ParameterizedSqlTests(unittest.TestCase):
     def test_store_never_builds_sql_with_string_interpolation(self) -> None:
         source = (SRC_DIR / "orchestrator" / "store.py").read_text(encoding="utf-8")
