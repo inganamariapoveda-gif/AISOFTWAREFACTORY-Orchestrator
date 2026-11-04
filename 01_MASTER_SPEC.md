@@ -1620,3 +1620,81 @@ Los locks excluyen escritores cooperativos, no escrituras arbitrarias ni ABA.
 NO_EXACTLY_ATOMIC_SQLITE_REF_INDEX_GUARANTEE. No se afirma durabilidad eléctrica
 del rename. INSTALLED no significa TECH_APPROVED, PUBLICATION_APPROVED,
 PUSHED, MERGED ni EXECUTABLE.
+
+## TRUSTED_DIRECTOR_ISSUANCE-001A — Ledger foundation
+
+Este slice incorpora exclusivamente datos, bindings, replay y persistencia en
+`controlled_publication_approval`. No implementa emisión autenticada, publisher,
+trusted_runtime, DirectorPort, CLI, endpoint ni wiring desde app/Builder.
+`LEDGER_RECORD_EXISTS != TRUSTED_APPROVAL`.
+`UNPROTECTED_STORE_ROW != PUBLICATION_AUTHORITY`.
+`IMPORTABLE != AUTHORITY`. `DIGEST != SIGNATURE`.
+`DIGEST != AUTHENTICATED ISSUER`.
+Una dataclass, JSON compatible, actor llamado director o estado TECH_APPROVED
+no autoriza publicación. La SQLite actual NO es trusted. El futuro publisher
+solo podrá consumir approvals de un Store admitido por el futuro trusted_runtime;
+las APIs de este ledger no proporcionan esa admisión ni conversión a autoridad.
+
+Modelo v1: schema_version, approval_id, operation_key, director_request_id,
+project_id, repository_identity, task_id, task_packet_sha256, builder_id,
+action, branch, candidate_head_sha, remote_name, effective_push_url, target_ref,
+permissions_sha256, policies_sha256, gates_sha256, director_profile_id,
+director_profile_version, decision_digest, issued_at y phase.
+Los bindings son inmutables. repository_identity es un identificador opaco del
+repositorio, no un path. Los identificadores usan el alfabeto ASCII de IDs del
+Store. Los hashes son hexadecimales minúsculos no nulos, SHA-256 salvo el commit
+Git SHA-1. El modelo v1 admite únicamente git_publish_task_branch, rama task/,
+target_ref exactamente refs/heads/<branch> y URL HTTPS estructural sin usuario,
+password, puerto, query ni fragmento. Validación estructural NO equivale a
+admisión por políticas ni a comprobar el repositorio remoto.
+No se acepta issuer_identity. Los bindings director_profile_id/version deberán
+provenir del runtime admitido en un slice futuro; ahora son datos sin autenticar.
+issued_at se asigna dentro de Store mediante reloj UTC del motor, nunca mediante
+un argumento del caller. No se introduce TTL ni autoridad derivada del reloj.
+
+Canonicalización v1: JSON UTF-8, sort_keys=True, separadores coma/dos puntos sin
+espacios, ensure_ascii=True, allow_nan=False. operation_key es SHA-256 de
+{"domain":"publication-operation-v1","bindings":<proyección>}.
+La proyección contiene exactamente schema_version, project_id,
+repository_identity, task_id, task_packet_sha256, builder_id, action, branch,
+candidate_head_sha, remote_name, effective_push_url, target_ref,
+permissions_sha256, policies_sha256 y gates_sha256.
+Excluye approval_id, director_request_id, director_profile_id/version, issued_at
+y phase: cambiar esas identidades cosméticas no crea una segunda reserva.
+decision_digest es SHA-256 de
+{"domain":"publication-decision-v1","decision":"APPROVE","bindings":<bindings>}.
+Incluye todos los campos de ApprovalBindings, incluidos approval_id,
+director_request_id y director_profile_id/version; excluye campos derivados
+operation_key/decision_digest y campos persistidos issued_at/phase. Es un hash
+reproducible de una decisión modelada, no una firma ni autenticación del emisor.
+
+Issue persiste ISSUED tras validar coherencia interna y pertenencia task/project.
+Replay exacto devuelve la misma fila, timestamp y fase, incluso si ya es terminal.
+Conflicto de approval_id o director_request_id con cualquier binding/digest
+diferente bloquea. Otra identidad approval/request para la misma operation_key
+también bloquea: no se crean aliases ni segunda fila o reserva efectiva.
+approval_id, director_request_id y operation_key tienen unicidad independiente.
+Issue/claim/revoke usan BEGIN IMMEDIATE; la transacción serializa consumidores.
+Claim exige approval_id, operation_key y decision_digest coincidentes. Solo
+ISSUED -> CLAIMED o ISSUED -> REVOKED son transiciones válidas. Un segundo claim
+o transición desde cualquier fase terminal devuelve false, sin mutar evidencia.
+CLAIMED significa reserva para un único intento; NO significa que ocurrió push.
+No se permite volver a ISSUED, sobrescribir bindings ni borrar evidencia.
+
+La migración es aditiva y conserva tablas/datos anteriores. La tabla y sus tres
+triggers se crean juntos en una transacción. Antes de inicializar un Store y
+antes de usar el ledger se admite la definición exacta de tabla y triggers;
+tabla incompatible, trigger ausente, homónimo alterado, trigger adicional o
+índice explícito inesperado bloquean sin reparar ni borrar datos. Los triggers
+impiden inserción terminal, reemplazo de evidencia, modificación de bindings,
+transiciones terminales y DELETE. Estos controles de consistencia no protegen
+contra un escritor que controla SQLite; no transforman el Store en trusted.
+
+Contrato crash/replay para el siguiente slice:
+- ISSUED + crash: conserva la misma fila durable ISSUED.
+- CLAIMED + crash antes del efecto externo: UNKNOWN; ningún retry automático.
+- CLAIMED + crash después del efecto externo: observación remota read-only por
+  el futuro componente; ningún retry automático.
+- REVOKED: conserva evidencia y nunca se reclama.
+Este slice no observa remotos ni ejecuta push, no consulta credenciales ni añade
+dependencias, permisos, proveedores, state machine o rutas de ejecución.
