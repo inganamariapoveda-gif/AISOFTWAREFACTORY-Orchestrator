@@ -374,3 +374,35 @@ class SchedulerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Gate1AclRegressionTests(unittest.TestCase):
+    def test_gate1_preserves_authority_container_and_file_split(self):
+        d = w.expected_descriptor('authority', RUNTIME, BUILDER)
+        runtime_aces = [a for a in d.aces if a.sid == RUNTIME]
+        container = next(a for a in runtime_aces if a.flags == 0)
+        forbidden = w.DELETE | 0x40 | w.WRITE_DAC | w.WRITE_OWNER | 0x4
+        self.assertEqual(container.mask & forbidden, 0)
+        files = next(a for a in runtime_aces if a.flags != 0)
+        self.assertEqual(files.flags, w.OBJECT_INHERIT | w.INHERIT_ONLY)
+        self.assertTrue(files.mask & w.DELETE)
+        self.assertFalse(files.flags & 0x2)
+
+    def test_gate1_builder_has_no_protected_root_or_task_grant(self):
+        for kind in ('authority', 'captures', 'secrets', 'runtime', 'task', 'folder'):
+            with self.subTest(kind=kind):
+                d = w.expected_descriptor(kind, RUNTIME, BUILDER)
+                self.assertTrue(d.protected)
+                self.assertFalse(any(a.sid == BUILDER for a in d.aces))
+        captures = w.expected_descriptor('captures', RUNTIME, BUILDER)
+        ace = next(a for a in captures.aces if a.sid == RUNTIME)
+        self.assertEqual(ace.mask & (w.DELETE | 0x40 | w.WRITE_DAC | w.WRITE_OWNER), 0)
+
+    def test_gate1_contract_reuses_exact_provenance_identity(self):
+        proof = provenance()
+        proof.update(published_sha256=w.GATE1_PYTHON_SHA256,
+                     calculated_sha256=w.GATE1_PYTHON_SHA256)
+        w.validate_provenance(proof)
+        proof['artifact_filename'] = 'python-3.14.10-embeddable-amd64.zip'
+        with self.assertRaises(w.AdmissionError):
+            w.validate_provenance(proof)

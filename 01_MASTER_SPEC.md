@@ -1916,3 +1916,86 @@ no se admite activacion. Receipt y activation son evidencia, no autoridad.
 Limite de este incremento: nueve archivos, sin config ni cambios a Store/parser/
 foundation/director_issuance/state_machine. Ninguna prueba crea cuentas, cambia UAC,
 rights/ACL reales, instala Python, provisiona DPAPI o registra/ejecuta tareas.
+
+
+## TRUSTED_RUNTIME_WINDOWS_HUMAN_GATE_1-001D — Code-only Gate 1 model
+
+CODE_EXISTS != HUMAN_GATE_AUTHORIZED.
+CODE_EXISTS != WINDOWS_MUTATION_AUTHORIZED. TEST_PASS != HOST_BOUNDARY_PROVEN.
+Este incremento no autoriza, instala ni ejecuta Human Gate 1. Las decisiones
+001D sustituyen la propuesta anterior de bootstrap privilegiado PowerShell:
+Phase 1A es una accion humana/Windows, nunca un script elevado del repositorio;
+Phase 1B futura requiere Python 3.14.10 amd64 embeddable protegido y verificado
+independientemente. Los dos scripts PowerShell 001B permanecen sin cambios.
+
+El contrato gate1_contract.json es DATA con esquema cerrado y tipos exactos,
+sin SIDs, installation IDs o secretos. Version/generation 1; reinstall=false;
+Captures permanece en Authority/Captures. Identidad fisica del artefacto:
+python-3.14.10-embed-amd64.zip, SHA-256 publicado
+90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159.
+PYTHON_ARTIFACT_FILENAME_EXACT_MATCH_REQUIRED = TRUE.
+No alias embeddable, normalizacion ni cambio del validador 001B. Sigstore y
+pertenencia de blobs al commit/tree requieren evidencia independiente externa;
+un booleano, un hash declarado o el contrato no autentican esa evidencia.
+
+Phase 1A valida observaciones del checkpoint: ASFBuilder habilitado/no admin,
+SID exacto, cambio real de sesion interactiva, perfil propio, workspace bajo
+su perfil, propietario/escritura Builder y sin otros escritores no-admin ni
+reparse. Codex y Git deben observarse disponibles. Python del usuario anterior
+no es dependencia requerida. Tooling ausente bloquea; no workspace compartido,
+creacion de cuenta, credenciales Builder ni reparacion automatica.
+
+El tool Python separa --plan/--preflight (solo DATA, sin observar el host) de
+--phase1b, que permanece fail-closed: no hay backend nativo instalado ni entrada
+CLI para inyectar uno o autenticar el Human Gate. run_sequence es un coordinador
+para un port sustituido en pruebas, NO una primitive operativa confiable. El
+backend futuro debe observar mediante APIs nativas, retener handles protegidos,
+admitir la cadena de imports y autenticar aprobacion externa antes de exponer
+este coordinador. No se afirma haber implementado esa frontera Windows aqui.
+No dato/flag suministrado por Builder puede convertir el modelo en autoridad.
+
+El modelo de admision exige Human Admin separado de Builder, elevado, sin agentes,
+checkpoint Phase 1A, staging protegido/no reparse, hashes externos exactos del
+script/contrato protegido, commit/tree admitidos, generation=1 y ausencia de
+receipt/cuenta runtime/raices/carpeta/tarea. Exige NTFS/ancestros sin reparse,
+Python protegido version/arquitectura/executable/tree admitidos, procedencia
+Sigstore independiente, R-1 completo, red false y bypass antivirus false.
+Readmision inmediatamente antes del primer efecto; UAC inicial exacto 1/5/3/1.
+Datos de observacion son consistencia de modelo, no prueba de host ni de TOCTOU.
+
+Secuencia modelada: cuenta runtime standard; congelar SID; readback no-admin;
+leer derechos directos/efectivos, agregar solo SeBatchLogonRight, releer;
+crear exclusivamente roots con seguridad inicial restrictiva, aplicar descriptores
+001B y releer; materializar exclusivamente inputs admitidos, verificar inventario
+exacto; registrar tarea Password/LeastPrivilege/no interactiva disabled, demanda
+false, IgnoreNew, 50 s con descriptores task/folder y readback; comparar UAC de
+nuevo, cambiar solo ConsentPromptBehaviorUser 3->0, releer; receipt exclusivo
+protegido; readback final; STOP. No Run, activacion, Inbox o DPAPI. El modelo LSA
+rechaza derechos extras/peligrosos y deny batch, sin import/export de politica.
+La implementacion nativa futura debera usar LsaEnumerateAccountRights y
+LsaAddAccountRights solo para el SID congelado y SeBatchLogonRight, sin fallback.
+
+ACLs reutilizan expected_descriptor sin alterar H-1: Authority container sin
+DELETE/DELETE_CHILD/WRITE_DAC/WRITE_OWNER/ADD_SUBDIRECTORY; DELETE SQLite solo en
+archivos via OBJECT_INHERIT|INHERIT_ONLY, nunca CONTAINER_INHERIT. Captures DACL
+protegida sin delete/change-owner/dacl. Builder solo recibe grant explicito Inbox.
+
+Credencial runtime se representa por buffer mutable en proceso; no argv, entorno,
+serializacion ni diagnostico. Port futuro genera el secreto; fixtures usan bytes
+sinteticos, nunca una credencial Windows. Buffer limpiado al terminar registro o
+ante fallo. No se garantiza borrar copias inmutables creadas por un backend futuro;
+su ABI/BSTR y limpieza deben revisarse antes de admitirlo. No passwords en receipt.
+
+El receipt de modelo contiene UUID aleatorio, UTC, generation, commit/tree,
+hashes contract/bootstrap/Python/runtime tree, SIDs, task identity, UAC antes/despues
+y pasos completados. Se escribe una sola vez, con estado explicito pendiente de
+readback final; no afirma un paso aun no ejecutado. Resultado final separado evita
+reescribir la evidencia inicial. Receipt existente impide reinstalacion.
+Fallo parcial conserva efectos y reporta solo nombres cerrados de pasos completados
+y ultimo intento. Un write fallido puede haber tenido efecto; no retry ni rollback
+ni borrado de cuentas/tareas/directorios/receipt. Exige plan del Director.
+
+Limites de verificacion: modelos y tests sustituidos no prueban ACL efectiva,
+procedencia criptografica, COM real, resistencia a carreras o frontera de imports.
+Backend nativo operativo y su admision independiente siguen pendientes antes de
+cualquier Gate real. Sin cambios a Store/state machine/config/dependencias.

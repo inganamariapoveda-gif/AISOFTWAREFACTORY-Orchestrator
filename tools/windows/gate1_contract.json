@@ -1,0 +1,50 @@
+{
+  "schema_version": "trusted-runtime-gate1-v1",
+  "phase1a": {
+    "builder_account_name": "ASFBuilder",
+    "expected_standard_user": true,
+    "required_session_switch": true,
+    "own_profile_required": true,
+    "own_workspace_required": true
+  },
+  "phase1b": {
+    "trusted_runtime_account_name": "ASFTrustedRuntime",
+    "trusted_runtime_root": "C:\\Program Files\\AISOFTWAREFACTORY\\TrustedRuntime",
+    "authority_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Authority",
+    "captures_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Authority\\Captures",
+    "inbox_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Inbox",
+    "secrets_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Secrets"
+  },
+  "scheduler": {
+    "folder": "\\AISOFTWAREFACTORY",
+    "task_name": "TrustedRuntime",
+    "logon_type": "TASK_LOGON_PASSWORD",
+    "run_level": "LeastPrivilege",
+    "enabled_initially": false,
+    "allow_demand_start": false,
+    "execution_time_limit_seconds": 50,
+    "multiple_instances_policy": "IgnoreNew"
+  },
+  "python": {
+    "version": "3.14.10",
+    "architecture": "amd64",
+    "artifact_filename": "python-3.14.10-embed-amd64.zip",
+    "published_sha256": "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159",
+    "sigstore_required": true
+  },
+  "uac": {
+    "expected_before": {
+      "EnableLUA": 1,
+      "ConsentPromptBehaviorAdmin": 5,
+      "ConsentPromptBehaviorUser": 3,
+      "PromptOnSecureDesktop": 1
+    },
+    "target_standard_user_behavior": 0
+  },
+  "receipt": {
+    "generation": 1,
+    "reinstall_allowed": false
+  },
+  "network_allowed": false,
+  "antivirus_bypass_allowed": false
+}
