@@ -1698,3 +1698,101 @@ Contrato crash/replay para el siguiente slice:
 - REVOKED: conserva evidencia y nunca se reclama.
 Este slice no observa remotos ni ejecuta push, no consulta credenciales ni añade
 dependencias, permisos, proveedores, state machine o rutas de ejecución.
+
+## TRUSTED_RUNTIME_FOUNDATION-001A — Request capture DATA
+
+Foundation exclusivamente importable para composición futura y pruebas.
+IMPORTABLE_FOUNDATION != TRUSTED_RUNTIME.
+FOUNDATION_TESTS_PASS != WINDOWS_BOUNDARY_PROVEN.
+REQUEST_CAPTURED != REQUEST_TRUSTED.
+REQUEST_VALIDATED != DIRECTOR_APPROVED.
+LEDGER_ROW != PUBLICATION_AUTHORITY. DIGEST != AUTHENTICATION.
+No DirectorPort, issuance, claim, publisher, red, credenciales, bootstrap,
+Scheduled Tasks, ACL, DPAPI ni cambios de Windows. No wiring en app o adapters.
+La futura credencial publisher requiere identidad Windows separada antes de
+introducirse. Este slice no introduce ninguna identidad ni credencial.
+
+El request tiene exactamente schema_version, request_id, project_id,
+repository_identity, task_id, task_packet_sha256, builder_id, action, branch,
+candidate_head_sha, remote_name, effective_push_url, target_ref,
+permissions_sha256, policies_sha256 y gates_sha256. schema_version es int 1
+(no bool); action es git_publish_task_branch. Usa las reglas materiales de
+director_issuance, con remote_name limitado a 64 caracteres. No acepta paths,
+ejecutables, comandos, entornos, plugins, aprobaciones ni campos adicionales.
+TrustedRequest es DATA inmutable validada, nunca una identidad autenticada.
+
+MAX_REQUEST_BYTES=16384. El parser recibe únicamente bytes de la captura,
+decodifica UTF-8 estricto sin BOM y exige objeto JSON plano. Rechaza duplicados,
+NaN/Infinity, floats, tipos incorrectos y nesting antes de llamar json.loads.
+No aplica trim, normalización Unicode/case/URL ni coerción. Sus errores públicos
+son categorías fijas sin contenido. Puede conservar un request_id válido solo
+si proviene de JSON sintácticamente válido y sin duplicados.
+captured_sha256 es SHA-256 de bytes físicos exactos. request_digest es SHA-256
+del JSON canónico existente sobre {domain: trusted-publication-request-v1,
+captured_sha256: <hash RAW>, request: <objeto validado>}. El hash RAW incluido
+mantiene distintas las variantes de formato aunque tengan igual significado.
+material_operation_key comparte exactamente el dominio publication-operation-v1
+y los quince campos materiales del ledger. No construye ApprovalBindings con
+IDs o perfiles ficticios. operation_key(ApprovalBindings) conserva sus bytes.
+
+La captura Win32 usa ctypes y APIs de archivos de kernel32 desde System32.
+No ejecuta subprocess, shell o PowerShell y no tiene fallback a open/read_bytes.
+Contrato de entrada: raíz fija absoluta local y nombre ASCII simple acotado.
+Rechaza separadores, ADS, traversal, nombres de dispositivo y NUL. La apertura
+usa OPEN_EXISTING, GENERIC_READ, FILE_FLAG_OPEN_REPARSE_POINT y comparte solo
+lectura; handles no heredables. Exige archivo de disco, no directorio/reparse,
+link count=1 y tamaño <=16384 desde handle. Lee como máximo N+1, acumulando
+lecturas cortas; EOF prematuro falla. Antes/después compara identidad, tamaño,
+atributos, links y last-write. Una diferencia produce CAPTURE_SOURCE_CHANGED.
+
+El destino es <uuid4.hex>.bin, generado por el motor y creado con CREATE_NEW,
+sin overwrite/replace. Comprueba escritura completa, FlushFileBuffers y
+readback reabriendo por handle: identidad física, tamaño, SHA-256 y bytes
+exactos. El cierre del writer puede finalizar su last-write: el readback
+compara identidad/tamaño/atributos/links entre handles y estabilidad dentro
+del handle lector. Solo un copy completo puede registrarse en SQLite.
+DESTINATION_PATH_PROVIDED != WINDOWS_PROTECTED_DESTINATION.
+CaptureEvidence no contiene trusted/protected/authority flags. La admisión de
+principal, owner/DACL, ancestros, volumen y reparse state pertenece al futuro
+runtime instalado. Los fixtures NO son almacenamiento protegido de Windows.
+OPEN_REPARSE_POINT sobre el componente final no admite sus ancestros. Una raíz
+de entrada con ancestros reemplazables por Builder no satisface el futuro
+contrato del host. No se afirma snapshot atómico frente a vistas mapeadas,
+escritores privilegiados o ABA. Se procesa únicamente la copia capturada.
+
+Tabla aditiva trusted_request_capture: capture_id, schema_version,
+captured_sha256, captured_size, captured_at, phase, source_request_id,
+request_digest, operation_key, rejection_code. captured_at lo asigna Store.
+captured_sha256 es único; source_request_id NO es globalmente único.
+request_capture_parsed_id es UNIQUE(source_request_id) WHERE phase='PARSED'.
+operation_key no es único y solo existe en PARSED. Fases exactas:
+CAPTURED -> PARSED o CAPTURED -> REJECTED. Terminales y metadata física
+inmutables; DELETE e INSERT OR REPLACE sobre evidencia existente prohibidos.
+Definiciones exactas de tabla, índice parcial y triggers se readmiten al abrir
+y usar Store. Alteraciones bloquean, sin repair ni eliminación de datos.
+
+COPY + FLUSH + READBACK preceden a CAPTURED. Un fallo físico no inserta una fila
+CAPTURED/REJECTED. Un JSON inválido en una copia completa persiste REJECTED.
+Un ID mencionado por una solicitud inválida no impide otra válida. Mismo ID
+válido y bytes diferentes conserva la segunda captura REJECTED con
+REQUEST_ID_CONFLICT y el mismo source_request_id; nunca reemplaza la primera.
+Replay exacto readmite la copia existente, verifica bytes y devuelve su estado.
+Requests diferentes para una operación pueden llegar a PARSED: la captura no
+reserva autorización; la futura emisión conserva la deduplicación del ledger.
+CAPTURE_OPERATION_DUPLICATE != SECOND_AUTHORIZATION.
+BEGIN IMMEDIATE serializa replay, registro y parseo. Las copias adicionales
+de una carrera se conservan: no se adoptan ni eliminan automáticamente.
+
+Crash tras crear archivo y antes del registro: ORPHAN_FILE. No adopción,
+parseo, borrado ni confianza automáticos. Una fila CAPTURED puede continuar
+solo leyendo su copia íntegra. Copia faltante/divergente bloquea sin reconstruir
+desde el origen mutable. No hay garantía de atomicidad filesystem + SQLite
+ni garantía absoluta contra pérdida eléctrica. No se añade cleanup/retención.
+
+RuntimeObservation/RuntimeLayout son contratos puros de consistencia:
+interpreter/code root/cwd absolutos y esperados, sys.path en raíces explícitas,
+sin checkout/venv de proyecto ni paths relativos/editables, user-site disabled,
+isolation/ignore-environment observados y PYTHONPATH ausente. Comparan componentes
+de paths Windows, no solo prefijos textuales. Devuelven CONSISTENT/REJECTED,
+nunca TRUSTED/SECURE/AUTHORITY. No inspeccionan ACL ni prueban la veracidad de
+observaciones suministradas por callers. Host probes futuros son obligatorios.
