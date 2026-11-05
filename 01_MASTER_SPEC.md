@@ -1796,3 +1796,123 @@ isolation/ignore-environment observados y PYTHONPATH ausente. Comparan component
 de paths Windows, no solo prefijos textuales. Devuelven CONSISTENT/REJECTED,
 nunca TRUSTED/SECURE/AUTHORITY. No inspeccionan ACL ni prueban la veracidad de
 observaciones suministradas por callers. Host probes futuros son obligatorios.
+
+## TRUSTED_RUNTIME_WINDOWS_BOOTSTRAP-001B — Code-only preflight
+
+CODE_EXISTS != WINDOWS_MUTATION_AUTHORIZED.
+DRY_RUN_PASS != WINDOWS_BOUNDARY_PROVEN. PREFLIGHT_PASS != HUMAN_GATE_1.
+Este incremento contiene modelos cerrados, generador offline, observacion COM
+read-only, planes de probes y entrypoint exclusivamente preflight/dry-run.
+No se instala ni procesa Inbox real. No funciones productivas para crear cuentas,
+mutar grupos/LSA/UAC/ACL, registrar/ejecutar tareas, provisionar DPAPI o credenciales.
+El entrypoint no recibe io, implementaciones, roots ni argv operacional y nunca
+abre Store ni requests en este slice. Un fallo produce categoria fija sanitizada.
+
+R-1: el futuro primer launcher privilegiado es el cmd.exe absoluto de System32
+con /d, iniciado por Human/Admin. Antes de PowerShell/CLR debe admitir el perfil,
+neutralizar COR_*, COMPLUS_*, DOTNET_*, APPDOMAIN_MANAGER_*, fijar PATH/PSModulePath
+y comprobar HKCU Environment/Run/RunOnce/COM, Startup, perfiles PowerShell,
+Windows Terminal, tareas de usuario y configuracion CLR. UNKNOWN bloquea.
+No reparacion automatica. BLOCKED_PRIVILEGED_LAUNCH_ENVIRONMENT ante riesgo.
+Solo Windows PowerShell System32 -NoProfile -NonInteractive tras esa admision.
+El staging minimo revisado copia como datos, flush, reabre, compara SHA externo
+de la copia protegida y solo entonces ejecuta su ruta absoluta. Ningun helper del
+repo/perfil se carga elevado. La misma cadena aplica al script de probes.
+
+Gate 1 conserva dos fases: 1A solo transicion a ASFBuilder mediante APIs nativas
+futuras y establecimiento humano de credencial OS-native; workspace bajo su perfil.
+STOP y cambio real de sesion. Evidencia de SID/token/procesos acredita migracion.
+1B solo desde Human/Admin separado, sin agentes en esa sesion. No se ejecuta
+bootstrap principal mientras anapo siga siendo Builder. ConsentPromptBehaviorUser=0
+es cambio global futuro explicitamente aprobado en Gate 1; agentes nunca elevan.
+Gate 2 autoriza validacion temporal sintetica; Gate 3 plano operacional fresco y
+activacion tras revision. Ningun gate concede autoridad publisher.
+
+R-2/R-3: Git blob bytes del commit/tree autoritativos son normativos; nunca bytes
+CRLF del checkout como sustituto. Generador no ejecuta aplicacion ni Git ni red.
+Inputs de material son datos, no prueba criptografica de pertenencia al tree.
+Verifier extrae independientemente objetos, comprueba pertenencia y reproduce el
+manifiesto canonico byte a byte. El manifiesto no se autentica a si mismo.
+PYTHON_ARTIFACT_REQUIRES_INDEPENDENT_VERIFICATION = TRUE.
+Python 3.14.10 amd64 embeddable oficial: release URL, nombre, size, SHA publicado y
+calculado iguales, Sigstore verificado/identity/issuer y verificacion independiente.
+No download/pip/runtime resolution. Template versionado installable=false se
+rechaza NOT_INSTALLABLE_TEMPLATE. No hashes reales inventados. Hash aprobado
+externamente antes de elevacion, tras staging y antes de mutacion futura.
+El generador rechaza paths absolutos/ADS/traversal/reservados/trailing dot-space,
+duplicados case-insensitive, hardlinks/reparse/streams/short-name ambiguo y trees
+extra/incompletos. Output canonico sin timestamp ni path local Builder.
+
+Cierre previsto: entrypoint, windows, foundation, trusted_request, director_issuance,
+store, state_machine y __init__. Store importa config_loader solo en rutas no
+alcanzadas por capture; PyYAML no se incluye. Runtime privado -I -B, ._pth protegido
+sin site, sin user Python, repo, venv, editable, plugin/MCP o modulos no admitidos.
+Observaciones de host se comparan con recibo/manifiesto protegidos: SID exacto,
+no admin/elevado, privilegios acotados, NTFS/volumen, ancestros sin reparse,
+owner/DACL protegidos, tree/hash/size, cwd/imports/entorno y tarea real.
+Modelos puros no autentican observaciones del caller. Esta release no afirma
+admitir una instalacion real: aun observando Scheduler termina bloqueada.
+
+R-6: Scheduler solo COM Windows local via ctypes/IDispatch, sin subprocess,
+PowerShell, schtasks, TaskCache ni scraping de registro como autoridad. Metodos
+permitidos Connect/GetFolder/GetTask, Xml/Enabled/GetSecurityDescriptor. Sin Run,
+Register ni Delete. HRESULT y errores de ABI/XML fallan cerrado sin diagnostico
+proveedor. Task y folder SD se comparan; XML bruto es evidencia, comparacion
+semantica separada. Host probes de COM/ACL reales siguen pendientes de Gate 2.
+
+ACLs SID-based: roots Administrators owner, DACL protegida, Admin/SYSTEM control;
+runtime sin WRITE_DAC/WRITE_OWNER. OWNER RIGHTS explicito READ_CONTROL elimina
+WRITE_DAC implicito del creador. Authority permite SQLite journal/wal/shm y delete/
+rename de auxiliares. Captures permite read/write/append/create/enumerate pero no
+DELETE/DELETE_CHILD/WRITE_DAC/WRITE_OWNER; no generic Modify. Sin grants Builder,
+Users, Authenticated Users, Everyone o CREATOR OWNER fuera de Inbox. Padres deben
+impedir sustitucion. Secrets validacion minimo acceso sintetico. DPAPI futuro
+CurrentUser UI_FORBIDDEN, nunca LOCAL_MACHINE.
+DPAPI_CURRENT_USER != PROTECTION_FROM_RUNTIME_ACCOUNT_COMPROMISE.
+
+R-4: Inbox no confiable toda su vida. Nombre activo [A-Za-z0-9][A-Za-z0-9_-]{0,63}
+seguido de .request; writer normal se cierra antes de procesamiento. Captura fisica
+CREATE_NEW/flush/readback precede CAPTURED; terminal PARSED/REJECTED precede
+retirement futuro por rename del MISMO handle revalidado a .processed.<capture-id>.
+No delete, repair ni reconstruccion desde Inbox. Fallo de rename conserva evidencia
+y es fallo lifecycle, nunca revoca evidencia ni concede autoridad. Este slice solo
+modela plan de retirement; no renombra fuentes ni modifica foundation.
+La futura implementacion de rename necesitara una admision explicita de derechos
+del source handle; no se supone que el handle GENERIC_READ existente concede DELETE.
+Los derechos actuales modelados de Inbox no autorizan todavia esa operacion nativa.
+Riesgo residual LOW: Builder puede provocar availability DoS por volumen/poison.
+Un rechazo normal continua al siguiente; host/evidence integrity failure aborta.
+Limites: 16384 bytes, 64 entradas activas examinadas, 8 procesadas, 40 s soft,
+50 s Scheduler. Retirados no cuentan como activos. No retries internos.
+
+Tarea futura Password/LeastPrivilege/IgnoreNew, demanda false, restart disabled,
+registro disabled; accion Python absoluto -I -B entrypoint absoluto/cwd protegido.
+Polling PT1M, sin daemon, StartWhenAvailable/Wake/network false. Validacion diez
+minutos por trigger, nunca Builder Run. Runtime relee tarea real cada ejecucion.
+R-5/N10: politica de demanda deshabilitada en tarea real NO prueba DACL. Canary
+habilitada con demanda true y mismo modelo SD debe devolver E_ACCESSDENIED al
+Builder. Cada probe registra SID/elevacion/integridad/grupos/deny-only/privilegios/
+sesion primero, target existente y control positivo. No netonly ni missing-object
+como PASS. Plan incluye protected create-dir/file/hardlink/ancestor-delete/profile,
+task registration, LSA efectiva, rollback activation, DLL decoy, hostile corpus,
+mid-capture termination y bounded exit. Probe script solo imprime plan sanitizado.
+
+Receipt schema cerrado: installation_id aleatorio128, generation=1, previous=null,
+manifest/source commit/tree/bootstrap hashes, SIDs, machine GUID/SID/build, volumen,
+perfil/roots/task/digest/timestamp/result. Reinstall completado bloquea. Reanudacion
+futura solo intent/result journal protegido y objetos exactamente coincidentes;
+sin takeover/adopcion/repair ni rollback destructivo. Credencial perdida bloquea,
+no regeneracion automatica. Sin passwords en argv/env/source/log/receipt/temp.
+Logon efectivo incluye grupos: batch allow requerido, deny batch prohibido,
+deny interactive/remote/network runtime; conflictos no se reparan globalmente.
+
+Validation y Operational usan subtrees distintos ligados a installation_id dentro
+de Authority/Captures/Secrets. No promover fixtures. Gate 3 crea DB/trees frescos.
+Activation Admin/SYSTEM-write Runtime-read: id/generation/mode/window/task digest/
+fixture digest. Rollback se rechaza frente al digest vigente protegido externamente
+al record, no por autodeclaracion del record. Sin anchor independiente disponible,
+no se admite activacion. Receipt y activation son evidencia, no autoridad.
+
+Limite de este incremento: nueve archivos, sin config ni cambios a Store/parser/
+foundation/director_issuance/state_machine. Ninguna prueba crea cuentas, cambia UAC,
+rights/ACL reales, instala Python, provisiona DPAPI o registra/ejecuta tareas.
