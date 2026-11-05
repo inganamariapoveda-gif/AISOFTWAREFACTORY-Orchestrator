@@ -552,3 +552,117 @@ def compare_task(observed, expected):
     require(type(observed) is dict and type(expected) is dict)
     require({k: v for k, v in observed.items() if k != 'xml_sha256'} ==
             {k: v for k, v in expected.items() if k != 'xml_sha256'}, 'SCHEDULER_MISMATCH')
+
+
+# 001D closed DATA contracts. No host observation or mutation is performed here.
+GATE1_PYTHON_SHA256 = '90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159'
+
+
+def gate1_contract_template():
+    return {
+        'schema_version': 'trusted-runtime-gate1-v1',
+        'phase1a': dict(builder_account_name='ASFBuilder', expected_standard_user=True,
+                       required_session_switch=True, own_profile_required=True,
+                       own_workspace_required=True),
+        'phase1b': dict(trusted_runtime_account_name='ASFTrustedRuntime',
+                       trusted_runtime_root=ROOTS['runtime_root'],
+                       **{k: v for k, v in ROOTS.items() if k != 'runtime_root'}),
+        'scheduler': dict(folder=r'\AISOFTWAREFACTORY', task_name='TrustedRuntime',
+                          logon_type='TASK_LOGON_PASSWORD', run_level='LeastPrivilege',
+                          enabled_initially=False, allow_demand_start=False,
+                          execution_time_limit_seconds=50, multiple_instances_policy='IgnoreNew'),
+        'python': dict(version='3.14.10', architecture='amd64',
+                       artifact_filename='python-3.14.10-embed-amd64.zip',
+                       published_sha256=GATE1_PYTHON_SHA256, sigstore_required=True),
+        'uac': dict(expected_before=dict(EnableLUA=1, ConsentPromptBehaviorAdmin=5,
+                                        ConsentPromptBehaviorUser=3, PromptOnSecureDesktop=1),
+                    target_standard_user_behavior=0),
+        'receipt': dict(generation=1, reinstall_allowed=False),
+        'network_allowed': False, 'antivirus_bypass_allowed': False,
+    }
+
+
+def exact_data(actual, expected, code='INVALID_CONTRACT'):
+    """Type-sensitive recursive equality, including bool versus int."""
+    require(type(actual) is type(expected), code)
+    if type(expected) is dict:
+        require(set(actual) == set(expected), code)
+        for key in expected:
+            exact_data(actual[key], expected[key], code)
+    elif type(expected) in (list, tuple):
+        require(len(actual) == len(expected), code)
+        for a, e in zip(actual, expected):
+            exact_data(a, e, code)
+    else:
+        require(actual == expected, code)
+
+
+def validate_gate1_contract(value):
+    exact_data(value, gate1_contract_template())
+    return value
+
+
+def gate1_local_path(value):
+    require(type(value) is str and 0 < len(value) <= 1024, 'INVALID_PATH')
+    p = PureWindowsPath(value)
+    require(p.is_absolute() and p.drive.upper() == 'C:' and '/' not in value
+            and str(p) == value and all(part not in ('.', '..') for part in p.parts),
+            'INVALID_PATH')
+    for part in p.parts[1:]:
+        require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_. -]*', part) is not None
+                and not part.endswith(('.', ' ')) and part not in ('.', '..')
+                and re.fullmatch(r'(?i)(con|prn|aux|nul|com[0-9]|lpt[0-9])',
+                                 part.split('.')[0]) is None, 'INVALID_PATH')
+    return p
+
+
+@dataclass(frozen=True)
+class BuilderCheckpoint:
+    exists: bool
+    account_name: str
+    account_sid: str
+    enabled: bool
+    administrator: bool
+    profile: str
+    profile_exists: bool
+    interactive_sid: str
+    interactive_session: bool
+    session_switched: bool
+    workspace: str
+    workspace_owner_sid: str
+    builder_writable: bool
+    runtime_writable: bool
+    other_nonadmin_writers: frozenset
+    ancestors_reparse: bool
+    codex_available: bool
+    git_available: bool
+
+
+def validate_builder_checkpoint(o):
+    require(type(o) is BuilderCheckpoint, 'BUILDER_CHECKPOINT_REJECTED')
+    require(o.exists is True and o.account_name == 'ASFBuilder' and o.enabled is True
+            and o.administrator is False, 'BUILDER_IDENTITY_REJECTED')
+    sid(o.account_sid)
+    require(o.interactive_sid == o.account_sid and o.interactive_session is True
+            and o.session_switched is True, 'SESSION_SWITCH_REQUIRED')
+    profile = gate1_local_path(o.profile)
+    workspace = gate1_local_path(o.workspace)
+    require(o.profile == r'C:\Users\ASFBuilder' and o.profile_exists is True
+            and profile in workspace.parents and o.ancestors_reparse is False,
+            'BUILDER_WORKSPACE_REJECTED')
+    require(o.workspace_owner_sid == o.account_sid and o.builder_writable is True
+            and o.runtime_writable is False and type(o.other_nonadmin_writers) is frozenset
+            and not o.other_nonadmin_writers, 'SHARED_WORKSPACE_REJECTED')
+    require(o.codex_available is True and o.git_available is True, 'BUILDER_TOOLING_NOT_AVAILABLE')
+    return 'PHASE1A_CHECKPOINT_CONSISTENT_NOT_AUTHORIZED'
+
+
+def validate_gate1_batch_rights(direct, effective, *, after=False):
+    """Native LSA readback model: unknown, extra and deny rights fail closed."""
+    require(type(direct) is frozenset and type(effective) is frozenset, 'LSA_RIGHTS_REJECTED')
+    expected = frozenset({'SeBatchLogonRight'}) if after else frozenset()
+    require(direct == expected and direct <= effective
+            and effective <= {'SeBatchLogonRight', 'SeChangeNotifyPrivilege',
+                              'SeIncreaseWorkingSetPrivilege'}, 'LSA_RIGHTS_REJECTED')
+    if after:
+        require('SeBatchLogonRight' in effective, 'LSA_RIGHTS_REJECTED')
