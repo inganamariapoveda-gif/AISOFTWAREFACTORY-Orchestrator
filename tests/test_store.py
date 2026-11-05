@@ -2583,6 +2583,254 @@ class PublicationApprovalLedgerTests(unittest.TestCase):
         self.assertEqual(self.store._conn.execute("SELECT * FROM status_event").fetchall(), events)
 
 
+class RequestCaptureStoreTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_trusted_runtime_foundation import MemoryFileIO, SOURCE, DESTINATION
+        from tests.test_trusted_request import request_bytes
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'capture.db'
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+        self.io = MemoryFileIO()
+        self.source, self.destination = SOURCE, DESTINATION
+        self.raw = request_bytes()
+        self.io.put(self.source, 'request.json', self.raw)
+
+    def capture(self, store=None):
+        from orchestrator.trusted_runtime_foundation import capture_request
+        return capture_request(store or self.store, self.source, 'request.json', self.destination, io=self.io)
+
+    def copied(self, raw=None):
+        from orchestrator.trusted_runtime_foundation import capture_file
+        self.io.put(self.source, 'request.json', self.raw if raw is None else raw)
+        return capture_file(self.source, 'request.json', self.destination, io=self.io)
+
+    def record(self, evidence, store=None):
+        return (store or self.store).record_request_capture(evidence, self.destination, io=self.io)
+
+    def parse(self, identity, store=None):
+        return (store or self.store).parse_request_capture(identity, self.destination, io=self.io)
+
+    def test_copy_then_captured_then_parsed_and_reopen_replay(self):
+        evidence = self.copied()
+        row = self.record(evidence)
+        self.assertEqual(row['phase'], 'CAPTURED')
+        self.assertIsNone(row['operation_key'])
+        parsed = self.parse(row['capture_id'])
+        self.assertEqual(parsed['phase'], 'PARSED')
+        before_files = set(self.io.files)
+        with Store(self.path) as other:
+            self.assertEqual(self.capture(other), parsed)
+        self.assertEqual(set(self.io.files), before_files)
+
+    def test_same_id_different_bytes_is_preserved_rejected_evidence(self):
+        first = self.capture()
+        self.io.put(self.source, 'request.json', self.raw + b' ')
+        second = self.capture()
+        self.assertEqual(second['phase'], 'REJECTED')
+        self.assertEqual(second['rejection_code'], 'REQUEST_ID_CONFLICT')
+        self.assertEqual(second['source_request_id'], first['source_request_id'])
+        self.assertIsNone(second['operation_key'])
+        self.assertNotEqual(first['captured_sha256'], second['captured_sha256'])
+        self.assertEqual(self.store.get_request_capture(first['capture_id']), first)
+        self.assertEqual(self.capture(), second)
+        self.assertEqual(self.io.files[(self.destination, second['capture_id']+'.bin')][0], self.raw+b' ')
+
+    def test_different_id_same_operation_does_not_issue_authority(self):
+        from tests.test_trusted_request import request_bytes
+        first = self.capture()
+        self.io.put(self.source, 'request.json', request_bytes(request_id='request-2'))
+        second = self.capture()
+        self.assertEqual(second['phase'], 'PARSED')
+        self.assertEqual(first['operation_key'], second['operation_key'])
+        self.assertEqual(self.store._conn.execute('SELECT count(*) FROM controlled_publication_approval').fetchone(), (0,))
+
+    def test_invalid_request_does_not_reserve_its_mentioned_id(self):
+        from tests.test_trusted_request import request_bytes
+        self.io.put(self.source, 'request.json', request_bytes(action='invalid'))
+        rejected = self.capture()
+        self.assertEqual(rejected['phase'], 'REJECTED')
+        self.assertEqual(rejected['source_request_id'], 'request-1')
+        self.io.put(self.source, 'request.json', self.raw)
+        valid = self.capture()
+        self.assertEqual(valid['phase'], 'PARSED')
+        self.assertEqual(self.parse(rejected['capture_id']), rejected)
+
+    def test_malformed_and_duplicate_json_reject_without_request_id(self):
+        for raw in (b'{', b'\xff', b'\xef\xbb\xbf{}', self.raw[:-1]+b',"request_id":"other"}'):
+            self.io.put(self.source, 'request.json', raw)
+            row = self.capture()
+            self.assertEqual(row['phase'], 'REJECTED')
+            self.assertIsNone(row['source_request_id'])
+
+    def test_copy_failures_never_insert_capture_or_rejection(self):
+        from orchestrator.trusted_runtime_foundation import CaptureError
+        for flag in ('short_write', 'flush_failure', 'corrupt_copy', 'exists_failure'):
+            setattr(self.io, flag, True)
+            with self.subTest(flag=flag), self.assertRaises(CaptureError):
+                self.capture()
+            setattr(self.io, flag, False)
+            self.assertEqual(self.store._conn.execute('SELECT count(*) FROM trusted_request_capture').fetchone(), (0,))
+
+    def test_missing_copy_blocks_captured_and_parsed_without_source_reconstruction(self):
+        from orchestrator.trusted_runtime_foundation import CaptureError
+        evidence = self.copied()
+        row = self.record(evidence)
+        key = (self.destination, evidence.filename)
+        removed = self.io.files.pop(key)
+        with self.assertRaises(CaptureError):
+            self.parse(row['capture_id'])
+        self.assertEqual(self.store.get_request_capture(row['capture_id'])['phase'], 'CAPTURED')
+        self.io.files[key] = removed
+        terminal = self.parse(row['capture_id'])
+        del self.io.files[key]
+        with self.assertRaises(CaptureError):
+            self.capture()
+        self.assertNotIn(key, self.io.files)
+        self.assertEqual(self.store.get_request_capture(row['capture_id']), terminal)
+
+    def test_divergent_existing_copy_blocks_exact_replay(self):
+        from orchestrator.trusted_runtime_foundation import CaptureError
+        row = self.capture()
+        self.io.files[(self.destination, row['capture_id']+'.bin')][0] = b'X'+self.raw[1:]
+        with self.assertRaises(CaptureError):
+            self.capture()
+        self.assertEqual(self.store.get_request_capture(row['capture_id']), row)
+
+    def test_orphan_file_is_never_adopted_parsed_or_deleted(self):
+        evidence = self.copied()
+        orphan = (self.destination, evidence.filename)
+        with self.assertRaises(StoreError):
+            self.parse(evidence.capture_id)
+        row = self.capture()
+        self.assertNotEqual(row['capture_id'], evidence.capture_id)
+        self.assertIn(orphan, self.io.files)
+        self.assertIsNone(self.store.get_request_capture(evidence.capture_id))
+
+    def test_physically_divergent_receipt_never_recorded(self):
+        from orchestrator.trusted_runtime_foundation import CaptureError
+        evidence = self.copied()
+        self.io.files[(self.destination, evidence.filename)][0] = b'wrong'
+        with self.assertRaises(CaptureError):
+            self.record(evidence)
+        self.assertEqual(self.store._conn.execute('SELECT count(*) FROM trusted_request_capture').fetchone(), (0,))
+
+    def test_physical_metadata_and_terminals_and_delete_are_immutable(self):
+        row = self.record(self.copied())
+        for field in ('capture_id', 'schema_version', 'captured_sha256', 'captured_size', 'captured_at'):
+            with self.subTest(field=field), self.assertRaises(sqlite3.IntegrityError):
+                self.store._conn.execute('UPDATE trusted_request_capture SET '+field+" = ?, phase = 'REJECTED', rejection_code = 'INVALID_JSON'",
+                                         (2 if field in ('schema_version', 'captured_size') else 'changed',))
+            self.store._conn.rollback()
+        terminal = self.parse(row['capture_id'])
+        for statement in ("UPDATE trusted_request_capture SET phase='CAPTURED',source_request_id=NULL,request_digest=NULL,operation_key=NULL",
+                          "UPDATE trusted_request_capture SET source_request_id='changed'",
+                          'DELETE FROM trusted_request_capture'):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store._conn.execute(statement)
+            self.store._conn.rollback()
+        self.assertEqual(self.store.get_request_capture(row['capture_id']), terminal)
+
+    def test_rejected_terminal_and_replace_cannot_reset_evidence(self):
+        self.io.put(self.source, 'request.json', b'{')
+        row = self.capture()
+        for statement in ("UPDATE trusted_request_capture SET phase='CAPTURED',rejection_code=NULL",
+                          "INSERT OR REPLACE INTO trusted_request_capture SELECT * FROM trusted_request_capture"):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store._conn.execute(statement)
+            self.store._conn.rollback()
+        self.assertEqual(self.store.get_request_capture(row['capture_id']), row)
+
+    def race(self, actions):
+        barrier = threading.Barrier(2, timeout=10)
+        results = [None, None]
+        def worker(index):
+            try:
+                with Store(self.path) as connection:
+                    barrier.wait()
+                    results[index] = actions[index](connection)
+            except Exception as error:
+                results[index] = error
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        for result in results:
+            self.assertIsInstance(result, dict)
+        return results
+
+    def test_concurrent_exact_copies_converge_without_second_parsed_request(self):
+        copies = [self.copied(), self.copied()]
+        actions = [lambda connection, evidence=evidence: self.parse(self.record(evidence, connection)['capture_id'], connection)
+                   for evidence in copies]
+        results = self.race(actions)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0]['phase'], 'PARSED')
+        self.assertEqual(self.store._conn.execute('SELECT count(*) FROM trusted_request_capture').fetchone(), (1,))
+        for evidence in copies:
+            self.assertIn((self.destination, evidence.filename), self.io.files)
+
+    def test_concurrent_id_conflict_preserves_one_parsed_and_one_rejected(self):
+        rows = [self.record(self.copied(self.raw)), self.record(self.copied(self.raw+b' '))]
+        results = self.race([lambda connection, row=row: self.parse(row['capture_id'], connection) for row in rows])
+        self.assertCountEqual([row['phase'] for row in results], ['PARSED', 'REJECTED'])
+        rejected = next(row for row in results if row['phase']=='REJECTED')
+        self.assertEqual(rejected['rejection_code'], 'REQUEST_ID_CONFLICT')
+        self.assertEqual(rejected['source_request_id'], 'request-1')
+        self.assertEqual(self.store._conn.execute('SELECT count(*) FROM trusted_request_capture').fetchone(), (2,))
+
+    def test_schema_index_and_trigger_tamper_blocks_live_use_and_reopen(self):
+        mutations = ("DROP INDEX request_capture_parsed_id",
+                     "DROP INDEX request_capture_parsed_id; CREATE UNIQUE INDEX request_capture_parsed_id ON trusted_request_capture(source_request_id)",
+                     "DROP TRIGGER request_capture_update",
+                     "DROP TRIGGER request_capture_update; CREATE TRIGGER request_capture_update BEFORE UPDATE ON trusted_request_capture BEGIN SELECT 1; END",
+                     "CREATE INDEX extra_capture_index ON trusted_request_capture(phase)")
+        for index, mutation in enumerate(mutations):
+            path = Path(self.tmp.name) / ('tamper'+str(index)+'.db')
+            with Store(path) as other:
+                other._conn.executescript(mutation)
+                with self.assertRaises(StoreError):
+                    other.get_request_capture_by_sha('a'*64)
+                evidence = self.copied()
+                with self.assertRaises(StoreError):
+                    self.record(evidence, other)
+                with self.assertRaises(StoreError):
+                    self.parse(evidence.capture_id, other)
+            before = path.read_bytes()
+            with self.assertRaises(StoreError):
+                Store(path)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_incompatible_capture_table_is_not_repaired(self):
+        path = Path(self.tmp.name) / 'old-incompatible.db'
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute('CREATE TABLE trusted_request_capture (evidence TEXT)')
+            connection.execute("INSERT INTO trusted_request_capture VALUES ('preserve')")
+            connection.commit()
+        before = path.read_bytes()
+        with self.assertRaises(StoreError):
+            Store(path)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_old_database_preserved_with_additive_capture_schema(self):
+        self.store.register_project('SAMPLE', 'Sample', '.', 'rules')
+        self.store.create_task('T-1', 'SAMPLE', 'Title', 'Need')
+        self.store._conn.execute('DROP TABLE trusted_request_capture')
+        self.store._conn.commit()
+        tables = [row[0] for row in self.store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        before = {name: self.store._conn.execute('SELECT * FROM "'+name+'"').fetchall() for name in tables}
+        schema = dict(self.store._conn.execute('SELECT name,sql FROM sqlite_master'))
+        with Store(self.path) as other:
+            self.assertEqual(before, {name: other._conn.execute('SELECT * FROM "'+name+'"').fetchall() for name in tables})
+            after = dict(other._conn.execute('SELECT name,sql FROM sqlite_master'))
+            for name, definition in schema.items():
+                self.assertEqual(after[name], definition)
+            self.assertEqual(self.capture(other)['phase'], 'PARSED')
+
+
 class ParameterizedSqlTests(unittest.TestCase):
     def test_store_never_builds_sql_with_string_interpolation(self) -> None:
         source = (SRC_DIR / "orchestrator" / "store.py").read_text(encoding="utf-8")

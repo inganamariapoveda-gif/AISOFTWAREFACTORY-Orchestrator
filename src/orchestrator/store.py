@@ -97,6 +97,50 @@ BEGIN SELECT RAISE(ABORT, 'publication evidence cannot be deleted'); END
 }
 
 
+REQUEST_CAPTURE_SCHEMA = """
+CREATE TABLE trusted_request_capture (
+    capture_id TEXT PRIMARY KEY NOT NULL CHECK (length(capture_id) = 32 AND capture_id NOT GLOB '*[^0-9a-f]*'),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    captured_sha256 TEXT NOT NULL UNIQUE CHECK (length(captured_sha256) = 64 AND captured_sha256 NOT GLOB '*[^0-9a-f]*'),
+    captured_size INTEGER NOT NULL CHECK (typeof(captured_size) = 'integer' AND captured_size BETWEEN 0 AND 16384),
+    captured_at TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('CAPTURED', 'PARSED', 'REJECTED')),
+    source_request_id TEXT,
+    request_digest TEXT CHECK (request_digest IS NULL OR (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*')),
+    operation_key TEXT CHECK (operation_key IS NULL OR (length(operation_key) = 64 AND operation_key NOT GLOB '*[^0-9a-f]*')),
+    rejection_code TEXT CHECK (rejection_code IS NULL OR rejection_code IN ('INVALID_SIZE', 'INVALID_ENCODING', 'INVALID_JSON', 'INVALID_SCHEMA', 'REQUEST_ID_CONFLICT')),
+    CHECK (
+        (phase = 'CAPTURED' AND source_request_id IS NULL AND request_digest IS NULL AND operation_key IS NULL AND rejection_code IS NULL)
+        OR (phase = 'PARSED' AND source_request_id IS NOT NULL AND request_digest IS NOT NULL AND operation_key IS NOT NULL AND rejection_code IS NULL)
+        OR (phase = 'REJECTED' AND request_digest IS NULL AND operation_key IS NULL AND rejection_code IS NOT NULL)
+    )
+)
+"""
+REQUEST_CAPTURE_INDEX = """
+CREATE UNIQUE INDEX request_capture_parsed_id ON trusted_request_capture(source_request_id) WHERE phase = 'PARSED'
+"""
+REQUEST_CAPTURE_TRIGGERS = {
+    "request_capture_insert": """
+CREATE TRIGGER request_capture_insert BEFORE INSERT ON trusted_request_capture
+WHEN NEW.phase != 'CAPTURED' OR EXISTS (
+    SELECT 1 FROM trusted_request_capture WHERE capture_id = NEW.capture_id OR captured_sha256 = NEW.captured_sha256)
+BEGIN SELECT RAISE(ABORT, 'capture insertion blocked'); END
+""",
+    "request_capture_update": """
+CREATE TRIGGER request_capture_update BEFORE UPDATE ON trusted_request_capture
+WHEN OLD.phase != 'CAPTURED' OR NEW.phase NOT IN ('PARSED', 'REJECTED')
+    OR NEW.capture_id IS NOT OLD.capture_id OR NEW.schema_version IS NOT OLD.schema_version
+    OR NEW.captured_sha256 IS NOT OLD.captured_sha256 OR NEW.captured_size IS NOT OLD.captured_size
+    OR NEW.captured_at IS NOT OLD.captured_at
+BEGIN SELECT RAISE(ABORT, 'capture evidence immutable'); END
+""",
+    "request_capture_delete": """
+CREATE TRIGGER request_capture_delete BEFORE DELETE ON trusted_request_capture
+BEGIN SELECT RAISE(ABORT, 'capture deletion blocked'); END
+""",
+}
+
+
 INSTALLATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidate_authority_installation (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -464,6 +508,118 @@ def _validate_reason_actor(reason: Any, actor: Any) -> tuple[str, str]:
 
 class Store:
     """SQLite persistence and transactional operational resource accounting."""
+
+    def _check_request_capture_schema(self, *, allow_absent=False):
+        name = "trusted_request_capture"
+        definitions = {name: ("table", REQUEST_CAPTURE_SCHEMA),
+                       "request_capture_parsed_id": ("index", REQUEST_CAPTURE_INDEX),
+                       **{key: ("trigger", value) for key, value in REQUEST_CAPTURE_TRIGGERS.items()}}
+        with closing(self._conn.cursor()) as cursor:
+            objects = cursor.execute("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name = ? COLLATE NOCASE",
+                                     (name,)).fetchall()
+            named = {key: cursor.execute("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE",
+                                         (key,)).fetchone() for key in definitions}
+        if not objects and not any(named.values()) and allow_absent:
+            return False
+        if {row[1] for row in objects if row[3] is not None} != set(definitions):
+            raise StoreError("incompatible request capture schema")
+        for key, (kind, sql) in definitions.items():
+            if named[key] != (kind, key, name, sql.strip().rstrip(";")):
+                raise StoreError("incompatible request capture definition")
+        return True
+
+    def _initialize_request_capture_schema(self):
+        with self._write_transaction():
+            if not self._check_request_capture_schema(allow_absent=True):
+                self._conn.execute(REQUEST_CAPTURE_SCHEMA)
+                self._conn.execute(REQUEST_CAPTURE_INDEX.strip())
+                for definition in REQUEST_CAPTURE_TRIGGERS.values():
+                    self._conn.execute(definition)
+            self._check_request_capture_schema()
+
+    @contextmanager
+    def _request_capture_transaction(self):
+        try:
+            with self._write_transaction():
+                self._check_request_capture_schema()
+                yield
+        except sqlite3.Error:
+            raise StoreError("request capture persistence blocked") from None
+
+    def _request_capture_row(self, column, value):
+        # column is selected solely by module-owned call sites.
+        with closing(self._conn.cursor()) as cursor:
+            row = cursor.execute("SELECT * FROM trusted_request_capture WHERE " + column + " = ?", (value,)).fetchone()
+            return dict(zip((item[0] for item in cursor.description), row)) if row else None
+
+    def get_request_capture_by_sha(self, captured_sha256):
+        """Untrusted metadata; replay must readmit the stored copy, not this row."""
+        _require_hex(captured_sha256, "capture digest", _SHA256_HEX_RE)
+        self._check_request_capture_schema()
+        return self._request_capture_row("captured_sha256", captured_sha256)
+
+    def get_request_capture(self, capture_id):
+        if type(capture_id) is not str or re.fullmatch(r"[0-9a-f]{32}", capture_id) is None:
+            raise StoreError("invalid capture identity")
+        self._check_request_capture_schema()
+        return self._request_capture_row("capture_id", capture_id)
+
+    def record_request_capture(self, evidence, destination_root, *, io=None):
+        """Verify completed copy before metadata. LEDGER_ROW != PUBLICATION_AUTHORITY."""
+        from .trusted_runtime_foundation import CaptureEvidence, read_capture_copy
+        if type(evidence) is not CaptureEvidence:
+            raise StoreError("capture evidence required")
+        values = dict(capture_id=evidence.capture_id, captured_sha256=evidence.captured_sha256,
+                      captured_size=evidence.captured_size)
+        raw = read_capture_copy(values, destination_root, io=io)
+        with self._request_capture_transaction():
+            row = self._request_capture_row("captured_sha256", evidence.captured_sha256)
+            if row is not None:
+                if read_capture_copy(row, destination_root, io=io) != raw:
+                    raise StoreError("capture replay bytes conflict")
+                return row
+            self._conn.execute("INSERT INTO trusted_request_capture "
+                               "(capture_id, schema_version, captured_sha256, captured_size, captured_at, phase) "
+                               "VALUES (?, 1, ?, ?, ?, 'CAPTURED')",
+                               (evidence.capture_id, evidence.captured_sha256, evidence.captured_size, _utcnow()))
+            return self._request_capture_row("capture_id", evidence.capture_id)
+
+    def parse_request_capture(self, capture_id, destination_root, *, io=None):
+        """Read only the completed copy; invalid JSON persists rejection, not authority."""
+        from .trusted_runtime_foundation import read_capture_copy
+        from .trusted_request import RequestError, parse_captured_request, request_digest
+        if type(capture_id) is not str or re.fullmatch(r"[0-9a-f]{32}", capture_id) is None:
+            raise StoreError("invalid capture identity")
+        with self._request_capture_transaction():
+            row = self._request_capture_row("capture_id", capture_id)
+            if row is None:
+                raise StoreError("capture record absent")
+            raw = read_capture_copy(row, destination_root, io=io)
+            request_id, digest, operation, reason = None, None, None, None
+            try:
+                request = parse_captured_request(raw)
+                request_id = request.request_id
+                with closing(self._conn.cursor()) as cursor:
+                    canonical = cursor.execute("SELECT capture_id FROM trusted_request_capture "
+                                               "WHERE source_request_id = ? AND phase = 'PARSED'", (request_id,)).fetchone()
+                if canonical is not None and canonical[0] != capture_id:
+                    reason = "REQUEST_ID_CONFLICT"
+                else:
+                    digest, operation = request_digest(raw), request.operation_key
+            except RequestError as error:
+                reason, request_id = error.code, error.request_id
+            phase = "REJECTED" if reason is not None else "PARSED"
+            terminal = dict(phase=phase, source_request_id=request_id, request_digest=digest,
+                            operation_key=operation, rejection_code=reason)
+            if row["phase"] != "CAPTURED":
+                if any(row[key] != value for key, value in terminal.items()):
+                    raise StoreError("capture terminal evidence conflict")
+                return row
+            self._conn.execute("UPDATE trusted_request_capture SET phase = ?, source_request_id = ?, "
+                               "request_digest = ?, operation_key = ?, rejection_code = ? "
+                               "WHERE capture_id = ? AND phase = 'CAPTURED'",
+                               (phase, request_id, digest, operation, reason, capture_id))
+            return self._request_capture_row("capture_id", capture_id)
 
     def _check_publication_approval_schema(self, *, allow_absent: bool = False) -> bool:
         """Definition admission, not protection against a writer controlling SQLite."""
@@ -950,6 +1106,7 @@ class Store:
 
     def _init_schema(self) -> None:
         # Reject incompatible ledger objects before any legacy schema writes.
+        self._check_request_capture_schema(allow_absent=True)
         self._check_publication_approval_schema(allow_absent=True)
         existing = self._conn.execute("SELECT sql FROM sqlite_master WHERE name='candidate_authority_installation'").fetchone()
         normalize = lambda sql: " ".join(sql.replace("IF NOT EXISTS ", "").rstrip(";\n ").split())
@@ -969,6 +1126,7 @@ class Store:
         self._conn.commit()
 
         self._initialize_publication_approval_schema()
+        self._initialize_request_capture_schema()
 
     def close(self) -> None:
         self._conn.close()
