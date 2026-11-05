@@ -1,0 +1,14 @@
+{
+  "schema_version": "trusted-runtime-install-manifest-v1",
+  "installable": false,
+  "classification": "NON_INSTALLABLE_CONTRACT_TEMPLATE",
+  "python_version": "3.14.10",
+  "architecture": "amd64",
+  "required_external_evidence": [
+    "authoritative_commit_and_tree",
+    "exact_git_blob_bytes",
+    "python_official_sha256_size_and_sigstore",
+    "independent_verifier_acquisition_and_recomputation",
+    "externally_approved_manifest_sha256"
+  ]
+}
