@@ -2086,3 +2086,112 @@ they do not establish real COM interoperability, effective Windows access, resis
 to concurrent administrators, or full system memory erasure. Those require separate
 Human Gate authorization and native host validation. No Store/state machine,
 dependency, service-account, DPAPI, workflow, activation or publication expansion.
+
+
+## TRUSTED_RUNTIME_WINDOWS_PRE_GATE_ASSURANCE-001F — Pre-Gate code-only assurance
+
+CODE_EXISTS != EXECUTION_AUTHORIZATION. AUTHORIZATION_FILE_EXISTS != HUMAN_APPROVAL.
+DESCRIPTOR_MATCH != EFFECTIVE_ACCESS_PROVEN.
+READ_ONLY_HOST_PREFLIGHT_PASS != HUMAN_GATE_EXECUTED.
+001F implements code and synthetic tests only. Running the real read-only host
+probe requires separate Director authorization after independent review.
+
+HumanGateAuthorization gains exactly human_confirmation_sha256: SHA-256 of the
+canonical 32 uppercase hexadecimal ASCII characters supplied independently by
+the future Director. No real token is generated here. Raw confirmation is never
+stored, passed in argv/environment, returned, logged or added to the receipt.
+The fixed native console path requires GetConsoleMode, disables cooked-line input
+and echo, consumes bounded ReadConsoleInputW key events for one attempt, and
+restores the original mode in finally,
+compares the digest in constant time and clears mutable WCHAR/ASCII buffers.
+Best-effort clearing does not guarantee process-wide secret erasure.
+
+Ordering: pre-import admission (001E bootstrap unchanged), full read-only
+admission, native Human/token preconditions, console confirmation, revalidation
+of expiry and pinned inputs, then backend/first mutation. The internal confirmation
+seal is an ordering guard, not public bearer authority. Expiry is enforced through
+first mutation; it no longer blocks successful final readback or receipt creation
+when time elapses after mutation. Authorization bytes must still remain unchanged.
+
+After runtime account/group/LSA readback, before Scheduler registration, the
+existing mutable password is passed directly to LogonUserW(BATCH, DEFAULT).
+The primary token and SecurityImpersonation duplicate have explicit ownership;
+no process creation or thread impersonation is used. TokenUser/TokenGroups must
+prove the frozen runtime SID and enabled Batch, Authenticated Users, Users and
+Local Account SIDs. Administrators/Interactive and unrecognized groups reject.
+Known nonprivileged characteristics and a correctly attributed per-logon SID are
+handled explicitly. Token handles remain held through final readback and close
+on success/failure.
+
+AccessCheck evaluates the actual runtime token against native owner/group/DACL
+readbacks. It rejects Builder workspace write, DELETE, WRITE_DAC and WRITE_OWNER,
+and parent DELETE_CHILD/control authority. Runtime root grants must exactly match
+the existing masks. Exact descriptor admission and O6/H1 remain prerequisites.
+
+Builder has no password input or logon. Authz uses a no-audit resource manager,
+AUTHZ_SKIP_TOKEN_GROUPS, and explicit enabled SID entries from independently read
+Builder identity and indirect local groups. The admitted account model requires
+exactly Users; custom or privileged memberships fail closed. Explicit logon
+characteristics are Everyone, Authenticated Users, Users, Local Account and
+Interactive, never Batch. Dangerous directly assigned or group-assigned privileges
+that could invalidate the DACL model reject. No hidden S4U membership resolution.
+This context models authorization against the exact admitted filesystem DACLs;
+it does not claim to reproduce an arbitrary interactive session, claims, restricted
+token or per-session logon SID. Such a broader context cannot be silently admitted.
+Authz failure never falls back to descriptor-only validation. Builder grants must
+be zero on protected roots and exactly the existing Inbox capability on Inbox.
+
+The new trusted_runtime_host_preflight.py uses --read-only with allow_abbrev=False.
+It has no mutation coordinator call, backend selector, force/skip mode, temporary
+files, network or elevation broker. DLL/structure ABI, process token, existing
+account NetAPI read, LSA read, filesystem SD, SDDL roundtrip, controlled in-memory
+Authz, existing Scheduler folder COM reads and UAC baseline are separate categories.
+Each reports PASS/FAIL/NOT_VERIFIED; missing evidence or cleanup failure cannot
+produce PASS. Names, provider diagnostics and raw tokens never enter its output.
+The controlled Authz fixture validates API functionality, not real Builder access.
+
+System32-only WinDLL loading and explicit signatures/calling convention apply to
+all added APIs. Borrowed console input handles are not closed. Logon/duplicate
+tokens are CloseHandle-owned. Authz contexts and resource manager have separate
+owners; LocalFree owns returned SD/SDDL allocations. Failed cleanup is evidence
+of failure, never suppressed success. No SACL write is introduced.
+
+Real RegisterTask with password, task XML normalization and post-registration
+SDDL remain unverified until a separately authorized Human Gate. The read-only
+probe cannot close those observations. Unrelated prior LOW findings stay open.
+Human Gate 1 and persistent Windows mutation remain unauthorized by 001F.
+
+
+### 001F adversarial hardening — F1/F2/F3/F8
+
+ACCESSCHECK_ABI uses only the current process token with QUERY|DUPLICATE,
+DuplicateToken(SecurityImpersonation), shared production TokenUser/TokenGroups
+parsing and the shared production AccessCheck wrapper. No LogonUser is called by
+the probe. TOKEN_GROUPS counts, SID_AND_ATTRIBUTES bounds, in-buffer SID pointers,
+SID length/revision and attributes are validated without reporting actual SIDs.
+AccessCheck API failure differs from a valid AccessStatus denial; generic masks
+are exact and returned privilege-buffer lengths/counts must fit allocated storage.
+The controlled in-memory SD has explicit SYSTEM owner, SYSTEM group and Everyone
+READ DACL; both AccessCheck and Authz exercise READ allow and WRITE_DATA deny.
+Authz uses a synthetic well-known principal, not host-user output. SDs are freed
+with LocalFree; token handles have deterministic cleanup, including error paths.
+
+CONSOLE_ABI queries GetStdHandle/GetConsoleMode only. No input, prompt, mode change
+or secret is requested. A missing console yields NOT_VERIFIED, never PASS.
+
+Future Human Gate secret entry consumes individual KEY_EVENT records, never a
+cooked line. Exactly 32 uppercase hexadecimal characters followed by Enter are
+required. Key-up is ignored; non-key events, noncanonical characters, early Enter,
+overflow, Ctrl/Alt commands and repeated/multi-character events reject. One bounded
+attempt permits at most 128 events; rejection never restarts entry. Processed input,
+line input, echo, virtual-terminal input and QuickEdit are disabled transiently and
+the original mode is restored in finally. WCHAR, ASCII and input-record storage
+are cleared on every exit; restoration failure cannot approve the Gate. No whole
+secret string/bytes is assembled. Native events cannot reliably identify every
+paste/injected event that is indistinguishable from canonical single-key input;
+no universal input-origin or console-history claim is made.
+
+F5_REAL_BATCH_TOKEN_CONTENTS = OPEN_FOR_ISOLATED_LAB_VM.
+The current-process ABI probe does not validate the future Batch token's groups.
+validate_batch_token is not weakened. Real host preflight, real console confirmation
+and all persistent Windows mutations still require separate authorization.
