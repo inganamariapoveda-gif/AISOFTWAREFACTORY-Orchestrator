@@ -43,6 +43,7 @@ class HumanGateAuthorization:
     machine_sid: str
     volume_guid: str
     human_admin_sid: str
+    human_confirmation_sha256: str
     builder_sid: str
     builder_workspace_path: str
     source_commit_sha: str
@@ -81,7 +82,7 @@ class HumanGateAuthorization:
             w.digest(value[key], 40)
         for key in ('bootstrap_sha256', 'native_backend_sha256', 'validator_module_sha256',
                     'contract_sha256', 'manifest_sha256', 'python_artifact_sha256',
-                    'python_runtime_tree_digest', 'authorization_nonce'):
+                    'python_runtime_tree_digest', 'authorization_nonce', 'human_confirmation_sha256'):
             w.digest(value[key])
         w.require(value['python_artifact_filename'] == 'python-3.14.10-embed-amd64.zip'
                   and value['python_artifact_sha256'] == w.GATE1_PYTHON_SHA256,
@@ -397,9 +398,9 @@ class NativeBindings:
                    c.byref(domain_size), c.byref(use)), 'SID_RESOLVE')
         return self.sid_string(data)
 
-    def local_groups(self, name='ASFTrustedRuntime'):
+    def local_groups(self, name='ASFTrustedRuntime', *, indirect=False):
         buffer = c.c_void_p(); count, total = t.DWORD(), t.DWORD()
-        result = self.net.NetUserGetLocalGroups(None, name, 0, 0,
+        result = self.net.NetUserGetLocalGroups(None, name, 0, 1 if indirect else 0,
                     c.byref(buffer), 0xffffffff, c.byref(count), c.byref(total))
         try:
             if result:
@@ -1184,6 +1185,11 @@ def validate_pre_mutation(context):
               'AUTHORIZATION_CHANGED')
     w.require(HumanGateAuthorization.parse(context.authorization_bytes, datetime.now(timezone.utc)) == auth,
               'AUTHORIZATION_CHANGED')
+    for relative, (size, digest) in context.source_inventory.items():
+        raw = _read_pinned(files, context.source_handles[relative], digest)
+        w.require(len(raw) == size, 'SOURCE_BYTES_MISMATCH')
+    _read_pinned(files, files.open(STAGING + r'\gate1_contract.json'), auth.contract_sha256)
+    _read_pinned(files, files.open(STAGING + r'\trusted_runtime_manifest.json'), auth.manifest_sha256)
     w.require(bindings.account_absent(), 'EXISTING_ACCOUNT')
     w.require(files.absent(PROFILE), 'EXISTING_RUNTIME_PROFILE')
     for _, path in ROOT_LAYOUT:
@@ -1200,12 +1206,14 @@ class NativeGateBackend:
     This is a control-flow capability inside protected code, not a cryptographic
     token or a public authorization API. Production CLI never accepts a context.
     """
-    def __init__(self, context):
+    def __init__(self, context, confirmation=None):
+        w.require(confirmation is _CONFIRMATION_SEAL, 'HUMAN_CONFIRMATION_REQUIRED')
         w.require(type(context) is _AdmittedContext and context.seal is _CONTEXT_SEAL,
                   'PROTECTED_AUTHORIZATION_REQUIRED')
         validate_pre_mutation(context)
         self.context = context
         self.runtime_sid = None
+        self.effective_access = None
         self.roots = {}
         self.destinations = {}
         self.expected_task = None
@@ -1245,6 +1253,10 @@ class NativeGateBackend:
         groups = set(b.local_groups()) | {'S-1-1-0', 'S-1-5-11'}
         validate_group_batch_rights({sid: b.direct_rights(sid) for sid in groups})
 
+    def prepare_effective_access(self, credential):
+        w.require(self.effective_access is None, 'EFFECTIVE_ACCESS_ALREADY_CREATED')
+        self.effective_access = EffectiveAccess(self.context, self.runtime_sid, credential)
+
     def create_roots(self):
         for kind, path in ROOT_LAYOUT:
             expected = w.expected_descriptor(kind, self.runtime_sid, self.context.authority.builder_sid)
@@ -1263,6 +1275,8 @@ class NativeGateBackend:
         w.require(workspace.owner == self.context.authority.builder_sid, 'ISOLATION_REJECTED')
         validate_isolation(workspace, tuple(observed[k] for k in ('runtime', 'authority', 'captures', 'secrets')),
                            self.runtime_sid, self.context.authority.builder_sid)
+        w.require(self.effective_access is not None, 'EFFECTIVE_ACCESS_REQUIRED')
+        self.effective_access.verify(self.roots)
 
     def materialize(self):
         files, base = self.context.files, PureWindowsPath(w.ROOTS['runtime_root'])
@@ -1335,7 +1349,8 @@ class NativeGateBackend:
         self.verify_task()
         self.verify_uac()
         w.require(self.context.bindings.machine() == self.context.host, 'MACHINE_BINDING_REJECTED')
-        HumanGateAuthorization.parse(self.context.authorization_bytes, datetime.now(timezone.utc))
+        w.require(self.context.files.read(self.context.authorization_handle, 65536) ==
+                  self.context.authorization_bytes, 'AUTHORIZATION_CHANGED')
         self._final_readback_complete = True
 
     def write_receipt(self):
@@ -1352,9 +1367,9 @@ class NativeGateBackend:
 
 
 PRODUCTION_STEPS = (
-    'AUTHORIZATION_ADMISSION', 'BACKEND_CONSTRUCTION', 'CREDENTIAL_ACQUISITION',
+    'AUTHORIZATION_ADMISSION', 'HUMAN_CONFIRMATION', 'BACKEND_CONSTRUCTION', 'CREDENTIAL_ACQUISITION',
     'CREATE_RUNTIME_ACCOUNT', 'FREEZE_RUNTIME_SID', 'ACCOUNT_READBACK',
-    'GROUP_NORMALIZATION', 'GRANT_BATCH', 'LSA_READBACK', 'CREATE_PROTECTED_ROOTS',
+    'GROUP_NORMALIZATION', 'GRANT_BATCH', 'LSA_READBACK', 'BATCH_TOKEN_AND_AUTHZ', 'CREATE_PROTECTED_ROOTS',
     'ROOTS_AND_ISOLATION_READBACK', 'MATERIALIZE', 'TREE_READBACK',
     'REGISTER_DISABLED_TASK', 'TASK_READBACK', 'UAC_HARDEN', 'UAC_READBACK',
     'FINAL_HOST_READBACK', 'WRITE_AND_VERIFY_FINAL_RECEIPT', 'STOP',
@@ -1367,15 +1382,17 @@ def run_native_gate():
     This function is reachable from production CLI only through explicit Phase1B;
     real admission must succeed before the mutation backend is constructed.
     """
-    context = credential = None
+    context = credential = backend = None
     stage = PRODUCTION_STEPS[0]
     completed = []
     may_have_mutated = False
     result = None
     try:
         context = admit_native_gate(); completed.append(stage)
+        stage = 'HUMAN_CONFIRMATION'
+        confirmation = confirm_human(context); completed.append(stage)
         stage = 'BACKEND_CONSTRUCTION'
-        backend = NativeGateBackend(context); completed.append(stage)
+        backend = NativeGateBackend(context, confirmation); completed.append(stage)
         stage = 'CREDENTIAL_ACQUISITION'
         credential = NativeCredential(context.bindings.bcrypt); completed.append(stage)
         operations = (
@@ -1384,6 +1401,7 @@ def run_native_gate():
             ('ACCOUNT_READBACK', backend.account_readback),
             ('GROUP_NORMALIZATION', backend.normalize_groups),
             ('GRANT_BATCH', backend.grant_batch), ('LSA_READBACK', backend.verify_lsa),
+            ('BATCH_TOKEN_AND_AUTHZ', lambda: backend.prepare_effective_access(credential)),
             ('CREATE_PROTECTED_ROOTS', backend.create_roots),
             ('ROOTS_AND_ISOLATION_READBACK', backend.verify_roots_and_isolation),
             ('MATERIALIZE', backend.materialize), ('TREE_READBACK', backend.verify_tree),
@@ -1410,6 +1428,11 @@ def run_native_gate():
     finally:
         cleanup_ok = True
         try:
+            if backend is not None and backend.effective_access is not None:
+                backend.effective_access.close()
+        except BaseException:
+            cleanup_ok = False
+        try:
             if credential is not None: credential.clear()
         except BaseException:
             cleanup_ok = False
@@ -1424,3 +1447,398 @@ def run_native_gate():
                           mutation_may_have_occurred=may_have_mutated, completed_steps=completed,
                           director_recovery_required=True)
     return result
+
+
+# 001F confirmation is an in-process ordering guard, not a bearer token API.
+_CONFIRMATION_SEAL = object()
+
+
+class KEY_EVENT_RECORD(c.Structure):
+    _fields_ = [('KeyDown', t.BOOL), ('RepeatCount', t.WORD), ('VirtualKey', t.WORD),
+                ('VirtualScan', t.WORD), ('UnicodeChar', c.c_uint16), ('ControlKeyState', t.DWORD)]
+
+
+class INPUT_EVENT(c.Union):
+    _fields_ = [('KeyEvent', KEY_EVENT_RECORD), ('padding', c.c_ubyte * 16)]
+
+
+class INPUT_RECORD(c.Structure):
+    _fields_ = [('EventType', t.WORD), ('Event', INPUT_EVENT)]
+
+
+class ConsoleConfirmation:
+    """One bounded raw-key attempt; no cooked-line submission or secret string."""
+    def __init__(self, kernel):
+        self.kernel = kernel
+        D = t.DWORD
+        for name, restype, args in (
+            ('GetStdHandle', t.HANDLE, [D]),
+            ('GetConsoleMode', t.BOOL, [t.HANDLE, c.POINTER(D)]),
+            ('SetConsoleMode', t.BOOL, [t.HANDLE, D]),
+            ('ReadConsoleInputW', t.BOOL, [t.HANDLE, c.POINTER(INPUT_RECORD), D, c.POINTER(D)]),
+        ):
+            api = getattr(kernel, name); api.argtypes = args; api.restype = restype
+
+    def verify(self, expected_digest):
+        import hmac
+        w.digest(expected_digest)
+        wide = (c.c_uint16 * 32)()
+        scratch = (c.c_ubyte * 32)()
+        record = INPUT_RECORD()
+        original = t.DWORD()
+        handle = self.kernel.GetStdHandle(0xfffffff6)  # borrowed STD_INPUT_HANDLE
+        mode_known = False
+        try:
+            w.require(handle not in (None, c.c_void_p(-1).value), 'CONSOLE_REQUIRED')
+            w.require(self.kernel.GetConsoleMode(handle, c.byref(original)), 'CONSOLE_REQUIRED')
+            mode_known = True
+            # Raw input: no processed Ctrl+C, line editing, echo, VT or QuickEdit.
+            mode = (original.value & ~(1 | 2 | 4 | 0x200 | 0x40)) | 0x80
+            w.require(self.kernel.SetConsoleMode(handle, mode), 'CONSOLE_MODE_FAILED')
+            length = 0
+            for _ in range(128):  # bounded events within ONE attempt, never restart
+                c.memset(c.addressof(record), 0, c.sizeof(record))
+                count = t.DWORD()
+                w.require(self.kernel.ReadConsoleInputW(handle, c.byref(record), 1, c.byref(count)),
+                          'CONSOLE_READ_FAILED')
+                w.require(count.value == 1 and record.EventType == 1, 'CONSOLE_EVENT_REJECTED')
+                key = record.Event.KeyEvent
+                if not key.KeyDown: continue
+                # Reject auto-repeat, Ctrl/Alt commands and detectable paste shortcuts.
+                w.require(key.RepeatCount == 1 and not key.ControlKeyState & 0xf,
+                          'CONSOLE_EVENT_REJECTED')
+                value = key.UnicodeChar
+                if value == 13:
+                    w.require(key.VirtualKey == 13 and length == 32, 'CONFIRMATION_REJECTED')
+                    break
+                w.require(length < 32 and (48 <= value <= 57 or 65 <= value <= 70),
+                          'CONFIRMATION_REJECTED')
+                wide[length] = value
+                scratch[length] = value
+                length += 1
+            else:
+                raise w.AdmissionError('CONSOLE_EVENT_LIMIT')
+            actual = hashlib.sha256(memoryview(scratch)).digest()
+            w.require(hmac.compare_digest(actual, bytes.fromhex(expected_digest)), 'CONFIRMATION_REJECTED')
+        finally:
+            for buffer in (wide, scratch, record):
+                c.memset(c.addressof(buffer), 0, c.sizeof(buffer))
+            if mode_known:
+                w.require(self.kernel.SetConsoleMode(handle, original.value), 'CONSOLE_RESTORE_FAILED')
+
+
+def confirm_human(context):
+    validate_pre_mutation(context)
+    ConsoleConfirmation(context.bindings.kernel).verify(context.authority.human_confirmation_sha256)
+    # Expiry and pinned inputs are rechecked after the potentially slow human read.
+    validate_pre_mutation(context)
+    return _CONFIRMATION_SEAL
+
+
+class SID_AND_ATTRIBUTES(c.Structure):
+    _fields_ = [('Sid', c.c_void_p), ('Attributes', t.DWORD)]
+
+
+class TOKEN_GROUPS_HEADER(c.Structure):
+    _fields_ = [('GroupCount', t.DWORD), ('Groups', SID_AND_ATTRIBUTES * 1)]
+
+
+class GENERIC_MAPPING(c.Structure):
+    _fields_ = [('GenericRead', t.DWORD), ('GenericWrite', t.DWORD),
+                ('GenericExecute', t.DWORD), ('GenericAll', t.DWORD)]
+
+
+class LUID(c.Structure):
+    _fields_ = [('LowPart', t.DWORD), ('HighPart', t.LONG)]
+
+
+class AUTHZ_ACCESS_REQUEST(c.Structure):
+    _fields_ = [('DesiredAccess', t.DWORD), ('PrincipalSelfSid', c.c_void_p),
+                ('ObjectTypeList', c.c_void_p), ('ObjectTypeListLength', t.DWORD),
+                ('OptionalArguments', c.c_void_p)]
+
+
+class AUTHZ_ACCESS_REPLY(c.Structure):
+    _fields_ = [('ResultListLength', t.DWORD), ('GrantedAccessMask', c.POINTER(t.DWORD)),
+                ('SaclEvaluationResults', c.POINTER(t.DWORD)), ('Error', c.POINTER(t.DWORD))]
+
+
+RUNTIME_REQUIRED_GROUPS = frozenset({'S-1-5-3', 'S-1-5-11', USERS, 'S-1-5-113'})
+BUILDER_CHARACTERISTICS = frozenset({'S-1-1-0', 'S-1-5-11', USERS, 'S-1-5-113', 'S-1-5-4'})
+MAXIMUM_ALLOWED = 0x02000000
+FILE_GENERIC_MAPPING = (w.READ, w.WRITE, w.READ_CONTROL | w.SYNCHRONIZE | 0xa0, w.FULL_ACCESS)
+
+
+def validate_batch_token(user, groups, expected_sid):
+    import re
+    w.require(user == expected_sid and type(groups) is dict, 'BATCH_TOKEN_REJECTED')
+    w.require(RUNTIME_REQUIRED_GROUPS <= set(groups), 'BATCH_TOKEN_REJECTED')
+    w.require(w.ADMIN not in groups and 'S-1-5-4' not in groups, 'BATCH_TOKEN_REJECTED')
+    for sid in RUNTIME_REQUIRED_GROUPS:
+        w.require(groups[sid] & 4 and not groups[sid] & 0x10, 'BATCH_TOKEN_REJECTED')
+    permitted = RUNTIME_REQUIRED_GROUPS | {'S-1-1-0', 'S-1-2-0', 'S-1-5-15', 'S-1-18-1', 'S-1-16-8192'}
+    for sid, attributes in groups.items():
+        # Per-logon SID carries no authorization on the admitted exact root SDs.
+        logon = re.fullmatch(r'S-1-5-5-[0-9]+-[0-9]+', sid) is not None
+        w.require(sid in permitted or (logon and attributes & 0xc0000000 == 0xc0000000),
+                  'UNEXPECTED_TOKEN_GROUP')
+
+
+@contextmanager
+def held_security_descriptor(files, handle):
+    pointer = c.c_void_p()
+    status = files.b.advapi.GetSecurityInfo(handle, 1, 7, None, None, None, None, c.byref(pointer))
+    if status: raise NativeError('ACCESS_SD_READ', status)
+    try:
+        w.require(bool(pointer), 'ACCESS_SD_REJECTED')
+        yield pointer
+    finally:
+        if files.b.kernel.LocalFree(pointer): raise NativeError('ACCESS_SD_FREE')
+
+
+def _bounded_sid(raw, pointer, minimum_offset, sid_string):
+    base = c.addressof(raw)
+    w.require(type(pointer) is int and base + minimum_offset <= pointer <= base + c.sizeof(raw) - 8,
+              'TOKEN_SID_BOUNDS_REJECTED')
+    revision = c.c_ubyte.from_address(pointer).value
+    count = c.c_ubyte.from_address(pointer + 1).value
+    w.require(revision == 1 and count <= 15 and pointer + 8 + count * 4 <= base + c.sizeof(raw),
+              'TOKEN_SID_BOUNDS_REJECTED')
+    return sid_string(pointer)
+
+
+def parse_token_groups(raw, sid_string):
+    offset = TOKEN_GROUPS_HEADER.Groups.offset
+    w.require(c.sizeof(raw) >= offset, 'TOKEN_GROUPS_BOUNDS_REJECTED')
+    count = c.c_uint32.from_buffer(raw).value
+    end = offset + count * c.sizeof(SID_AND_ATTRIBUTES)
+    w.require(count <= 512 and end <= c.sizeof(raw), 'TOKEN_GROUPS_BOUNDS_REJECTED')
+    groups = {}
+    for i in range(count):
+        item = SID_AND_ATTRIBUTES.from_buffer(raw, offset + i*c.sizeof(SID_AND_ATTRIBUTES))
+        sid = _bounded_sid(raw, item.Sid, end, sid_string)
+        w.require(sid not in groups, 'TOKEN_GROUPS_DUPLICATE')
+        groups[sid] = item.Attributes
+    return groups
+
+
+def observe_native_token(bindings, handle):
+    def info(kind):
+        size = t.DWORD()
+        bindings.advapi.GetTokenInformation(handle, kind, None, 0, c.byref(size))
+        w.require(0 < size.value <= 1024*1024, 'TOKEN_INFORMATION_REJECTED')
+        buffer = c.create_string_buffer(size.value)
+        bindings.check(bindings.advapi.GetTokenInformation(handle, kind, buffer, len(buffer),
+                       c.byref(size)), 'TOKEN_INFORMATION_READ')
+        w.require(0 < size.value <= len(buffer), 'TOKEN_INFORMATION_REJECTED')
+        return buffer
+    user = info(1)
+    w.require(len(user) >= c.sizeof(SID_AND_ATTRIBUTES), 'TOKEN_USER_BOUNDS_REJECTED')
+    pointer = SID_AND_ATTRIBUTES.from_buffer(user).Sid
+    sid = _bounded_sid(user, pointer, c.sizeof(SID_AND_ATTRIBUTES), bindings.sid_string)
+    return sid, parse_token_groups(info(2), bindings.sid_string)
+
+
+def access_check(bindings, token, descriptor, desired=MAXIMUM_ALLOWED):
+    api = bindings.advapi.AccessCheck
+    api.argtypes = [c.c_void_p, t.HANDLE, t.DWORD, c.POINTER(GENERIC_MAPPING), c.c_void_p,
+                    c.POINTER(t.DWORD), c.POINTER(t.DWORD), c.POINTER(t.BOOL)]
+    api.restype = t.BOOL
+    privileges = c.create_string_buffer(65536)
+    size, granted, allowed = t.DWORD(len(privileges)), t.DWORD(), t.BOOL()
+    mapping = GENERIC_MAPPING(*FILE_GENERIC_MAPPING)
+    bindings.check(api(descriptor, token, desired, c.byref(mapping), privileges,
+                       c.byref(size), c.byref(granted), c.byref(allowed)), 'ACCESS_CHECK_API')
+    w.require(8 <= size.value <= len(privileges), 'ACCESS_ABI_REJECTED')
+    count = c.c_uint32.from_buffer(privileges).value
+    w.require(count <= (size.value - 8) // 12, 'ACCESS_PRIVILEGES_REJECTED')
+    return granted.value if allowed.value else 0
+
+
+@contextmanager
+def current_process_access_token(bindings):
+    a = bindings.advapi
+    a.DuplicateToken.argtypes = [t.HANDLE, c.c_int, c.POINTER(t.HANDLE)]
+    a.DuplicateToken.restype = t.BOOL
+    primary, duplicate = t.HANDLE(), t.HANDLE()
+    try:
+        bindings.check(a.OpenProcessToken(bindings.kernel.GetCurrentProcess(), 0x0a,
+                       c.byref(primary)), 'PREFLIGHT_TOKEN_OPEN')  # QUERY | DUPLICATE
+        bindings.check(a.DuplicateToken(primary, 2, c.byref(duplicate)), 'PREFLIGHT_TOKEN_DUPLICATE')
+        yield duplicate
+    finally:
+        ok = True
+        for handle in (duplicate, primary):
+            if handle and not bindings.kernel.CloseHandle(handle): ok = False
+        if not ok: raise NativeError('PREFLIGHT_TOKEN_CLOSE')
+
+
+class RuntimeBatchToken:
+    """Own primary and duplicated token handles; never impersonate a thread."""
+    def __init__(self, bindings, credential, expected_sid):
+        self.b = bindings
+        self.primary, self.token = t.HANDLE(), t.HANDLE()
+        a = bindings.advapi
+        a.LogonUserW.argtypes = [t.LPCWSTR, t.LPCWSTR, c.POINTER(c.c_uint16), t.DWORD,
+                                t.DWORD, c.POINTER(t.HANDLE)]
+        a.LogonUserW.restype = t.BOOL
+        a.DuplicateToken.argtypes = [t.HANDLE, c.c_int, c.POINTER(t.HANDLE)]
+        a.DuplicateToken.restype = t.BOOL
+        a.AccessCheck.argtypes = [c.c_void_p, t.HANDLE, t.DWORD, c.POINTER(GENERIC_MAPPING),
+                                 c.c_void_p, c.POINTER(t.DWORD), c.POINTER(t.DWORD), c.POINTER(t.BOOL)]
+        a.AccessCheck.restype = t.BOOL
+        try:
+            w.require(type(credential) is NativeCredential, 'CREDENTIAL_REQUIRED')
+            bindings.check(a.LogonUserW('ASFTrustedRuntime', '.', credential.buffer, 4, 0,
+                                       c.byref(self.primary)), 'BATCH_LOGON')
+            self.validate(self.primary, expected_sid)
+            bindings.check(a.DuplicateToken(self.primary, 2, c.byref(self.token)), 'BATCH_DUPLICATE')
+            self.validate(self.token, expected_sid)
+        except BaseException:
+            self.close()
+            raise
+
+    def validate(self, handle, expected_sid):
+        sid, groups = observe_native_token(self.b, handle)
+        validate_batch_token(sid, groups, expected_sid)
+
+    def access(self, descriptor):
+        return access_check(self.b, self.token, descriptor)
+
+    def close(self):
+        ok = True
+        for name in ('token', 'primary'):
+            handle = getattr(self, name)
+            if handle:
+                if not self.b.kernel.CloseHandle(handle): ok = False
+                setattr(self, name, t.HANDLE())
+        if not ok: raise NativeError('BATCH_TOKEN_CLOSE')
+
+
+class BuilderAuthz:
+    """Explicit group context, no S4U, no credentials, no context from metadata flags."""
+    def __init__(self, bindings, sid, groups):
+        self.b = bindings
+        self.manager, self.base, self.context = c.c_void_p(), c.c_void_p(), c.c_void_p()
+        w.require(type(groups) is frozenset and BUILDER_CHARACTERISTICS <= groups
+                  and 'S-1-5-3' not in groups and w.ADMIN not in groups, 'BUILDER_CONTEXT_REJECTED')
+        self.api = c.WinDLL('authz.dll', use_last_error=True, winmode=0x800)
+        P, D = c.c_void_p, t.DWORD
+        def bind(name, result, *args):
+            f = getattr(self.api, name); f.restype = result; f.argtypes = list(args)
+        bind('AuthzInitializeResourceManager', t.BOOL, D, P, P, P, t.LPCWSTR, c.POINTER(P))
+        bind('AuthzInitializeContextFromSid', t.BOOL, D, P, P, P, LUID, P, c.POINTER(P))
+        bind('AuthzAddSidsToContext', t.BOOL, P, c.POINTER(SID_AND_ATTRIBUTES), D,
+             c.POINTER(SID_AND_ATTRIBUTES), D, c.POINTER(P))
+        bind('AuthzAccessCheck', t.BOOL, D, P, c.POINTER(AUTHZ_ACCESS_REQUEST), P, P,
+             c.POINTER(P), D, c.POINTER(AUTHZ_ACCESS_REPLY), c.POINTER(P))
+        bind('AuthzFreeContext', t.BOOL, P)
+        bind('AuthzFreeResourceManager', t.BOOL, P)
+        from contextlib import ExitStack
+        try:
+            bindings.check(self.api.AuthzInitializeResourceManager(1, None, None, None, None,
+                            c.byref(self.manager)), 'AUTHZ_MANAGER')
+            with bindings.sid_pointer(sid) as pointer:
+                # AUTHZ_SKIP_TOKEN_GROUPS: never resolve a hidden S4U token.
+                bindings.check(self.api.AuthzInitializeContextFromSid(2, pointer, self.manager,
+                                None, LUID(), None, c.byref(self.base)), 'AUTHZ_CONTEXT')
+            with ExitStack() as stack:
+                entries = (SID_AND_ATTRIBUTES * len(groups))()
+                for i, group in enumerate(sorted(groups)):
+                    pointer = stack.enter_context(bindings.sid_pointer(group))
+                    entries[i] = SID_AND_ATTRIBUTES(pointer, 7)  # mandatory/default-enabled/enabled
+                bindings.check(self.api.AuthzAddSidsToContext(self.base, entries, len(entries), None, 0,
+                                c.byref(self.context)), 'AUTHZ_GROUPS')
+        except BaseException:
+            self.close()
+            raise
+
+    def access(self, descriptor, desired=MAXIMUM_ALLOWED):
+        granted, error = t.DWORD(), t.DWORD()
+        request = AUTHZ_ACCESS_REQUEST(desired, None, None, 0, None)
+        reply = AUTHZ_ACCESS_REPLY(1, c.pointer(granted), None, c.pointer(error))
+        self.b.check(self.api.AuthzAccessCheck(0, self.context, c.byref(request), None, descriptor,
+                     None, 0, c.byref(reply), None), 'BUILDER_ACCESS_CHECK')
+        if error.value == 5:
+            w.require(granted.value == 0, 'AUTHZ_ACCESS_RESULT_REJECTED')
+            return 0  # documented per-result access denial
+        if error.value: raise NativeError('AUTHZ_ACCESS_RESULT', error.value)
+        return granted.value
+
+    def close(self):
+        ok = True
+        for name in ('context', 'base'):
+            handle = getattr(self, name)
+            if handle:
+                if not self.api.AuthzFreeContext(handle): ok = False
+                setattr(self, name, c.c_void_p())
+        if self.manager:
+            if not self.api.AuthzFreeResourceManager(self.manager): ok = False
+            self.manager = c.c_void_p()
+        if not ok: raise NativeError('AUTHZ_CLOSE')
+
+
+def builder_context_groups(bindings, builder_sid):
+    observed = bindings.account('ASFBuilder')
+    machine_sid = bindings.machine()['machine_sid']
+    w.require(builder_sid.startswith(machine_sid + '-'), 'BUILDER_NOT_LOCAL')
+    w.require(observed['sid'] == builder_sid and observed['standard'] and observed['enabled'],
+              'BUILDER_CONTEXT_REJECTED')
+    indirect = bindings.local_groups('ASFBuilder', indirect=True)
+    # The approved standard-user model is exactly Users, including indirect groups.
+    # Unknown/custom groups are not silently approximated.
+    w.require(set(indirect) == {USERS}, 'BUILDER_CONTEXT_REJECTED')
+    groups = BUILDER_CHARACTERISTICS
+    dangerous = {'SeTakeOwnershipPrivilege', 'SeRestorePrivilege', 'SeBackupPrivilege',
+                 'SeSecurityPrivilege', 'SeRelabelPrivilege', 'SeTcbPrivilege',
+                 'SeDebugPrivilege', 'SeImpersonatePrivilege', 'SeCreateTokenPrivilege',
+                 'SeAssignPrimaryTokenPrivilege'}
+    for principal in groups | {builder_sid}:
+        w.require(not bindings.direct_rights(principal) & dangerous, 'BUILDER_PRIVILEGE_REJECTED')
+    return groups
+
+
+class EffectiveAccess:
+    def __init__(self, context, runtime_sid, credential):
+        self.context = context
+        self.runtime = self.builder = None
+        self.runtime_sid = runtime_sid
+        try:
+            groups = builder_context_groups(context.bindings, context.authority.builder_sid)
+            self.runtime = RuntimeBatchToken(context.bindings, credential, runtime_sid)
+            self.builder = BuilderAuthz(context.bindings, context.authority.builder_sid, groups)
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self, roots):
+        files = self.context.files
+        w.require(builder_context_groups(self.context.bindings, self.context.authority.builder_sid) ==
+                  BUILDER_CHARACTERISTICS, 'BUILDER_CONTEXT_REJECTED')
+        self.runtime.validate(self.runtime.token, self.runtime_sid)
+        with held_security_descriptor(files, self.context.workspace_handle) as sd:
+            w.require(not self.runtime.access(sd) & WRITE_MASK, 'RUNTIME_WORKSPACE_ACCESS_REJECTED')
+        parent = str(PureWindowsPath(self.context.authority.builder_workspace_path).parent)
+        w.require(parent in files.directories, 'WORKSPACE_PARENT_NOT_HELD')
+        with held_security_descriptor(files, files.directories[parent]) as sd:
+            w.require(not self.runtime.access(sd) & (0x40 | w.WRITE_DAC | w.WRITE_OWNER),
+                      'RUNTIME_WORKSPACE_PARENT_ACCESS_REJECTED')
+        runtime_masks = {'runtime':w.EXECUTE_ACCESS, 'control':w.READ, 'authority':w.AUTHORITY_ACCESS,
+                         'captures':w.CAPTURE_ACCESS, 'inbox':w.READ, 'secrets':w.CAPTURE_ACCESS}
+        w.require(set(roots) == set(runtime_masks), 'ACCESS_ROOTS_REJECTED')
+        for kind, handle in roots.items():
+            with held_security_descriptor(files, handle) as sd:
+                w.require(self.runtime.access(sd) == runtime_masks[kind], 'RUNTIME_ACCESS_REJECTED')
+                granted = self.builder.access(sd)
+                expected = w.BUILDER_INBOX_ACCESS if kind == 'inbox' else 0
+                w.require(granted == expected, 'BUILDER_ACCESS_REJECTED')
+
+    def close(self):
+        failed = False
+        for name in ('builder', 'runtime'):
+            resource = getattr(self, name)
+            if resource is not None:
+                try: resource.close()
+                except BaseException: failed = True
+                setattr(self, name, None)
+        if failed: raise NativeError('EFFECTIVE_ACCESS_CLOSE')

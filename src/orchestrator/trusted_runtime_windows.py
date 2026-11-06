@@ -588,7 +588,13 @@ def gate1_contract_template():
         'network_allowed': False, 'antivirus_bypass_allowed': False,
         'authorization': dict(path=r'C:\Program Files\AISOFTWAREFACTORY\GateStaging\gate1_authorization.json',
                               action='TRUSTED_RUNTIME_GATE1_PHASE1B',
-                              schema_version='human-gate-authorization-v1'),
+                              schema_version='human-gate-authorization-v1',
+                              confirmation_digest_field='human_confirmation_sha256',
+                              confirmation_format='32_UPPERCASE_HEX_ASCII',
+                              console_required=True, confirmation_attempts=1),
+        'effective_access': dict(runtime_logon='BATCH', runtime_api='AccessCheck',
+                                 builder_api='AuthzAccessCheck', builder_skip_token_groups=True,
+                                 descriptor_admission_required=True),
     }
 
 
