@@ -294,7 +294,7 @@ class ACLTests(unittest.TestCase):
         delete_aces = [a for a in authority.aces if a.sid == RUNTIME and a.mask & w.DELETE]
         self.assertEqual(len(delete_aces), 1)
         ace = delete_aces[0]
-        self.assertEqual(ace.flags, 0x1 | 0x8)  # OI | IO, not CI
+        self.assertEqual(ace.flags, 0x0D)  # OI | NP | IO, not CI
         self.assertFalse(ace.flags & 0x2)
         self.assertFalse(ace.mask & (0x40 | w.WRITE_DAC | w.WRITE_OWNER))
 
@@ -384,7 +384,7 @@ class Gate1AclRegressionTests(unittest.TestCase):
         forbidden = w.DELETE | 0x40 | w.WRITE_DAC | w.WRITE_OWNER | 0x4
         self.assertEqual(container.mask & forbidden, 0)
         files = next(a for a in runtime_aces if a.flags != 0)
-        self.assertEqual(files.flags, w.OBJECT_INHERIT | w.INHERIT_ONLY)
+        self.assertEqual(files.flags, w.OBJECT_INHERIT | w.NO_PROPAGATE_INHERIT | w.INHERIT_ONLY)
         self.assertTrue(files.mask & w.DELETE)
         self.assertFalse(files.flags & 0x2)
 

@@ -78,6 +78,8 @@ REPOSITORY = 'https://github.com/inganamariapoveda-gif/AISOFTWAREFACTORY-Orchest
 APPLICATION_FILES = tuple('app/orchestrator/' + n + '.py' for n in (
     '__init__', 'trusted_runtime_entrypoint', 'trusted_runtime_windows',
     'trusted_runtime_foundation', 'trusted_request', 'director_issuance', 'store', 'state_machine'))
+APPLICATION_FILES += ('app/orchestrator/trusted_runtime_windows_native.py',
+                      'trusted_runtime_gate1_bootstrap.py')
 ROLES = frozenset(('PYTHON_EXECUTABLE', 'PYTHON_LIBRARY', 'NATIVE_LIBRARY',
                    'STDLIB_ARCHIVE', 'APPLICATION_MODULE', 'ENTRYPOINT',
                    'IMPORT_CONFIG', 'STATIC_DATA', 'LICENSE'))
@@ -150,6 +152,7 @@ CAPTURE_ACCESS = READ | WRITE  # no FILE_DELETE_CHILD (0x40)
 AUTHORITY_ACCESS = (CAPTURE_ACCESS | 0x20) & ~0x4  # traverse, no create-subdirectory
 SQLITE_FILE_ACCESS = CAPTURE_ACCESS | DELETE
 OBJECT_INHERIT = 0x1
+NO_PROPAGATE_INHERIT = 0x4
 INHERIT_ONLY = 0x8
 EXECUTE_ACCESS = READ | 0x20
 BUILDER_INBOX_ACCESS = 0x22 | READ_CONTROL | SYNCHRONIZE
@@ -191,7 +194,7 @@ def expected_descriptor(kind, runtime_sid, builder_sid):
     if kind == 'authority':
         # DELETE is effective on inherited files only, never this container.
         # Protected child roots (including Captures) admit no inherited ACEs.
-        aces.append(Ace(runtime_sid, SQLITE_FILE_ACCESS, OBJECT_INHERIT | INHERIT_ONLY))
+        aces.append(Ace(runtime_sid, SQLITE_FILE_ACCESS, OBJECT_INHERIT | NO_PROPAGATE_INHERIT | INHERIT_ONLY))
     if kind == 'inbox':
         aces.append(Ace(builder_sid, BUILDER_INBOX_ACCESS, 0))
     return Descriptor(ADMIN, True, tuple(aces))
@@ -566,11 +569,15 @@ def gate1_contract_template():
                        own_workspace_required=True),
         'phase1b': dict(trusted_runtime_account_name='ASFTrustedRuntime',
                        trusted_runtime_root=ROOTS['runtime_root'],
+                       program_files_parent=r'C:\Program Files\AISOFTWAREFACTORY',
+                       control_root=r'C:\ProgramData\AISOFTWAREFACTORY',
+                       runtime_profile_path=r'C:\Users\ASFTrustedRuntime',
                        **{k: v for k, v in ROOTS.items() if k != 'runtime_root'}),
         'scheduler': dict(folder=r'\AISOFTWAREFACTORY', task_name='TrustedRuntime',
                           logon_type='TASK_LOGON_PASSWORD', run_level='LeastPrivilege',
                           enabled_initially=False, allow_demand_start=False,
-                          execution_time_limit_seconds=50, multiple_instances_policy='IgnoreNew'),
+                          execution_time_limit_seconds=50, multiple_instances_policy='IgnoreNew',
+                          repetition_interval='PT1M'),
         'python': dict(version='3.14.10', architecture='amd64',
                        artifact_filename='python-3.14.10-embed-amd64.zip',
                        published_sha256=GATE1_PYTHON_SHA256, sigstore_required=True),
@@ -579,6 +586,9 @@ def gate1_contract_template():
                     target_standard_user_behavior=0),
         'receipt': dict(generation=1, reinstall_allowed=False),
         'network_allowed': False, 'antivirus_bypass_allowed': False,
+        'authorization': dict(path=r'C:\Program Files\AISOFTWAREFACTORY\GateStaging\gate1_authorization.json',
+                              action='TRUSTED_RUNTIME_GATE1_PHASE1B',
+                              schema_version='human-gate-authorization-v1'),
     }
 
 
