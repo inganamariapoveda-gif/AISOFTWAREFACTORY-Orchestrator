@@ -422,3 +422,42 @@ class CliSafetyTests(unittest.TestCase):
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
         self.assertFalse(called & {'system', 'remove', 'rmdir', 'unlink', 'Run', 'Delete',
                                   'CryptProtectData', 'CryptUnprotectData'})
+
+
+class ProductionEntryFenceTests(unittest.TestCase):
+    def test_preimport_failure_stops_before_any_project_import(self):
+        # Execute only the stdlib prefix with a synthetic failing fence. Never
+        # execute a real native API or Phase1B against the host.
+        import ast
+        source = (ROOT/'tools/windows/trusted_runtime_gate1_bootstrap.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        index = next(i for i,node in enumerate(tree.body) if isinstance(node,ast.ImportFrom)
+                     and node.module == 'orchestrator')
+        prefix = tree.body[:index]
+        fence = next(node for node in prefix if isinstance(node,ast.FunctionDef)
+                     and node.name == '_phase1b_preimport_fence')
+        fence.body = ast.parse("raise ValueError('SYNTHETIC_REJECTION')").body
+        namespace = {'__name__':'__main__','__file__':'synthetic-bootstrap'}
+        with patch.object(sys,'argv',['synthetic-bootstrap','--phase1b']), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as outcome:
+                exec(compile(ast.fix_missing_locations(ast.Module(body=prefix,type_ignores=[])),
+                             '<synthetic-preimport-fence>','exec'),namespace)
+        self.assertEqual(outcome.exception.code,2)
+        self.assertEqual(output.getvalue().strip(),'HUMAN_GATE_NOT_AUTHORIZED_PREIMPORT_ADMISSION')
+        self.assertNotIn('w',namespace)
+        self.assertNotIn('SYNTHETIC_REJECTION',output.getvalue())
+
+    def test_seed_rejects_nonisolated_before_loading_dll(self):
+        from types import SimpleNamespace
+        import ctypes
+        fake = SimpleNamespace(platform='win32',version_info=(3,14,10),
+                               flags=SimpleNamespace(isolated=0,no_user_site=1,dont_write_bytecode=1))
+        with patch.object(g,'sys',fake), patch.object(ctypes,'WinDLL',create=True) as loader:
+            with self.assertRaises(ValueError): g._phase1b_preimport_fence()
+        loader.assert_not_called()
+
+    def test_production_cli_cannot_select_test_backend_or_bypass(self):
+        for option in ('--backend','--test-backend','--force','--skip-checks','--phase1'):
+            with self.subTest(option=option), patch('sys.stderr',new=io.StringIO()):
+                with self.assertRaises(SystemExit) as result: g.main(['--plan',option])
+                self.assertEqual(result.exception.code,2)

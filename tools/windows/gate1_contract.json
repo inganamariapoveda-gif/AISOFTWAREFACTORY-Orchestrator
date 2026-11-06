@@ -13,7 +13,10 @@
     "authority_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Authority",
     "captures_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Authority\\Captures",
     "inbox_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Inbox",
-    "secrets_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Secrets"
+    "secrets_root": "C:\\ProgramData\\AISOFTWAREFACTORY\\Secrets",
+    "program_files_parent": "C:\\Program Files\\AISOFTWAREFACTORY",
+    "control_root": "C:\\ProgramData\\AISOFTWAREFACTORY",
+    "runtime_profile_path": "C:\\Users\\ASFTrustedRuntime"
   },
   "scheduler": {
     "folder": "\\AISOFTWAREFACTORY",
@@ -23,7 +26,8 @@
     "enabled_initially": false,
     "allow_demand_start": false,
     "execution_time_limit_seconds": 50,
-    "multiple_instances_policy": "IgnoreNew"
+    "multiple_instances_policy": "IgnoreNew",
+    "repetition_interval": "PT1M"
   },
   "python": {
     "version": "3.14.10",
@@ -46,5 +50,10 @@
     "reinstall_allowed": false
   },
   "network_allowed": false,
-  "antivirus_bypass_allowed": false
+  "antivirus_bypass_allowed": false,
+  "authorization": {
+    "path": "C:\\Program Files\\AISOFTWAREFACTORY\\GateStaging\\gate1_authorization.json",
+    "action": "TRUSTED_RUNTIME_GATE1_PHASE1B",
+    "schema_version": "human-gate-authorization-v1"
+  }
 }

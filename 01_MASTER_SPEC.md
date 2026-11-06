@@ -1999,3 +1999,90 @@ Limites de verificacion: modelos y tests sustituidos no prueban ACL efectiva,
 procedencia criptografica, COM real, resistencia a carreras o frontera de imports.
 Backend nativo operativo y su admision independiente siguen pendientes antes de
 cualquier Gate real. Sin cambios a Store/state machine/config/dependencias.
+
+
+## TRUSTED_RUNTIME_WINDOWS_NATIVE_BACKEND-001E — Code-only native integration
+
+CODE_EXISTS != HUMAN_GATE_AUTHORIZED. BACKEND_EXISTS != HUMAN_GATE_AUTHORIZED.
+TEST_PASS != HOST_BOUNDARY_PROVEN. No real Windows mutation is authorized by 001E.
+This section supersedes the 001D model sequence for the native production path.
+The legacy run_sequence(port), snapshot booleans and model receipt remain test
+models only; production CLI never consumes them or accepts a backend selector.
+
+The exact --phase1b entry requires externally verified protected Python 3.14.10
+amd64, -I -B, no user site, no PYTHONPATH and only protected GateStaging import
+paths. A minimal read-only seed in the externally pinned bootstrap runs BEFORE
+project imports. It holds no-write/no-delete-share handles, rejects reparse and
+untrusted writers, verifies authorization-pinned manifest/bootstrap/native/
+validator bytes and manifest-pinned package __init__/running Python bytes, and
+rejects cache/extension shadow entries in the application directories. It is not
+a substitute for independent admission of the interpreter/stdlib before launch.
+No abbreviated phase flag, direct imported main() or environment approval can
+skip this seed and reach the native production entrypoint.
+
+Canonical authorization is the protected GateStaging/gate1_authorization.json
+under C:/Program Files/AISOFTWAREFACTORY. HumanGateAuthorization is closed DATA;
+authentication comes from held-handle owner/DACL admission, not its name. The
+schema binds action/generation/expiry/nonce, machine/volume, Human/Builder SIDs,
+Builder workspace path, source commit/tree, bootstrap/native/validator/contract/
+manifest SHA-256, exact Python artifact identity and extracted tree digest.
+Expected values never come from the observations being checked. External Human
+Admin verification of source blobs, Sigstore and the Python artifact remains
+required; runtime code performs no download or independent online attestation.
+
+admit_native_gate() has no caller ports, paths or approval arguments. It validates
+process token with no thread impersonation, canonical protected inputs, complete
+manifest inventory and project import closure before NativeGateBackend exists.
+Source layout is app/orchestrator/*.py with root trusted_runtime_gate1_bootstrap.py.
+The manifest includes these normative application blobs. Python tree digest is
+SHA-256 of canonical JSON mapping each python/ relative path to [size, sha256].
+The independently authorized digest is compared with the pinned manifest and
+actual held-source bytes. Exact embed filename/hash from 001D remain unchanged.
+
+Program Files/AISOFTWAREFACTORY already contains protected GateStaging and must
+be admitted, not recreated. All final runtime/control/Authority/Captures/Inbox/
+Secrets roots and runtime profile must be absent before account creation. Relevant
+ancestors remain held without delete sharing. Named CreateDirectoryW is necessary
+because this Win32 interface has no relative-handle directory creation primitive;
+retained admitted ancestors and restrictive initial SECURITY_ATTRIBUTES bound it.
+
+Native order: read-only admission; backend construction; mutable CSPRNG credential;
+NetUserAdd USER_PRIV_USER; freeze newly resolved runtime SID; account/group readback;
+add Users only if absent and reject every unexpected direct group; direct LSA rights
+empty -> exactly SeBatchLogonRight with independent group deny-batch checks; protected
+roots; exact descriptor/isolation readback; copy held sources exclusively, flush and
+read/hash destinations; exact runtime file/directory/DACL inventory; register disabled
+Scheduler task and observe it; exact UAC 1/5/3/1 baseline then change only user 3->0;
+complete final host readback; exclusive final receipt and exact validated readback.
+No retry, rollback, deletion, repair or task execution follows partial failure.
+
+O-6 supersedes earlier SQLite-file inheritance: OBJECT_INHERIT |
+NO_PROPAGATE_INHERIT | INHERIT_ONLY = 0x0D, never CONTAINER_INHERIT. H-1 masks stay
+unchanged. Native parsing preserves NULL/empty DACL and deny/unknown/inherited ACE
+information; unexpected descriptors reject. No SACL overwrite is requested. Runtime
+cannot write Builder workspace; Builder/broad writers cannot write protected roots,
+with only the specified Inbox exception. Final isolation uses post-SID descriptors.
+
+System32 DLL bindings have explicit ctypes signatures. BCryptGenRandom supplies
+mutable WCHAR storage; NetUserAdd receives its pointer. Scheduler requires one
+explicit BSTR copy, wiped before VariantClear releases it; provider diagnostic BSTRs
+are wiped without decoding. The original buffer is cleared after registration or
+on any failed stage. BEST_EFFORT_USERSPACE_ZEROIZATION != GUARANTEED_SECRET_ERASURE.
+No password appears in argv, environment, files, JSON, receipt or diagnostics.
+
+Direct COM uses the existing 001B observer schema and compare_task(), Password,
+LeastPrivilege, create+disable+do-not-add-principal-ACE, demand=false, IgnoreNew,
+PT50S and one PT1M TimeTrigger. No Run method is exposed. Task/folder SDs are parsed
+and compared before canonical observer comparison; deny/unknown ACEs are not lost.
+
+The production receipt uses existing validate_receipt and generation-1 keys without
+an alternate schema. FINAL_HOST_READBACK must succeed before exclusive receipt
+creation. Partial failure preserves state and reports only closed stage/error names,
+numeric native status, completed steps and Director-recovery requirement. A failed
+receipt write/readback may leave a partial artifact and never reports success.
+
+Validation is synthetic and code-only. Tests substitute native components/ABI calls;
+they do not establish real COM interoperability, effective Windows access, resistance
+to concurrent administrators, or full system memory erasure. Those require separate
+Human Gate authorization and native host validation. No Store/state machine,
+dependency, service-account, DPAPI, workflow, activation or publication expansion.

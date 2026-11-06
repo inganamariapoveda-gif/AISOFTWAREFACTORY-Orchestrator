@@ -1,7 +1,7 @@
-"""Gate 1 code-only model. Import/CLI never acquires a Windows mutation backend.
+"""Gate 1 model and guarded native coordinator entrypoint.
 
 The sequence below is executable against an explicitly supplied port for tests.
-It is NOT a trusted host observer, elevation broker or Human Gate authority.
+The legacy run_sequence port is MODEL ONLY and is never used by production CLI.
 No caller-controlled JSON/argv can select a backend or authorize real execution.
 """
 from dataclasses import dataclass
@@ -12,6 +12,190 @@ import hashlib
 import json
 from pathlib import PureWindowsPath
 import uuid
+import sys
+
+
+# Minimal pre-import fence. This is deliberately in the already externally pinned
+# bootstrap, not in the as-yet-unadmitted project modules it must verify.
+# It performs ONE fixed read-only operation and retains handles across imports.
+_seed_resources = None
+
+
+def _close_seed_resources():
+    global _seed_resources
+    if _seed_resources is None:
+        return True
+    kernel, handles = _seed_resources
+    ok = True
+    for handle in reversed(handles):
+        if not kernel.CloseHandle(handle): ok = False
+    _seed_resources = None
+    return ok
+
+
+def _phase1b_preimport_fence():
+    import ctypes as c
+    from ctypes import wintypes as t
+    import os
+    global _seed_resources
+    def require(value):
+        if not value: raise ValueError('PREIMPORT_ADMISSION_REJECTED')
+    stage = PureWindowsPath(r'C:\Program Files\AISOFTWAREFACTORY\GateStaging')
+    require(sys.platform == 'win32' and sys.version_info[:3] == (3, 14, 10)
+            and sys.flags.isolated == 1 and sys.flags.no_user_site == 1
+            and sys.flags.dont_write_bytecode == 1 and c.sizeof(c.c_void_p) == 8)
+    require(PureWindowsPath(__file__) == stage / 'trusted_runtime_gate1_bootstrap.py'
+            and PureWindowsPath(sys.executable) == stage / 'python/python.exe'
+            and 'PYTHONPATH' not in os.environ)
+    require(all(PureWindowsPath(p).is_absolute() and
+                (PureWindowsPath(p) == stage or stage in PureWindowsPath(p).parents) for p in sys.path))
+    require(not any(name == 'orchestrator' or name.startswith('orchestrator.') for name in sys.modules))
+    k = c.WinDLL('kernel32.dll', use_last_error=True, winmode=0x800)
+    a = c.WinDLL('advapi32.dll', use_last_error=True, winmode=0x800)
+    P, D = c.c_void_p, t.DWORD
+    def bind(dll, name, restype, *args):
+        f = getattr(dll, name); f.restype = restype; f.argtypes = list(args)
+        return f
+    bind(k, 'CreateFileW', t.HANDLE, t.LPCWSTR, D, D, P, D, D, t.HANDLE)
+    bind(k, 'CloseHandle', t.BOOL, t.HANDLE)
+    bind(k, 'GetCurrentProcess', t.HANDLE)
+    bind(k, 'GetFileInformationByHandleEx', t.BOOL, t.HANDLE, c.c_int, P, D)
+    bind(k, 'ReadFile', t.BOOL, t.HANDLE, P, D, c.POINTER(D), P)
+    bind(k, 'LocalFree', P, P)
+    bind(a, 'OpenProcessToken', t.BOOL, t.HANDLE, D, c.POINTER(t.HANDLE))
+    bind(a, 'GetTokenInformation', t.BOOL, t.HANDLE, c.c_int, P, D, c.POINTER(D))
+    bind(a, 'ConvertSidToStringSidW', t.BOOL, P, c.POINTER(t.LPWSTR))
+    bind(a, 'GetSecurityInfo', D, t.HANDLE, c.c_int, D, c.POINTER(P), P, c.POINTER(P), P, c.POINTER(P))
+    bind(a, 'GetSecurityDescriptorControl', t.BOOL, P, c.POINTER(c.c_uint16), c.POINTER(D))
+    bind(a, 'GetAce', t.BOOL, P, D, c.POINTER(P))
+    handles = []; _seed_resources = (k, handles)
+    def sid_string(pointer):
+        text = t.LPWSTR()
+        require(a.ConvertSidToStringSidW(pointer, c.byref(text)))
+        try: return text.value
+        finally: k.LocalFree(c.cast(text, P))
+    token = t.HANDLE()
+    require(a.OpenProcessToken(k.GetCurrentProcess(), 8, c.byref(token)))
+    try:
+        size = D()
+        a.GetTokenInformation(token, 1, None, 0, c.byref(size))
+        require(0 < size.value <= 65536)
+        data = c.create_string_buffer(size.value)
+        require(a.GetTokenInformation(token, 1, data, size, c.byref(size)))
+        human = sid_string(c.cast(data, c.POINTER(P))[0])
+        elevated = D(); size = D()
+        require(a.GetTokenInformation(token, 20, c.byref(elevated), c.sizeof(elevated), c.byref(size)))
+        require(elevated.value != 0)
+    finally:
+        require(k.CloseHandle(token))
+    def security(handle, strict):
+        owner, dacl, sd = P(), P(), P()
+        require(a.GetSecurityInfo(handle, 1, 5, c.byref(owner), None,
+                                  c.byref(dacl), None, c.byref(sd)) == 0)
+        try:
+            require(bool(dacl))
+            control, revision = c.c_uint16(), D()
+            require(a.GetSecurityDescriptorControl(sd, c.byref(control), c.byref(revision)))
+            if strict:
+                require(control.value & 0x1000 and sid_string(owner) in (human, 'S-1-5-32-544', 'S-1-5-18'))
+            count = c.c_uint16.from_address(dacl.value + 4).value
+            require(count <= 1024)
+            for i in range(count):
+                ace = P(); require(a.GetAce(dacl, i, c.byref(ace)))
+                kind, flags = c.c_ubyte.from_address(ace.value).value, c.c_ubyte.from_address(ace.value+1).value
+                require(kind == 0 and c.c_uint16.from_address(ace.value+2).value >= 16)
+                mask = c.c_uint32.from_address(ace.value+4).value
+                sid = sid_string(ace.value+8)
+                if strict:
+                    require(not mask & 0x500d0156 or sid in (human, 'S-1-5-32-544', 'S-1-5-18'))
+                elif not flags & 8 and sid in ('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545'):
+                    require(not mask & 0x500d0040)
+        finally:
+            k.LocalFree(sd)
+    opened = {}
+    def open_read(path, directory=False):
+        key = str(path)
+        if key in opened: return opened[key]
+        handle = k.CreateFileW(key, 0x80020000, 1, None, 3,
+                              0x00200000 | (0x02000000 if directory else 0), None)
+        require(handle not in (None, c.c_void_p(-1).value)); handles.append(handle)
+        tag = (D*2)()
+        require(k.GetFileInformationByHandleEx(handle, 9, tag, c.sizeof(tag)))
+        require(not tag[0] & 0x400 and tag[1] == 0)
+        info = c.create_string_buffer(24)
+        require(k.GetFileInformationByHandleEx(handle, 1, info, len(info)))
+        require(bool(info.raw[21]) == directory and info.raw[20] == 0)
+        if not directory: require(c.c_uint32.from_buffer(info, 16).value == 1)
+        strict = path == stage.parent or path == stage or stage in path.parents
+        security(handle, strict)
+        opened[key] = handle
+        return handle
+    for ancestor in reversed(stage.parents): open_read(ancestor, True)
+    open_read(stage, True)
+    def read(path):
+        for ancestor in reversed(path.parents):
+            if ancestor == stage or stage in ancestor.parents: open_read(ancestor, True)
+        handle = open_read(path)
+        raw = bytearray(); buffer = c.create_string_buffer(65536)
+        while True:
+            count = D(); require(k.ReadFile(handle, buffer, len(buffer), c.byref(count), None))
+            if not count.value: break
+            raw.extend(buffer.raw[:count.value]); require(len(raw) <= 64*1024*1024)
+        return bytes(raw)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result); result[key] = value
+        return result
+    def decode(raw):
+        require(not raw.startswith(b'\xef\xbb\xbf'))
+        return json.loads(raw.decode('utf-8'), object_pairs_hook=pairs)
+    auth = decode(read(stage/'gate1_authorization.json'))
+    require(type(auth) is dict and auth.get('human_admin_sid') == human)
+    def pinned(path, digest):
+        require(type(digest) is str and len(digest) == 64 and all(x in '0123456789abcdef' for x in digest))
+        raw = read(path); require(hashlib.sha256(raw).hexdigest() == digest); return raw
+    manifest = decode(pinned(stage/'trusted_runtime_manifest.json', auth['manifest_sha256']))
+    inventory = {entry['relative_path']: entry['sha256'] for entry in manifest['files']}
+    bindings = {'trusted_runtime_gate1_bootstrap.py':'bootstrap_sha256',
+                'app/orchestrator/trusted_runtime_windows.py':'validator_module_sha256',
+                'app/orchestrator/trusted_runtime_windows_native.py':'native_backend_sha256'}
+    for relative, field in bindings.items():
+        require(inventory.get(relative) == auth[field]); pinned(stage/relative, auth[field])
+    pinned(stage/'app/orchestrator/__init__.py', inventory['app/orchestrator/__init__.py'])
+    pinned(stage/'python/python.exe', inventory['python/python.exe'])
+    # Python may READ caches despite -B, and extension modules can shadow .py.
+    # Reject every non-source entry in the application package before importing.
+    for path, permitted in ((stage/'app', {'orchestrator'}),
+                            (stage/'app/orchestrator', {PureWindowsPath(p).name for p in inventory
+                             if PureWindowsPath(p).parent == PureWindowsPath('app/orchestrator')})):
+        handle = open_read(path, True); buffer = c.create_string_buffer(65536); restart = True
+        while True:
+            ok = k.GetFileInformationByHandleEx(handle, 11 if restart else 10, buffer, len(buffer)); restart=False
+            if not ok:
+                require(c.get_last_error() == 18); break
+            offset = 0
+            while True:
+                require(offset+104 <= len(buffer))
+                address = c.addressof(buffer)+offset
+                next_offset = c.c_uint32.from_address(address).value
+                length = c.c_uint32.from_address(address+60).value
+                require(length % 2 == 0 and 0 < length <= 510 and offset+104+length <= len(buffer))
+                name = c.string_at(address+104, length).decode('utf-16-le')
+                if name not in ('.','..'):
+                    require(name in permitted and (path.name == 'app' or name.endswith('.py')))
+                if not next_offset: break
+                require(next_offset >= 104+length and next_offset % 8 == 0); offset += next_offset
+
+
+if __name__ == '__main__' and '--phase1b' in sys.argv[1:]:
+    try:
+        _phase1b_preimport_fence()
+    except BaseException:
+        _close_seed_resources()
+        print('HUMAN_GATE_NOT_AUTHORIZED_PREIMPORT_ADMISSION')
+        raise SystemExit(2) from None
+
 
 from orchestrator import trusted_runtime_windows as w
 
@@ -314,14 +498,23 @@ def run_sequence(port):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Gate 1 code-only contract and sequence model')
+    parser = argparse.ArgumentParser(description='Gate 1 guarded native coordinator and model plan', allow_abbrev=False)
     modes = parser.add_mutually_exclusive_group(required=True)
     for mode in ('preflight', 'plan', 'phase1b'):
         modes.add_argument('--' + mode, action='store_true')
     args = parser.parse_args(argv)
     if args.phase1b:
-        print('HUMAN_GATE_NOT_AUTHORIZED_NATIVE_BACKEND_NOT_INSTALLED')
-        return 2
+        if _seed_resources is None:
+            print('HUMAN_GATE_NOT_AUTHORIZED_PREIMPORT_ADMISSION')
+            return 2
+        if not (sys.flags.isolated == 1 and sys.flags.dont_write_bytecode == 1
+                and sys.flags.no_user_site == 1):
+            print('HUMAN_GATE_NOT_AUTHORIZED_IMPORT_ENVIRONMENT')
+            return 2
+        from orchestrator.trusted_runtime_windows_native import run_native_gate
+        result = run_native_gate()
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result['status'] == 'TASK_REGISTERED_DISABLED' else 2
     # These modes inspect only immutable contract DATA, never the host.
     result = plan(w.gate1_contract_template())
     result['mode'] = 'preflight' if args.preflight else 'plan'
@@ -331,4 +524,8 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    try:
+        result = main()
+    finally:
+        seed_closed = _close_seed_resources()
+    raise SystemExit(result if seed_closed else 2)
